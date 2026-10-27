@@ -97,7 +97,28 @@ When simulating large superconducting integrated circuits (10k–500k+ Josephson
 - **Solution:**
   - Pre-compute total expanded line counts to `reserve` `expNetlist` once, use in-place string appends (`append("|").append(label)`) in `Netlist::expand_io`, and pre-reserve `nz`, `ci`, and `rp` in `Matrix::create_csr`.
 
-#### 6. Future Large-Circuit Roadmap (Phase 5+)
+#### 6. Phase 4 Verification & Medium/Large-Scale Benchmark Results
+
+Verified via [`scripts/test_phase4_wsl.sh`](scripts/test_phase4_wsl.sh) and [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh) in WSL (`-O3` Release build with Ninja):
+- **Mid-Flight PTL `.savestate` / `.loadstate` (`JOSIMSTA` v2):** Exact bit-identical (`0.000e+00` error) waveform continuation across a checkpoint taken while an SFQ pulse is mid-flight inside a `25 ps` transmission line.
+- **In-Loop `PRSTART` / `PRSTEP` Decimation:** `0.000e+00` max error vs. full-history output across `V`, `P`, and `I` traces while reducing stored transient steps by >90%.
+- **Block-Partitioned KLU & `.option kcutoff`:** Bit-identical (`0.000e+00` diff) serial vs. OpenMP (`-p`) multi-block KLU solves.
+
+##### End-to-End Runtime & Memory Benchmark (Upstream `v2.7` vs. Enhanced)
+
+| Design | Scale & Description | Upstream CSV | Enhanced 1T CSV | Enhanced `-p` CSV | Enhanced `-p` `.bin` | Speedup (`-p` `.bin`) | Peak RSS (`Base -> Enh`) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ex_ksa4bit` | Medium: 4-bit RSFQ Kogge-Stone Adder | `2.029 s` | `1.409 s` | `1.499 s` | `1.466 s` | **1.38x** (`1.44x` 1T) | `60.9 -> 43.9 MB` (**1.39x**) |
+| `ex_jtl_string` | Medium: Long RSFQ JTL chain (`100 ps`) | `3.069 s` | `2.103 s` | `2.137 s` | `2.109 s` | **1.46x–1.73x** | `39.1 -> 43.7 MB` |
+| `ex_gen_pp_ipht` | Medium: IPHT SFQ pulse generator & logic | `5.962 s` | `2.563 s` | `2.547 s` | `2.570 s` | **2.32x–2.34x** | `62.6 -> 70.0 MB` |
+| `med_ext_6k_K` | Medium: 500 JJs, 2.5k `L`, 6k `K` couplings | `0.826 s` | `0.557 s` | `0.360 s` | `0.357 s` | **2.31x–2.56x** | `19.7 -> 19.6 MB` |
+| `large_10k_jtl` | Large: 10,000-JJ JTL (~70k devices, ~90k eqns) | `1.894 s` | `1.173 s` | `1.059 s` | `1.064 s` | **1.78x–1.79x** | `136.8 -> 149.7 MB` |
+| `large_64blk_ptl` | Large: 64-tile PTL fabric (3,072 JJs, 512 PTLs) | `1.375 s` | `0.912 s` | `0.900 s` | `0.840 s` | **1.64x** | `77.8 -> 47.1 MB` (**1.65x**) |
+| `large_2k_windowed` | Large: 2,000 JJs, 4k steps (`PRSTART=800p, PRSTEP=2p`) | `1.413 s` | `0.734 s` | `0.773 s` | `0.712 s` | **1.98x** | `85.1 -> 33.5 MB` (**2.54x**) |
+| `vlarge_io_2.5Mpts` | Very Large: 2,500 JJs, 1,250 traces $\times$ 2k steps | `1.219 s` | `0.996 s` | `1.047 s` | `0.574 s` | **2.12x** | `75.0 -> 68.3 MB` (**1.10x**) |
+| `vlarge_512ptl_10k` | Very Large: 512 PTLs over 10,000 steps (`2.5 ns`) | `0.548 s` | `0.341 s` | `0.344 s` | `0.343 s` | **1.60x** | `165.4 -> 11.1 MB` (**14.89x**) |
+
+#### 7. Future Large-Circuit Roadmap (Phase 5+)
 - **Series $R + L$ Internal Node Elimination & Compact Nodal Stamping:** Fold uncoupled two-terminal resistors/capacitors and series $R$-$L$ JJ shunt branches into nodal/composite stamps to shrink MNA dimension by 35%–50%.
 - **In-Memory Rolling Checkpoints & Local Timestep Rollback:** Replace full $t = 0$ restarts on `needsTR_` with local rollback to a recent in-memory state snapshot using variable-step BDF2 coefficients.
 - **Activity-Driven / Event-Driven Subcircuit Bypass:** Skip device evaluation and block KLU solves on quiescent PTL-decoupled partitions whose terminal states and inputs are idle ($\Delta \phi < \epsilon$).

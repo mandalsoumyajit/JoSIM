@@ -89,9 +89,38 @@ arr = load_josim_npy("output.npy")       # Zero-copy memory-mapped structured ar
   .option kcutoff=1e-3
   ```
 
-### 4. WSL Build, Benchmark & Verification Scripts
+### 4. Benchmark Results (Medium, Large & Very-Large Designs)
+
+Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh) in WSL (`-O3` Release build with Ninja, comparing upstream `v2.7` / `02a34ee` against this enhanced version):
+
+#### End-to-End Wall-Clock Runtime
+
+| Design | Scale & Description | Upstream CSV | Enhanced 1T CSV | Enhanced `-p` CSV | Enhanced `-p` `.bin` | Speedup (`-p` CSV) | Speedup (`-p` `.bin`) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ex_ksa4bit` | Medium: 4-bit RSFQ Kogge-Stone Adder | `2.029 s` | `1.409 s` | `1.499 s` | `1.466 s` | **1.35x–1.44x** | **1.38x** |
+| `ex_jtl_string` | Medium: Long RSFQ JTL chain (`100 ps`) | `3.069 s` | `2.103 s` | `2.137 s` | `2.109 s` | **1.44x–1.64x** | **1.46x–1.73x** |
+| `ex_gen_pp_ipht` | Medium: IPHT SFQ pulse generator & logic | `5.962 s` | `2.563 s` | `2.547 s` | `2.570 s` | **2.34x** | **2.32x** |
+| `med_ext_6k_K` | Medium: 3D-extracted macro (500 JJs, 2.5k `L`, 6k `K`) | `0.826 s` | `0.557 s` | `0.360 s` | `0.357 s` | **2.29x** | **2.31x–2.56x** |
+| `large_10k_jtl` | Large: 10,000-JJ JTL (~70k devices, ~90k eqns) | `1.894 s` | `1.173 s` | `1.059 s` | `1.064 s` | **1.79x** | **1.78x** |
+| `large_64blk_ptl` | Large: 64-tile PTL fabric (3,072 JJs, 512 PTLs) | `1.375 s` | `0.912 s` | `0.900 s` | `0.840 s` | **1.53x** | **1.64x** |
+| `large_2k_windowed` | Large: 2,000 JJs, 4k steps (`PRSTART=800p, PRSTEP=2p`) | `1.413 s` | `0.734 s` | `0.773 s` | `0.712 s` | **1.83x** | **1.98x** |
+| `vlarge_io_2.5Mpts` | Very Large: 2,500 JJs, 1,250 traces $\times$ 2k steps | `1.219 s` | `0.996 s` | `1.047 s` | `0.574 s` | **1.16x** | **2.12x** |
+| `vlarge_512ptl_10k` | Very Large: 512 PTLs over 10,000 steps (`2.5 ns`) | `0.548 s` | `0.341 s` | `0.344 s` | `0.343 s` | **1.59x** | **1.60x** |
+
+#### Peak Memory (RSS) Reduction
+
+| Design | Upstream Peak RSS | Enhanced Peak RSS | RAM Reduction | Primary Optimization Driver |
+| :--- | ---: | ---: | ---: | :--- |
+| `vlarge_512ptl_10k` (512 PTLs, 10k steps) | `165.4 MB` | **`11.1 MB`** | **14.89x less RAM** | Self-contained TX circular ring buffers (`hist_`) of length $k + 4$ instead of 6 $\times N_{\text{steps}}$ vectors per PTL |
+| `large_2k_windowed` (`PRSTART=800p, PRSTEP=2p`) | `85.1 MB` | **`33.5 MB`** | **2.54x less RAM** | In-loop print windowing & decimation (`keepStep_`) skipping unprinted transient steps |
+| `large_64blk_ptl` (3,072 JJs, 512 PTLs, 2.5k steps) | `77.8 MB` | **`47.1 MB`** | **1.65x less RAM** | TX circular ring buffers (`hist_`) across 512 PTL interconnects |
+| `ex_ksa4bit` (4-bit Adder) | `60.9 MB` | **`43.9 MB`** | **1.39x less RAM** | Pre-reserved subcircuit expansion + TX circular ring buffers |
+| `vlarge_io_2.5Mpts` (1,250 traces $\times$ 2k steps) | `75.0 MB` | **`68.3 MB`** | **1.10x less RAM** | Direct streaming binary `.bin` output |
+
+### 5. WSL Build, Benchmark & Verification Scripts
 - [`scripts/build_wsl.sh`](scripts/build_wsl.sh): Configures and builds JoSIM in WSL using Ninja (`-DCMAKE_BUILD_TYPE=Release -DPARALLEL=ON`) and runs the 23-test CTest suite.
 - [`scripts/benchmark_wsl.sh`](scripts/benchmark_wsl.sh): Benchmarks upstream vs. optimized JoSIM and verifies 100% bit-identical CSV outputs.
+- [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh): Benchmarks wall-clock runtime and peak memory (RSS) across 9 medium-, large-, and very-large-scale superconducting IC designs.
 - [`scripts/test_phase3_wsl.sh`](scripts/test_phase3_wsl.sh): Tests and benchmarks `.bin`/`.npy`/`.rawb` binary outputs, fractional TX delay interpolation, `.savestate`/`.loadstate` checkpointing, `-f` fixed-step control, and `-c` JJ predictor-corrector iteration.
 - [`scripts/test_phase4_wsl.sh`](scripts/test_phase4_wsl.sh): Tests transmission-line circular ring buffers, mid-flight PTL `.savestate`/`.loadstate` checkpointing, in-loop `PRSTART`/`PRSTEP` decimation, `.option kcutoff`, and OpenMP block-partitioned KLU solving across PTL boundaries.
 

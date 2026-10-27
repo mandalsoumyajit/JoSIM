@@ -18,6 +18,9 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace JoSIM;
 
@@ -103,28 +106,39 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
             bar.set_status_text("Formatting Output");
             bar.set_total((float) mObj.relevantTraces.size());
         }
-        // Reset progress counter
-        cc = 0;
-        for (const auto& i : mObj.relevantTraces) {
-            auto& st = i.storageType;
-            if (!iObj.argMin) { bar.update(static_cast<float>(cc)); }
+        const int64_t nTraces = static_cast<int64_t>(mObj.relevantTraces.size());
+        for (int64_t idx = 0; idx < nTraces; ++idx) {
+            const auto& i = mObj.relevantTraces[idx];
+            traces.emplace_back(i.deviceLabel.value());
+            traces.back().fileIndex = i.fIndex;
+            if (i.storageType == StorageType::Voltage) {
+                traces.back().type_ = 'V';
+            } else if (i.storageType == StorageType::Phase) {
+                traces.back().type_ = 'P';
+            } else {
+                traces.back().type_ = 'I';
+            }
+            traces.back().data_.reserve(result_indices.size());
+        }
+        auto process_trace = [&](int64_t idx) {
+            const auto& i        = mObj.relevantTraces[idx];
+            auto&       outTrace = traces[idx + 1];
+            auto&       st       = i.storageType;
+            if (!iObj.argMin && idx % 4 == 0) { bar.update(static_cast<float>(idx)); }
             // Shorthand for the optional value
-            auto i1    = i.index1.has_value() ? i.index1.value() : -1;
-            auto i2    = i.index2.has_value() ? i.index2.value() : -1;
-            auto si    = i.sourceIndex.has_value() ? i.sourceIndex.value() : -1;
-            auto vi    = i.variableIndex.has_value() ? i.variableIndex.value() : -1;
+            auto                       i1    = i.index1.has_value() ? i.index1.value() : -1;
+            auto                       i2    = i.index2.has_value() ? i.index2.value() : -1;
+            auto                       vi    = i.variableIndex.has_value() ? i.variableIndex.value() : -1;
+            const std::vector<double>* v1    = (i1 != -1) ? &(*x[i1]) : nullptr;
+            const std::vector<double>* v2    = (i2 != -1) ? &(*x[i2]) : nullptr;
+            const std::vector<double>* vv    = (vi != -1) ? &(*x[vi]) : nullptr;
             // Size of original data vectors available to FIR filter
-            auto xsize = t.size();
-            if (i1 != -1 && x.at(i1).value().size() < xsize) { xsize = x.at(i1).value().size(); }
-            if (i2 != -1 && x.at(i2).value().size() < xsize) { xsize = x.at(i2).value().size(); }
-            if (vi != -1 && x.at(vi).value().size() < xsize) { xsize = x.at(vi).value().size(); }
+            auto                       xsize = t.size();
+            if (v1 && v1->size() < xsize) { xsize = v1->size(); }
+            if (v2 && v2->size() < xsize) { xsize = v2->size(); }
+            if (vv && vv->size() < xsize) { xsize = vv->size(); }
             // If this is a voltage we are storing
             if (st == StorageType::Voltage) {
-                // Set the label for the plot
-                traces.emplace_back(i.deviceLabel.value());
-                traces.back().fileIndex = i.fIndex;
-                traces.back().type_     = 'V';
-                traces.back().data_.reserve(result_indices.size());
                 // Push the FIR filtered values for each value on the time axis
                 for (auto j : result_indices) { // j: Index of window center
                     // FIR filter voltage
@@ -140,26 +154,26 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                         // Calculate individual voltage sample
                         double value;
                         // Shorthand values
-                        auto   valin1 = i1 != -1 ? x.at(i1).value().at(jk) : 0;
-                        auto   valin2 = i2 != -1 ? x.at(i2).value().at(jk) : 0;
+                        auto   valin1 = v1 ? (*v1)[jk] : 0.0;
+                        auto   valin2 = v2 ? (*v2)[jk] : 0.0;
                         // If the analysis method was voltage
                         if (iObj.argAnal == AnalysisType::Voltage) {
                             value = valin1 - valin2;
                             // Else calculate the voltage from the phase value
                         } else {
-                            if (i.deviceLabel.value().at(3) == 'B' && vi != -1) {
-                                value = x.at(vi).value().at(jk);
+                            if (i.deviceLabel.value().at(3) == 'B' && vv) {
+                                value = (*vv)[jk];
                             } else {
                                 double valin1n1, valin1n2;
                                 double valin2n1, valin2n2;
                                 if (jk >= 2) {
-                                    valin1n2 = i1 != -1 ? x.at(i1).value().at(jk - 2) : 0;
-                                    valin1n1 = i1 != -1 ? x.at(i1).value().at(jk - 1) : 0;
-                                    valin2n2 = i2 != -1 ? x.at(i2).value().at(jk - 2) : 0;
-                                    valin2n1 = i2 != -1 ? x.at(i2).value().at(jk - 1) : 0;
+                                    valin1n2 = v1 ? (*v1)[jk - 2] : 0.0;
+                                    valin1n1 = v1 ? (*v1)[jk - 1] : 0.0;
+                                    valin2n2 = v2 ? (*v2)[jk - 2] : 0.0;
+                                    valin2n1 = v2 ? (*v2)[jk - 1] : 0.0;
                                 } else if (jk == 1) {
-                                    valin1n2 = valin1n1 = i1 != -1 ? x.at(i1).value().at(jk - 1) : 0;
-                                    valin2n2 = valin2n1 = i2 != -1 ? x.at(i2).value().at(jk - 1) : 0;
+                                    valin1n2 = valin1n1 = v1 ? (*v1)[jk - 1] : 0.0;
+                                    valin2n2 = valin2n1 = v2 ? (*v2)[jk - 1] : 0.0;
                                 } else {
                                     valin1n2 = valin1n1 = valin1;
                                     valin2n2 = valin2n1 = valin2;
@@ -169,16 +183,11 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                                            + (1.0 / 3.0) * (valin1n2 - valin2n2));
                             }
                         }
-                        accumulator += firwindow.at(k) * value;
+                        accumulator += firwindow[k] * value;
                     }
-                    traces.back().data_.emplace_back(accumulator);
+                    outTrace.data_.emplace_back(accumulator);
                 }
             } else if (st == StorageType::Phase) {
-                // Set the label for the plot
-                traces.emplace_back(i.deviceLabel.value());
-                traces.back().fileIndex = i.fIndex;
-                traces.back().type_     = 'P';
-                traces.back().data_.reserve(result_indices.size());
                 // If the analysis type is phase
                 if (iObj.argAnal == AnalysisType::Phase) {
                     // Push the FIR filtered values for each value on the time axis
@@ -194,16 +203,16 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                                 jk = xsize - 1;
                             }
                             // Calculate individual phase sample
-                            auto valin1  = i1 != -1 ? x.at(i1).value().at(jk) : 0;
-                            auto valin2  = i2 != -1 ? x.at(i2).value().at(jk) : 0;
+                            auto valin1  = v1 ? (*v1)[jk] : 0.0;
+                            auto valin2  = v2 ? (*v2)[jk] : 0.0;
                             auto value   = valin1 - valin2;
-                            accumulator += firwindow.at(k) * value;
+                            accumulator += firwindow[k] * value;
                         }
-                        traces.back().data_.emplace_back(accumulator);
+                        outTrace.data_.emplace_back(accumulator);
                     }
                     // Else if the analysis type was voltage
                 } else {
-                    if (i.deviceLabel.value().at(3) == 'B' && vi != -1) {
+                    if (i.deviceLabel.value().at(3) == 'B' && vv) {
                         // Push the FIR filtered values for each value on the time axis
                         for (auto j : result_indices) { // j: Index of window center
                             // FIR filter phase
@@ -217,10 +226,10 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                                     jk = xsize - 1;
                                 }
                                 // Get individual phase sample
-                                auto value   = x.at(vi).value().at(jk);
-                                accumulator += firwindow.at(k) * value;
+                                auto value   = (*vv)[jk];
+                                accumulator += firwindow[k] * value;
                             }
-                            traces.back().data_.emplace_back(accumulator);
+                            outTrace.data_.emplace_back(accumulator);
                         }
                     } else {
                         // Calculate the phase for all points in time.
@@ -229,9 +238,9 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                         std::vector<double> vectphase;
                         vectphase.reserve(xsize);
                         double phaseN1 = 0., phaseN2 = phaseN1;
-                        for (auto j = 0; j < xsize; j++) {
-                            auto valin1 = i1 != -1 ? x.at(i1).value().at(j) : 0;
-                            auto valin2 = i2 != -1 ? x.at(i2).value().at(j) : 0;
+                        for (size_t j = 0; j < xsize; j++) {
+                            auto valin1 = v1 ? (*v1)[j] : 0.0;
+                            auto valin2 = v2 ? (*v2)[j] : 0.0;
                             auto value  = ((2.0 * iObj.transSim.tstep()) / (3.0 * Constants::SIGMA)) * (valin1 - valin2)
                                          + (4.0 / 3.0) * (phaseN1) - (1.0 / 3.0) * (phaseN2);
                             phaseN2 = phaseN1;
@@ -251,18 +260,17 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                                     jk = xsize - 1;
                                 }
                                 // Get individual phase sample
-                                auto value   = vectphase.at(jk);
-                                accumulator += firwindow.at(k) * value;
+                                auto value   = vectphase[jk];
+                                accumulator += firwindow[k] * value;
                             }
-                            traces.back().data_.emplace_back(accumulator);
+                            outTrace.data_.emplace_back(accumulator);
                         }
                     }
                 }
             } else if (st == StorageType::Current) {
-                traces.emplace_back(i.deviceLabel.value());
-                traces.back().fileIndex = i.fIndex;
-                traces.back().type_     = 'I';
-                traces.back().data_.reserve(result_indices.size());
+                Function localSrc;
+                bool     isISrc = (i.deviceLabel.value().at(3) == 'I');
+                if (isISrc) { localSrc = mObj.sourcegen.at(i.sourceIndex.value()); }
                 // Push the FIR filtered values for each value on the time axis
                 for (auto j : result_indices) { // j: Index of window center
                     // FIR filter current
@@ -278,17 +286,26 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                         }
                         // Get individual current sample
                         double value;
-                        if (i.deviceLabel.value().at(3) != 'I') {
-                            value = x.at(i1).value().at(jk);
+                        if (!isISrc) {
+                            value = (*v1)[jk];
                         } else {
-                            value = mObj.sourcegen.at(i.sourceIndex.value()).value(t.at(jk));
+                            value = localSrc.value(t[jk]);
                         }
-                        accumulator += firwindow.at(k) * value;
+                        accumulator += firwindow[k] * value;
                     }
-                    traces.back().data_.emplace_back(accumulator);
+                    outTrace.data_.emplace_back(accumulator);
                 }
             }
-            ++cc;
+        };
+#ifdef _OPENMP
+        if (iObj.argPar && nTraces >= 2) {
+            const int nThreads = std::min<int>(omp_get_max_threads(), static_cast<int>(nTraces));
+#pragma omp parallel for schedule(dynamic) num_threads(nThreads)
+            for (int64_t idx = 0; idx < nTraces; ++idx) { process_trace(idx); }
+        } else
+#endif
+        {
+            for (int64_t idx = 0; idx < nTraces; ++idx) { process_trace(idx); }
         }
         if (!iObj.argMin) {
             bar.complete();
@@ -342,31 +359,34 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
 
 void Output::format_csv_or_dat(const std::string& filename, const char& delimiter, bool argmin, int64_t fIndex) {
     std::vector<int64_t> tIndices = {0};
-    for (auto i = 1; i < traces.size(); ++i) {
-        if (traces.at(i).fileIndex == fIndex || fIndex == -1) { tIndices.emplace_back(i); }
+    for (size_t i = 1; i < traces.size(); ++i) {
+        if (traces[i].fileIndex == fIndex || fIndex == -1) { tIndices.emplace_back(i); }
     }
-    std::ofstream outfile(filename);
+    std::ofstream     outfile(filename);
+    std::vector<char> ioBuf(262144);
+    outfile.rdbuf()->pubsetbuf(ioBuf.data(), static_cast<std::streamsize>(ioBuf.size()));
     outfile << std::setprecision(15);
     if (outfile.is_open()) {
-        for (auto i = 0; i < tIndices.size() - 1; ++i) { outfile << traces.at(tIndices.at(i)).name_ << delimiter; }
-        outfile << traces.at(tIndices.at(tIndices.size() - 1)).name_ << "\n";
+        for (size_t i = 0; i < tIndices.size() - 1; ++i) { outfile << traces[tIndices[i]].name_ << delimiter; }
+        outfile << traces[tIndices.back()].name_ << "\n";
         ProgressBar bar;
+        const size_t numRows = traces[0].data_.size();
+        const size_t numCols = tIndices.size();
         if (!argmin) {
             bar.create_thread();
             bar.set_bar_width(30);
             bar.fill_bar_progress_with("O");
             bar.fill_bar_remainder_with(" ");
             bar.set_status_text("Writing Output");
-            bar.set_total((float) traces.at(0).data_.size());
+            bar.set_total((float) numRows);
         }
-        for (auto j = 0; j < traces.at(0).data_.size(); ++j) {
+        outfile << std::scientific << std::setprecision(6);
+        for (size_t j = 0; j < numRows; ++j) {
             if (!argmin) { bar.update(static_cast<float>(j)); }
-            for (auto i = 0; i < tIndices.size() - 1; ++i) {
-                outfile << std::scientific << std::setprecision(6) << traces.at(tIndices.at(i)).data_.at(j)
-                        << delimiter;
+            for (size_t i = 0; i < numCols - 1; ++i) {
+                outfile << traces[tIndices[i]].data_[j] << delimiter;
             }
-            outfile << std::scientific << std::setprecision(6)
-                    << traces.at(tIndices.at(tIndices.size() - 1)).data_.at(j) << "\n";
+            outfile << traces[tIndices[numCols - 1]].data_[j] << "\n";
         }
         if (!argmin) {
             bar.complete();

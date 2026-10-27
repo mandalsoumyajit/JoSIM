@@ -93,5 +93,5 @@ Resistor::Resistor(const std::pair<tokens_t, string_o>& s,
 
 // Update timestep based on a scalar factor i.e 0.5 for half the timestep
 void Resistor::update_timestep(const double& factor) {
-    if (at_ == AnalysisType::Phase) { matrixInfo.nonZeros_.back() = factor * factor * matrixInfo.nonZeros_.back(); }
+    if (at_ == AnalysisType::Phase) { matrixInfo.nonZeros_.back() = factor * matrixInfo.nonZeros_.back(); }
 }

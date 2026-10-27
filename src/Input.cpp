@@ -39,7 +39,7 @@ std::vector<tokens_t> Input::read_input(LineInput& input, string_o fileName) {
         // Remove all Carriage Return characters
         line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
         // Remove all the leading, trailing and extra white spaces
-        line = std::regex_replace(line, std::regex("^ +| +$|( ) +"), "$1");
+        Misc::collapse_spaces(line);
         if (!line.empty() && line.at(0) != '*' && line.at(0) != '#') {
             // Tokenize the line
             tokens = Misc::tokenize(line);

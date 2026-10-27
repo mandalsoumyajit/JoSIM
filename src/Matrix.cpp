@@ -148,6 +148,8 @@ void Matrix::create_components(Input& iObj) {
             case 'I':
                 // Create a current source and add it to the current sources list
                 components.currentsources.emplace_back(CurrentSource(i, nodeConfig.at(cc), nm, lm, sourcegen.size()));
+                components.csMap.emplace(components.currentsources.back().netlistInfo.label_,
+                                         components.currentsources.size() - 1);
                 // Add it to the global sources list
                 sourcegen.emplace_back();
                 sourcegen.back().parse_function(Misc::vector_to_string(i.first), iObj, i.second);
@@ -262,6 +264,11 @@ void Matrix::create_components(Input& iObj) {
         // Increment the component counter
         ++cc;
     }
+    components.deviceMap.reserve(components.devices.size());
+    for (int64_t devIdx = 0; devIdx < static_cast<int64_t>(components.devices.size()); ++devIdx) {
+        std::visit([&](const auto& device) { components.deviceMap.emplace(device.netlistInfo.label_, devIdx); },
+                   components.devices[devIdx]);
+    }
     if (!iObj.argMin) {
         bar.complete();
         std::cout << "\n";
@@ -293,18 +300,10 @@ void Matrix::handle_mutual_inductance(Input& iObj) {
         }
         // Variables to store the indices of the relevant inductors
         int_o ind1Index, ind2Index;
-        // Loop through all the components in the simulation
-        for (auto i = 0; i < components.devices.size(); ++i) {
-            // Find the component label
-            const auto& label = std::visit(
-                    [](const auto& device) noexcept -> const std::string& { return device.netlistInfo.label_; },
-                    components.devices.at(i));
-            // See if it matches the first inductor label of the mutual inductance
-            if (label == s.first.at(1)) { ind1Index = i; }
-            // See if it matches the second inductor label of the mutual inductance
-            if (label == s.first.at(2)) { ind2Index = i; }
-            if (ind2Index && ind1Index) { break; }
-        }
+        auto  it1 = components.deviceMap.find(s.first.at(1));
+        if (it1 != components.deviceMap.end()) { ind1Index = it1->second; }
+        auto it2 = components.deviceMap.find(s.first.at(2));
+        if (it2 != components.deviceMap.end()) { ind2Index = it2->second; }
         // Complain if any of these inductors do not exist
         if (!ind1Index) { Errors::invalid_component_errors(ComponentErrors::MISSING_INDUCTOR, s.first.at(1)); }
         if (!ind2Index) { Errors::invalid_component_errors(ComponentErrors::MISSING_INDUCTOR, s.first.at(2)); }
@@ -376,12 +375,15 @@ void Matrix::create_nz() {
     }
     // Loop through all the devices
     for (auto& i : components.devices) {
-        // Get each device's non zero vector
-        const auto& nonZeros = std::visit(
-                [](const auto& device) noexcept -> const std::vector<double>& { return device.matrixInfo.nonZeros_; },
+        std::visit(
+                [&](auto& device) {
+                    const auto& nonZeros = device.matrixInfo.nonZeros_;
+                    nz.insert(nz.end(), nonZeros.begin(), nonZeros.end());
+                    if constexpr (std::is_same_v<std::decay_t<decltype(device)>, JJ>) {
+                        device.nzBackIndex_ = static_cast<int64_t>(nz.size()) - 1;
+                    }
+                },
                 i);
-        // Insert the non zero vector of the device into the greater vector
-        nz.insert(nz.end(), nonZeros.begin(), nonZeros.end());
     }
 }
 
@@ -398,14 +400,12 @@ void Matrix::create_ci() {
     }
     // Loop through all the devices
     for (auto& i : components.devices) {
-        // Get each device's column index vector
-        const auto& columnIndices = std::visit(
-                [](const auto& device) noexcept -> const std::vector<int64_t>& {
-                    return device.matrixInfo.columnIndex_;
+        std::visit(
+                [&](const auto& device) {
+                    const auto& columnIndices = device.matrixInfo.columnIndex_;
+                    ci.insert(ci.end(), columnIndices.begin(), columnIndices.end());
                 },
                 i);
-        // Insert the column index vector of the device into the greater vector
-        ci.insert(ci.end(), columnIndices.begin(), columnIndices.end());
     }
 }
 
@@ -418,16 +418,11 @@ void Matrix::create_rp() {
     for (const auto& it : nc) { rp.emplace_back(rp.back() + it.size()); }
     // Loop through all the devices
     for (auto& i : components.devices) {
-        // Get the row pointer vector for each device
-        const auto& rowPointer = std::visit(
-                [](const auto& device) noexcept -> const std::vector<int64_t>& {
-                    return device.matrixInfo.rowPointer_;
+        std::visit(
+                [&](const auto& device) {
+                    const auto& rowPointer = device.matrixInfo.rowPointer_;
+                    for (const auto& ti : rowPointer) { rp.emplace_back(rp.back() + ti); }
                 },
                 i);
-        // For each entry in the row pointer vector of the device
-        for (const auto& ti : rowPointer) {
-            // Add it to the last entry of the greater row pointer vector
-            rp.emplace_back(rp.back() + ti);
-        }
     }
 }

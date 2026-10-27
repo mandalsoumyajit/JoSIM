@@ -259,6 +259,9 @@ void Function::parse_cus(const tokens_t& t, const Input& iObj, const string_o& s
     for (auto i = 0; i < WF.size(); ++i) { ampValues_.emplace_back(Misc::modifier(WF.at(i)) * miscValues_.at(1)); }
     if (miscValues_.at(0) < tstep) { miscValues_.at(0) = tstep; }
     for (int i = 0; i < ampValues_.size(); ++i) { timeValues_.emplace_back(miscValues_.at(3) + i * miscValues_.at(0)); }
+    if (static_cast<int>(std::round(miscValues_.at(2))) == 2 && timeValues_.size() >= 3) {
+        cusSpline_ = std::make_shared<tk::spline>(timeValues_, ampValues_);
+    }
     // Store the stop time
     miscValues_.emplace_back(iObj.transSim.tstop());
 }
@@ -316,12 +319,15 @@ double Function::return_pwl(double& x) {
         return ampValues_.back();
         // Else check within which range x falls
     } else {
-        for (auto i = 0; i < timeValues_.size() - 1; ++i) {
-            if (x >= timeValues_.at(i) && x < timeValues_.at(i + 1)) {
-                double& y2 = ampValues_.at(i + 1);
-                double& y1 = ampValues_.at(i);
-                double& x2 = timeValues_.at(i + 1);
-                double& x1 = timeValues_.at(i);
+        const size_t n = timeValues_.size() - 1;
+        size_t       i = (lastIdx_ < n && x >= timeValues_[lastIdx_]) ? lastIdx_ : 0;
+        for (; i < n; ++i) {
+            if (x >= timeValues_[i] && x < timeValues_[i + 1]) {
+                lastIdx_   = i;
+                double& y2 = ampValues_[i + 1];
+                double& y1 = ampValues_[i];
+                double& x2 = timeValues_[i + 1];
+                double& x1 = timeValues_[i];
                 // Calculate function value and return it
                 return y1 + ((y2 - y1) / (x2 - x1)) * (x - x1);
             }
@@ -407,8 +413,8 @@ double Function::return_cus(double& x) {
             if (idx != 0) { y1 = ampValues_.at(idx - 1); }
             return y1 + ((y2 - y1) / ts) * (norm_x - (idx * ts));
         } else if (im == 2) {
-            tk::spline s(timeValues_, ampValues_);
-            return s(norm_x);
+            if (!cusSpline_) { cusSpline_ = std::make_shared<tk::spline>(timeValues_, ampValues_); }
+            return (*static_cast<const tk::spline*>(cusSpline_.get()))(norm_x);
         }
     }
     return 0.0;
@@ -444,11 +450,14 @@ double Function::return_pws(double& x) {
     if (x >= timeValues_.back()) { return ampValues_.back(); }
 
     // Find the segment [x1, x2)
-    for (size_t i = 0; i + 1 < timeValues_.size(); ++i) {
+    const size_t n = timeValues_.size() - 1;
+    size_t       i = (lastIdx_ < n && x >= timeValues_[lastIdx_]) ? lastIdx_ : 0;
+    for (; i < n; ++i) {
         double x1 = timeValues_[i];
         double x2 = timeValues_[i + 1];
 
         if (x >= x1 && x < x2) {
+            lastIdx_  = i;
             double y1 = ampValues_[i];
             double y2 = ampValues_[i + 1];
 

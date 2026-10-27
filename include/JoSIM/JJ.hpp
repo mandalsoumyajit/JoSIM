@@ -55,11 +55,13 @@ class JJ : public BasicComponent {
 
   public:
     int64_t                 variableIndex_ = 0;
+    int64_t                 nzBackIndex_   = 0;
     double                  area_          = 1.0;
     std::optional<double>   Ic_, temp_, neb_, spAmp_;
     Model                   model_;
     double                  phaseConst_ = 0.0;
     double                  lowerB_ = 0.0, upperB_ = 0.0, gLarge_ = 0.0;
+    double                  negInvSubgap_ = 0.0, negInvTrans_ = 0.0, negInvNormal_ = 0.0;
     double                  del0_ = 0.0, del_ = 0.0;
     double                  pn1_ = 0.0, pn2_ = pn1_, pn3_ = pn2_, pn4_ = pn3_, phi0_ = 0.0;
     double                  vn1_ = 0.0, vn2_ = vn1_, vn3_ = vn2_, vn4_ = vn3_, vn5_ = vn4_, vn6_ = vn5_;

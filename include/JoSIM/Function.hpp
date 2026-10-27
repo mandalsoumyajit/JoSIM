@@ -5,6 +5,7 @@
 
 #include "Input.hpp"
 
+#include <memory>
 #include <vector>
 
 namespace JoSIM {
@@ -13,10 +14,12 @@ enum class FunctionType { PWL = 0, PULSE = 1, SINUSOID = 2, CUS = 3, NOISE = 4, 
 
 class Function {
   private:
-    FunctionType        fType_ = FunctionType::PWL;
-    std::vector<double> timeValues_;
-    std::vector<double> ampValues_;
-    std::vector<double> miscValues_;
+    FunctionType          fType_ = FunctionType::PWL;
+    std::vector<double>   timeValues_;
+    std::vector<double>   ampValues_;
+    std::vector<double>   miscValues_;
+    size_t                lastIdx_ = 0;
+    std::shared_ptr<void> cusSpline_;
     void                parse_pwl(const tokens_t& t, const Input& iObj, const string_o& s);
     void                parse_pulse(const tokens_t& t, const Input& iObj, const string_o& s);
     void                parse_sin(const tokens_t& t, const Input& iObj, const string_o& s);
@@ -39,9 +42,13 @@ class Function {
     double              value(double x);
     void                ampValues(std::vector<double> values);
 
-    std::vector<double> ampValues() { return ampValues_; }
+    std::vector<double>&       ampValues() noexcept { return ampValues_; }
+    const std::vector<double>& ampValues() const noexcept { return ampValues_; }
 
-    void                clearMisc() { miscValues_.clear(); }
+    void                       clearMisc() {
+        miscValues_.clear();
+        lastIdx_ = 0;
+    }
 
 }; // class Function
 

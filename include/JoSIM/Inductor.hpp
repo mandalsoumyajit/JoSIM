@@ -57,7 +57,7 @@ class Inductor : public BasicComponent {
 
     void add_mutualInductance(const double& m, const AnalysisType& at, const double& h, const int64_t& ci);
 
-    const mutualinductors get_mutualInductance() const { return mutualInductances_; }
+    const mutualinductors& get_mutualInductance() const noexcept { return mutualInductances_; }
 
     void                  update_timestep(const double& factor) override;
 

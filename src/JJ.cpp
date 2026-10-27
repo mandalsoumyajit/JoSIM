@@ -101,6 +101,9 @@ JJ::JJ(const std::pair<tokens_t, string_o>& s,
     set_node_indices(tokens_t(s.first.begin() + 1, s.first.begin() + 3), nm, nc);
     // Set the non zero, column index and row pointer vectors
     set_matrix_info();
+    negInvSubgap_ = -1 / subgap_impedance();
+    negInvTrans_  = -1 / transient_impedance();
+    negInvNormal_ = -1 / normal_impedance();
     if (temp_) {
         spAmp_ = Noise::determine_spectral_amplitude(this->model_.r0(), temp_.value());
         Function tnoise;
@@ -241,9 +244,9 @@ bool JJ::update_value(const double& v) {
         // Set the transition current to 0
         it_ = 0.0;
         // If the non zero vector does not end with the subgap conductance
-        if (matrixInfo.nonZeros_.back() != -1 / subgap_impedance()) {
+        if (matrixInfo.nonZeros_.back() != negInvSubgap_) {
             // Make it end with the subgap conductance
-            matrixInfo.nonZeros_.back() = -1 / subgap_impedance();
+            matrixInfo.nonZeros_.back() = negInvSubgap_;
             // Set state to 0 (Subgap)
             state_                      = 0;
             // Return that a value has been updated
@@ -259,9 +262,9 @@ bool JJ::update_value(const double& v) {
         // If the voltage is negative, current must be negative
         if (v < 0) { it_ = -it_; }
         // If the back of the non zero vector is not the transition conductance
-        if (matrixInfo.nonZeros_.back() != -1 / transient_impedance()) {
+        if (matrixInfo.nonZeros_.back() != negInvTrans_) {
             // Set it to the transition conductance
-            matrixInfo.nonZeros_.back() = -1 / transient_impedance();
+            matrixInfo.nonZeros_.back() = negInvTrans_;
             // Set state to 1 (Transition)
             state_                      = 1;
             // Return that a value has changed
@@ -280,9 +283,9 @@ bool JJ::update_value(const double& v) {
         // Reset the transition current, transition has passed.
         it_ = 0.0;
         // If the back of the non zero vector is not the normal conductance
-        if (matrixInfo.nonZeros_.back() != -1 / normal_impedance()) {
+        if (matrixInfo.nonZeros_.back() != negInvNormal_) {
             // Set it to the normal conductance
-            matrixInfo.nonZeros_.back() = -1 / normal_impedance();
+            matrixInfo.nonZeros_.back() = negInvNormal_;
             // Set state to 2 (Normal)
             state_                      = 2;
             // Return that a value has changed

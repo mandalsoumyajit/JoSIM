@@ -31,63 +31,63 @@ class Model {
         : vg_(2.8E-3), ic_(1E-3), cpr_({1.0}), rtype_(1), rn_(5), r0_(30), c_(2.5E-12), t_(4.2), tc_(9.1),
           deltaV_(0.1E-3), d_(0), icFct_(Constants::PI / 4), phiOff_(0), tDep_(false) {};
 
-    std::string         modelName() const { return modelName_; }
+    const std::string&         modelName() const noexcept { return modelName_; }
 
-    void                modelName(const std::string& n) { modelName_ = n; }
+    void                       modelName(const std::string& n) { modelName_ = n; }
 
-    double              vg() const { return vg_; }
+    double                     vg() const noexcept { return vg_; }
 
-    void                vg(const double& v) { vg_ = v; }
+    void                       vg(const double& v) { vg_ = v; }
 
-    double              ic() const { return ic_; }
+    double                     ic() const noexcept { return ic_; }
 
-    void                ic(const double& i) { ic_ = i; }
+    void                       ic(const double& i) { ic_ = i; }
 
-    std::vector<double> cpr() const { return cpr_; }
+    const std::vector<double>& cpr() const noexcept { return cpr_; }
 
-    void                cpr(const std::vector<double>& i) { cpr_ = i; }
+    void                       cpr(const std::vector<double>& i) { cpr_ = i; }
 
-    int64_t             rtype() const { return rtype_; }
+    int64_t                    rtype() const noexcept { return rtype_; }
 
-    void                rtype(const int64_t& r) { rtype_ = r; }
+    void                       rtype(const int64_t& r) { rtype_ = r; }
 
-    double              rn() const { return rn_; }
+    double                     rn() const noexcept { return rn_; }
 
-    void                rn(const double& r) { rn_ = r; }
+    void                       rn(const double& r) { rn_ = r; }
 
-    double              r0() const { return r0_; }
+    double                     r0() const noexcept { return r0_; }
 
-    void                r0(const double& r) { r0_ = r; }
+    void                       r0(const double& r) { r0_ = r; }
 
-    double              c() const { return c_; }
+    double                     c() const noexcept { return c_; }
 
-    void                c(const double& c) { c_ = c; }
+    void                       c(const double& c) { c_ = c; }
 
-    double              t() const { return t_; }
+    double                     t() const noexcept { return t_; }
 
-    void                t(const double& t) { t_ = t; }
+    void                       t(const double& t) { t_ = t; }
 
-    double              tc() const { return tc_; }
+    double                     tc() const noexcept { return tc_; }
 
-    void                tc(const double& t) { tc_ = t; }
+    void                       tc(const double& t) { tc_ = t; }
 
-    double              deltaV() const { return deltaV_; }
+    double                     deltaV() const noexcept { return deltaV_; }
 
-    void                deltaV(const double& d) { deltaV_ = d; }
+    void                       deltaV(const double& d) { deltaV_ = d; }
 
-    double              d() const { return d_; }
+    double                     d() const noexcept { return d_; }
 
-    void                d(const double& t) { d_ = t; }
+    void                       d(const double& t) { d_ = t; }
 
-    double              icFct() const { return icFct_; }
+    double                     icFct() const noexcept { return icFct_; }
 
-    void                icFct(const double& r) { icFct_ = r; }
+    void                       icFct(const double& r) { icFct_ = r; }
 
-    double              phiOff() const { return phiOff_; }
+    double                     phiOff() const noexcept { return phiOff_; }
 
-    void                phiOff(const double& o) { phiOff_ = o; }
+    void                       phiOff(const double& o) { phiOff_ = o; }
 
-    bool                tDep() { return tDep_; }
+    bool                       tDep() const noexcept { return tDep_; }
 
     void                tDep(bool b) { tDep_ = b; }
 

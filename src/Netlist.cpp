@@ -44,17 +44,14 @@ void Netlist::id_io_subc_label(const tokens_t&                                  
 }
 
 bool Netlist::rename_io_nodes(std::string& node, const tokens_t& subIO, const tokens_t& parentIO) {
-    // If the subcircuit IO contains the first node
-    if (std::count(subIO.begin(), subIO.end(), node) != 0) {
-        // Loop through the subcircuit IO
-        for (auto l = 0; l < subIO.size(); ++l) {
-            // If the nodes match
-            if (::strcmp(node.c_str(), subIO.at(l).c_str()) == 0) {
-                // Replace the node with the IO node
-                node = parentIO.at(l);
-                // Return true
-                return true;
-            }
+    // Loop through the subcircuit IO in a single pass
+    for (size_t l = 0; l < subIO.size(); ++l) {
+        // If the nodes match
+        if (node == subIO[l]) {
+            // Replace the node with the IO node
+            node = parentIO[l];
+            // Return true
+            return true;
         }
     }
     // Return false
@@ -154,11 +151,12 @@ void Netlist::expand_subcircuits() {
             if (sanityCheck && sanityCheckSubckts.count(i.first) != 0) {
                 for (auto node : i.second.io) { increment_subcircuit_node_count(i.first, node); }
             }
-            for (auto j = 0; j < subcircuits.at(i.first).lines.size(); ++j) {
-                // Shorthand for the current subcircuit
-                Subcircuit& subcircuit      = subcircuits.at(i.first);
-                // Shorthand for the current subcircuit line
-                tokens_t&   subcCurrentLine = subcircuit.lines.at(j).first;
+            Subcircuit& subcircuit = subcircuits.at(i.first);
+            if (!subcircuit.containsSubckt) { continue; }
+            std::vector<std::pair<tokens_t, string_o>> newLines;
+            newLines.reserve(subcircuit.lines.size() * 2);
+            for (size_t j = 0; j < subcircuit.lines.size(); ++j) {
+                tokens_t& subcCurrentLine = subcircuit.lines[j].first;
                 // If the line denotes a subcircuit
                 if (subcCurrentLine.front().at(0) == 'X') {
                     // Variable to store io and parameters
@@ -168,17 +166,17 @@ void Netlist::expand_subcircuits() {
                     if (sanityCheck && sanityCheckSubckts.count(i.first) != 0) {
                         for (auto node : io) { increment_subcircuit_node_count(i.first, node); }
                     }
-                    // Create a copy of the subircuit for this instance
-                    Subcircuit subc = subcircuits.at(subcktName);
+                    const Subcircuit& targetSubc = subcircuits.at(subcktName);
                     // If not nested
-                    if (!subc.containsSubckt) {
+                    if (!targetSubc.containsSubckt) {
+                        Subcircuit subc = targetSubc;
                         // Expand the IO nodes of the subcircuit for this instance
                         expand_io(subc, params, io, label);
-                        // Erase the current line (tokens)
-                        subcircuit.lines.erase(subcircuit.lines.begin() + j);
-                        // Insert the subcircuit token lines at the erased line position
-                        subcircuit.lines.insert(subcircuit.lines.begin() + j, subc.lines.begin(), subc.lines.end());
-                        // Reduce the total amound of subcircuits in this subcircuit by 1
+                        // Append the expanded lines in O(1) amortized time
+                        newLines.insert(newLines.end(),
+                                        std::make_move_iterator(subc.lines.begin()),
+                                        std::make_move_iterator(subc.lines.end()));
+                        // Reduce the total amount of subcircuits in this subcircuit by 1
                         --subcircuit.subcktCounter;
                         ++cc;
                         // Reduce the total nested subcircuit count by 1
@@ -188,9 +186,14 @@ void Netlist::expand_subcircuits() {
                             // This subcircuit no longer contains subcircuits
                             subcircuit.containsSubckt = false;
                         }
+                    } else {
+                        newLines.push_back(std::move(subcircuit.lines[j]));
                     }
+                } else {
+                    newLines.push_back(std::move(subcircuit.lines[j]));
                 }
             }
+            subcircuit.lines = std::move(newLines);
         }
     }
     // Let the user know subcircuit expansion is complete
@@ -303,25 +306,25 @@ void Netlist::sanity_check_subcircuits() {
     }
 }
 
-void Netlist::sanity_check(Components components) {
+void Netlist::sanity_check(const Components& components) {
     if (!sanityCheck) { return; }
 
     // Update node counts in main design
-    for (auto device : components.devices) {
-        // If device belongs to a subcircuit
-        if (std::visit([](const auto device) { return device.netlistInfo.label_.find("|") != std::string::npos; },
-                       device)) {
-            continue;
-        }
-        // Only consider nodes in maindesign (top)
-        auto nodes = std::visit([](const auto device) { return device.nodes; }, device);
-        for (auto node : nodes) { increment_maindesign_node_count(node); }
+    for (const auto& device : components.devices) {
+        std::visit(
+                [&](const auto& dev) {
+                    // Only consider nodes in maindesign (top)
+                    if (dev.netlistInfo.label_.find('|') == std::string::npos) {
+                        for (const auto& node : dev.nodes) { increment_maindesign_node_count(node); }
+                    }
+                },
+                device);
     }
-    for (auto source : components.currentsources) {
+    for (const auto& source : components.currentsources) {
         // If device belongs to a subcircuit
         if (source.netlistInfo.label_.find("|") != std::string::npos) { continue; }
         // Only consider nodes in maindesign (top)
-        for (auto node : source.nodes) { increment_maindesign_node_count(node); }
+        for (const auto& node : source.nodes) { increment_maindesign_node_count(node); }
     }
 
     std::cout << "\nSanity check results:" << std::endl;

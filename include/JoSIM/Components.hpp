@@ -43,6 +43,8 @@ class Components {
     std::vector<int64_t> junctionIndices, resistorIndices, inductorIndices, capacitorIndices, vsIndices, psIndices,
             txIndices, vccsIndices, cccsIndices, vcvsIndices, ccvsIndices;
     std::vector<std::pair<tokens_t, string_o>> mutualinductances;
+    std::unordered_map<std::string, int64_t>   deviceMap;
+    std::unordered_map<std::string, int64_t>   csMap;
 }; // class Components
 
 } // namespace JoSIM

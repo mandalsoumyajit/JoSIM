@@ -32,10 +32,24 @@ class Simulation {
     int64_t             simSize_;
     JoSIM::AnalysisType atyp_;
     bool                minOut_;
+    bool                parallel_                = false;
+    bool                hasJJThermalNoise_       = false;
+    bool                hasResistorThermalNoise_ = false;
     bool                needsLU_;
     bool                needsTR_ = true;
     bool                startup_;
     double              stepSize_, prstep_, prstart_;
+
+    // Contiguous homogeneous device storage for fast hot-loop iteration
+    std::vector<JJ>               jjs_;
+    std::vector<Inductor>         inductors_;
+    std::vector<Resistor>         resistors_;
+    std::vector<Capacitor>        capacitors_;
+    std::vector<TransmissionLine> txlines_;
+    std::vector<VoltageSource>    vsources_;
+    std::vector<PhaseSource>      psources_;
+    std::vector<CCVS>             ccvss_;
+    std::vector<VCCS>             vccss_;
 #ifdef SLU
     LUSolve lu;
 #else

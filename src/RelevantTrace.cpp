@@ -150,33 +150,22 @@ void JoSIM::handle_current(const std::string& s, Matrix& mObj, int64_t fIndex) {
     temp.fIndex      = fIndex;
     temp.storageType = StorageType::Current;
     if (s.at(0) != 'I') {
-        for (auto j = 0; j < mObj.components.devices.size(); ++j) {
-            const auto& l = std::visit(
-                    [](const auto& device) noexcept -> const std::string& { return device.netlistInfo.label_; },
-                    mObj.components.devices.at(j));
-
-            if (l == s) {
-                temp.deviceLabel = "\"I(" + s + ")\"";
-                temp.device      = true;
-                temp.index1      = std::visit(
-                        [](const auto& device) noexcept -> const int64_t& {
-                            return device.indexInfo.currentIndex_.value();
-                        },
-                        mObj.components.devices.at(j));
-                mObj.relevantTraces.emplace_back(temp);
-                break;
-            }
+        auto it = mObj.components.deviceMap.find(s);
+        if (it != mObj.components.deviceMap.end()) {
+            temp.deviceLabel = "\"I(" + s + ")\"";
+            temp.device      = true;
+            std::visit([&](const auto& device) { temp.index1 = device.indexInfo.currentIndex_.value(); },
+                       mObj.components.devices.at(it->second));
+            mObj.relevantTraces.emplace_back(temp);
         }
         if (!temp.deviceLabel) { Errors::control_errors(ControlErrors::NODECURRENT, s); }
     } else {
-        for (auto i = 0; i < mObj.components.currentsources.size(); ++i) {
-            if (s == mObj.components.currentsources.at(i).netlistInfo.label_) {
-                temp.deviceLabel = "\"I(" + s + ")\"";
-                temp.device      = true;
-                temp.sourceIndex = mObj.components.currentsources.at(i).sourceIndex_;
-                mObj.relevantTraces.emplace_back(temp);
-                break;
-            }
+        auto it = mObj.components.csMap.find(s);
+        if (it != mObj.components.csMap.end()) {
+            temp.deviceLabel = "\"I(" + s + ")\"";
+            temp.device      = true;
+            temp.sourceIndex = mObj.components.currentsources.at(it->second).sourceIndex_;
+            mObj.relevantTraces.emplace_back(temp);
         }
     }
 }
@@ -190,49 +179,38 @@ void JoSIM::handle_voltage_or_phase(const std::string& s, bool voltage, Matrix& 
     } else {
         temp.storageType = StorageType::Phase;
     }
-    for (auto j = 0; j < mObj.components.devices.size(); ++j) {
-        const auto& l = std::visit(
-                [](const auto& device) noexcept -> const std::string& { return device.netlistInfo.label_; },
-                mObj.components.devices.at(j));
-
-        if (l == tokens.at(0)) {
-            if (tokens.size() < 1) {
-                Errors::control_errors(ControlErrors::MATHOPS, s);
-            } else {
-                if (s.at(0) != 'B') {
-                    if (voltage) {
-                        temp.deviceLabel = "\"V(" + s + ")\"";
-                    } else {
-                        temp.deviceLabel = "\"P(" + s + ")\"";
-                    }
-                    temp.device = true;
-                    temp.index1 = std::visit(
-                            [](const auto& device) noexcept -> const int_o& { return device.indexInfo.posIndex_; },
-                            mObj.components.devices.at(j));
-                    temp.index2 = std::visit(
-                            [](const auto& device) noexcept -> const int_o& { return device.indexInfo.negIndex_; },
-                            mObj.components.devices.at(j));
-                    mObj.relevantTraces.emplace_back(temp);
-                    break;
+    auto it = mObj.components.deviceMap.find(tokens.at(0));
+    if (it != mObj.components.deviceMap.end()) {
+        const auto& devVar = mObj.components.devices.at(it->second);
+        if (tokens.size() < 1) {
+            Errors::control_errors(ControlErrors::MATHOPS, s);
+        } else {
+            if (s.at(0) != 'B') {
+                if (voltage) {
+                    temp.deviceLabel = "\"V(" + s + ")\"";
                 } else {
-                    if (voltage) {
-                        temp.deviceLabel = "\"V(" + s + ")\"";
-                    } else {
-                        temp.deviceLabel = "\"P(" + s + ")\"";
-                    }
-                    temp.device = true;
-                    temp.index1 = std::visit(
-                            [](const auto& device) noexcept -> const int_o& { return device.indexInfo.posIndex_; },
-                            mObj.components.devices.at(j));
-                    temp.index2 = std::visit(
-                            [](const auto& device) noexcept -> const int_o& { return device.indexInfo.negIndex_; },
-                            mObj.components.devices.at(j));
-                    try {
-                        temp.variableIndex = std::get<JJ>(mObj.components.devices.at(j)).variableIndex_;
-                        mObj.relevantTraces.emplace_back(temp);
-                        break;
-                    } catch (const std::bad_variant_access&) {}
+                    temp.deviceLabel = "\"P(" + s + ")\"";
                 }
+                temp.device = true;
+                std::visit(
+                        [&](const auto& device) {
+                            temp.index1 = device.indexInfo.posIndex_;
+                            temp.index2 = device.indexInfo.negIndex_;
+                        },
+                        devVar);
+                mObj.relevantTraces.emplace_back(temp);
+            } else if (std::holds_alternative<JJ>(devVar)) {
+                if (voltage) {
+                    temp.deviceLabel = "\"V(" + s + ")\"";
+                } else {
+                    temp.deviceLabel = "\"P(" + s + ")\"";
+                }
+                temp.device        = true;
+                const auto& jjDev  = std::get<JJ>(devVar);
+                temp.index1        = jjDev.indexInfo.posIndex_;
+                temp.index2        = jjDev.indexInfo.negIndex_;
+                temp.variableIndex = jjDev.variableIndex_;
+                mObj.relevantTraces.emplace_back(temp);
             }
         }
     }

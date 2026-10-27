@@ -138,9 +138,10 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                     // Enable parallel processing (EXPERIMENTAL)
                 case 'p':
 #ifdef _OPENMP
-                    std::cout << "Parallelization is ENABLED" << std::endl;
+                    out.parallel = true;
+                    if (!out.minimal) { std::cout << "Parallelization is ENABLED" << std::endl; }
 #else
-                    std::cout << "Parallelization is DISABLED" << std::endl;
+                    if (!out.minimal) { std::cout << "Parallelization is DISABLED" << std::endl; }
 #endif
                     break;
                     // Sanity check input circuit netlist

@@ -42,6 +42,8 @@ namespace Misc {
 
     void        rtrim(std::string& s);
 
+    void        collapse_spaces(std::string& s);
+
     double      modifier(const std::string& value);
 
     void        unique_push(std::vector<std::string>& vector, const std::string& string);

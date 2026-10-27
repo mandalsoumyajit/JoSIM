@@ -35,14 +35,16 @@ class Input {
     AnalysisType                                 argAnal;
     int64_t                                      argVerb;
     bool                                         argMin;
+    bool                                         argPar = false;
 
-    Input(AnalysisType at = AnalysisType::Phase, int64_t verb = 0, bool min = false)
-        : argAnal(at), argVerb(verb), argMin(min) {};
+    Input(AnalysisType at = AnalysisType::Phase, int64_t verb = 0, bool min = false, bool par = false)
+        : argAnal(at), argVerb(verb), argMin(min), argPar(par) {};
 
     Input(CliOptions& cli_options) {
         argAnal                    = cli_options.analysis_type;
         argVerb                    = cli_options.verbose;
         argMin                     = cli_options.minimal;
+        argPar                     = cli_options.parallel;
         cli_output_file            = cli_options.output_file;
         netlist.sanityCheck        = cli_options.sanityCheck;
         netlist.sanityCheckSubckts = cli_options.sanityCheckSubckts;

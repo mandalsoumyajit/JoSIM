@@ -99,7 +99,7 @@ tokens_t Misc::tokenize(const std::string& c, std::string d, bool trimEmpty, boo
         if (trimSpaces) {
             if (!tokens.empty()) {
                 // Remove trailing, leading and duplicate spaces between tokens
-                tokens.back() = std::regex_replace(tokens.back(), std::regex("^ +| +$|( ) +"), "$1");
+                Misc::collapse_spaces(tokens.back());
             }
         }
         lastPos = pos + 1;
@@ -120,7 +120,7 @@ tokens_t Misc::tokenize(const std::string& c, std::string d, bool trimEmpty, boo
     // If trim spaces is enabled
     if (trimSpaces) {
         // Remove trailing, leading and duplicate spaces between tokens
-        tokens.back() = std::regex_replace(tokens.back(), std::regex("^ +| +$|( ) +"), "$1");
+        if (!tokens.empty()) { Misc::collapse_spaces(tokens.back()); }
     }
     // Return the tokens
     return tokens;
@@ -132,6 +132,25 @@ void Misc::ltrim(std::string& s) {
 
 void Misc::rtrim(std::string& s) {
     s.erase(std::find_if(s.rbegin(), s.rend(), [](int ch) { return !std::isspace(ch); }).base(), s.end());
+}
+
+void Misc::collapse_spaces(std::string& s) {
+    size_t write   = 0;
+    bool   inSpace = true; // skip leading spaces
+    for (size_t read = 0; read < s.size(); ++read) {
+        char c = s[read];
+        if (c == ' ') {
+            if (!inSpace) {
+                s[write++] = ' ';
+                inSpace    = true;
+            }
+        } else {
+            s[write++] = c;
+            inSpace    = false;
+        }
+    }
+    if (write > 0 && s[write - 1] == ' ') { --write; }
+    s.resize(write);
 }
 
 double Misc::modifier(const std::string& value) {

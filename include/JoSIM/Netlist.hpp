@@ -73,7 +73,7 @@ class Netlist {
     Netlist() : jjCount(0), compCount(0), subcktCounter(0), nestedSubcktCount(0), containsSubckt(false) {};
     void expand_subcircuits();
     void expand_maindesign();
-    void sanity_check(Components components);
+    void sanity_check(const Components& components);
 };
 
 } // namespace JoSIM

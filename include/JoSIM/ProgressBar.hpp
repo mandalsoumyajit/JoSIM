@@ -60,6 +60,7 @@ class ProgressBar {
                 write_progress(perc);
                 set_currentprogress(perc);
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
         }
         write_progress(100.0f);
     }

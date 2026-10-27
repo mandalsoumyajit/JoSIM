@@ -310,8 +310,9 @@ void Simulation::factorize_lu(Matrix& mObj) {
     if (usePartitions_) {
         const int64_t nParts = static_cast<int64_t>(partitions_.size());
 #ifdef _OPENMP
-        if (parallel_ && nParts >= 2) {
-#pragma omp parallel for schedule(dynamic)
+        if (parallel_ && nParts >= 4 && b_.size() >= 32768) {
+            const int nThreads = std::min<int>(8, std::min<int>(omp_get_max_threads(), static_cast<int>(nParts)));
+#pragma omp parallel for schedule(static) num_threads(nThreads)
             for (int64_t p = 0; p < nParts; ++p) {
                 auto&   part = partitions_[p];
                 int64_t ok   = klu_l_defaults(&part.common);
@@ -349,8 +350,9 @@ void Simulation::refactor_lu(Matrix& mObj) {
     if (usePartitions_) {
         const int64_t nParts = static_cast<int64_t>(partitions_.size());
 #ifdef _OPENMP
-        if (parallel_ && nParts >= 2) {
-#pragma omp parallel for schedule(dynamic)
+        if (parallel_ && nParts >= 4 && b_.size() >= 32768) {
+            const int nThreads = std::min<int>(8, std::min<int>(omp_get_max_threads(), static_cast<int>(nParts)));
+#pragma omp parallel for schedule(static) num_threads(nThreads)
             for (int64_t p = 0; p < nParts; ++p) {
                 auto& part = partitions_[p];
                 if (!part.needsLU) { continue; }
@@ -401,8 +403,9 @@ void Simulation::solve_lu(Matrix& mObj) {
         const int64_t nParts = static_cast<int64_t>(partitions_.size());
         bool          anyErr = false;
 #ifdef _OPENMP
-        if (parallel_ && nParts >= 2) {
-#pragma omp parallel for schedule(dynamic) reduction(|| : anyErr)
+        if (parallel_ && nParts >= 4 && b_.size() >= 32768) {
+            const int nThreads = std::min<int>(8, std::min<int>(omp_get_max_threads(), static_cast<int>(nParts)));
+#pragma omp parallel for schedule(static) num_threads(nThreads) reduction(|| : anyErr)
             for (int64_t p = 0; p < nParts; ++p) {
                 auto& part = partitions_[p];
                 for (int64_t i = 0; i < part.n; ++i) { part.xLocal[i] = b_[part.globalRows[i]]; }

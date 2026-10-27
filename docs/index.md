@@ -1,12 +1,12 @@
 # JoSIM - Superconducting Circuit Simulator
 
-Developers Manual for v2.6.5
+Developers Manual for v2.8
 
 ## Project Status
 
-### Testing: v2.6.5 - Status: [![Build Status](https://joeydelp.visualstudio.com/JoSIM/_apis/build/status/JoSIM-CI-Devel?branchName=testing)](https://joeydelp.visualstudio.com/JoSIM/_build/latest?definitionId=1&branchName=testing)
+### Testing: v2.8 - Status: [![Build Status](https://joeydelp.visualstudio.com/JoSIM/_apis/build/status/JoSIM-CI-Devel?branchName=testing)](https://joeydelp.visualstudio.com/JoSIM/_build/latest?definitionId=1&branchName=testing)
 
-### Stable: v2.6.5 - Status: [![Build Status](https://joeydelp.visualstudio.com/JoSIM/_apis/build/status/JoeyDelp.JoSIM?branchName=master)](https://joeydelp.visualstudio.com/JoSIM/_build/latest?definitionId=3&branchName=master)
+### Stable: v2.8 - Status: [![Build Status](https://joeydelp.visualstudio.com/JoSIM/_apis/build/status/JoeyDelp.JoSIM?branchName=master)](https://joeydelp.visualstudio.com/JoSIM/_build/latest?definitionId=3&branchName=master)
 
 ## Introduction
 
@@ -14,7 +14,7 @@ JoSIM was developed under IARPA contract SuperTools(via the U.S. Army Research O
 
 JoSIM is meant to function as an alternative to the simulators such as JSIM[^1] and WRspice[^2]. JoSIM is written in modern C++ and is fully customizable and extendable to offer support for improved superconducting elements as well better approximations to the Josephson effect in superconducting materials.
 
-A *.cir* file containing a SPICE syntax circuit netlist is provided as input. The circuit netlist, given appropriate input excitations can then be simulated through transient analysis. Results of this simulation can be dumped to standard output or saved in various formats such as a comma separated value (*.csv*) file.
+A *.cir* file containing a SPICE syntax circuit netlist is provided as input. The circuit netlist, given appropriate input excitations can then be simulated through transient analysis. Results of this simulation can be dumped to standard output or saved in text formats (*.csv*, *.dat*, *.raw*) or high-speed binary formats (*.bin*, *.npy*, *.rawb*).
 
 Below is a macro overview of the process performed by JoSIM. This is very basic and is discussed in further detail in the [Technical Discussion](tech_disc.md) section of the documentation.
 
@@ -111,13 +111,19 @@ git clone https://github.com/JoeyDelp/JoSIM.git
 cd JoSIM
 ```
 
-Navigate to the newly cloned/extracted JoSIM directory then run the following commands:
+Navigate to the newly cloned/extracted JoSIM directory then run the following commands (adding `-DPARALLEL=ON` to enable OpenMP parallelization with the `-p` flag):
 
 ```bash
 mkdir build
 cd build
-cmake ..
+cmake .. -DCMAKE_BUILD_TYPE=Release -DPARALLEL=ON
 cmake --build . --config Release
+```
+
+On WSL / Ubuntu Linux, you can also run the provided helper script directly from the repository root to build with Ninja and execute the full CTest regression suite:
+
+```bash
+bash scripts/build_wsl.sh
 ```
 
 This will generate a JoSIM executable in the **build** directory.

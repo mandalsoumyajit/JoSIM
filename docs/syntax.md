@@ -107,11 +107,13 @@ The **CPR** parameter alters each individual harmonic of the junction supercurre
 
 ### Transmission Line
 
-**T**Label&emsp;$N^{+}_{1}$&emsp;$N^{-}_{1}$&emsp;$N^{+}_{2}$&emsp;$N^{-}_{2}$&emsp;**TD=VALUE**&emsp;**Z0=VALUE**
+**T**Label&emsp;$N^{+}_{1}$&emsp;$N^{-}_{1}$&emsp;$N^{+}_{2}$&emsp;$N^{-}_{2}$&emsp;**TD=VALUE**&emsp;**Z0=VALUE**&emsp;[interp=<**0|1**>]
 
 **TD** is the time delay in seconds.
 
 **Z0** is the impedance in Ohms.
+
+**INTERP** (optional, `1`, `TRUE`, or `YES`) enables linear fractional-step interpolation on this transmission line when **TD** is not an integer multiple of the simulation timestep $T_{STEP}$. Fractional delay interpolation can also be enabled globally for all transmission lines in the netlist using `.option txinterp` (or `.option fractx`). When disabled (the default), $\text{TD} / T_{STEP}$ is rounded to the nearest integer step count.
 
 ### Mutual Inductance
 
@@ -354,13 +356,46 @@ An example:
 
 If an inductor has a value of *2pH*, this is its nominal value. If a local spread of *0.2* is specified this means a random value can be chosen anywhere between *1.6pH* and *2.4pH*. If global inductor specific spread is specified as *0.3* and the local spread is not defined, the value can be anything within the range *1.4pH -  2.6pH*. Similarly if the global spread is defined as *0.5* then the value each time the simulation is run can be anywhere between *1pH* and *3pH*.
 
-### Reproducibility
+### Options and Reproducibility (`.option`)
 
-For both **noise** and **spread** a random number generator is seeded upon creation of the input object. This is done to enable non-deterministic noise/spread. However, in some cases the user might wish to produce deterministic noise/spread between runs. To enable this a **.option seed=** has been added. An integer seed value can be specified to obtain deterministic noise/spread. Additionally, the current auto-seeded run's seed can be obtained using verbose mode (**-V 1**). 
+Simulator options can be configured in the netlist using the `.option` (or `.options`) control card:
 
-An example:
+**.option**&emsp;*OPTION_KEY*[=*VALUE*]&emsp;[*OPTION_KEY2*[=*VALUE2*] ...]
+
+| Option | Syntax | Description |
+| ------ | ------ | ----------- |
+| **SEED** | `.option seed=<int>` | Sets a deterministic integer seed for the random number generator used by **noise** and **spread**. The current run's seed is also printed in verbose mode (`-V 1`). |
+| **TXINTERP** / **FRACTX** | `.option txinterp` | Enables linear fractional-step delay interpolation for all transmission lines (`T` elements) when $T_D / T_{STEP}$ is non-integer. Can also be set per element via `interp=1`. |
+| **FIXEDSTEP** | `.option fixedstep` | Disables automatic global timestep halving (`reduce_step`) when a Josephson junction's phase step exceeds $0.4\pi$. Equivalent to the `-f` (`--fixed-step`) CLI switch. |
+| **WARNSTEP** | `.option warnstep` | Prints a diagnostic warning identifying the offending Josephson junction label, halving count, and old/new `TSTEP` whenever automatic step halving or a phase jump occurs. |
+| **CORRECTOR** | `.option corrector=<N>` | Enables up to `N` implicit predictor-corrector (Picard/BDF2) iterations per timestep on active Josephson junctions (default `0`; `-c` on the CLI defaults to `2`). |
+| **CORRECTORTOL** | `.option correctortol=<val>` | Sets the phase convergence threshold (in radians, default `1e-3`) that triggers predictor-corrector iteration when `CORRECTOR` > 0. |
+
+Examples:
 ```cir
 .option seed=4190754512324517577
+.option txinterp warnstep
+.option corrector=2 correctortol=1e-4
+```
+
+### State Checkpointing (`.savestate` / `.loadstate`)
+
+For large circuits that require a long initial bias-conditioning or settling window before applying data stimuli, JoSIM can serialize and restore the full simulator state (the MNA solution vector $\mathbf{x}$ and all multi-step device and transmission-line history registers) in a compact binary checkpoint file (`JOSIMSTA`):
+
+**.savestate**&emsp;*filepath*&emsp;[*save_time*]
+
+**.loadstate**&emsp;*filepath*
+
+- **.savestate** (or alias **.savebias**) writes the binary checkpoint to *filepath*. If *save_time* is specified, the state is captured at the first timestep where $t \ge \text{save\_time}$; otherwise, it is written at the end of the transient simulation ($T_{STOP}$).
+- **.loadstate** (or alias **.loadbias**) loads the binary checkpoint from *filepath* at the start of the transient simulation ($t = 0$), restoring all node voltages/phases, branch currents, Josephson junction state variables, and transmission-line delay buffers.
+
+Example:
+```cir
+* Run 1: Save conditioned bias state at 6000 ps
+.savestate bias_6ns.state 6000p
+
+* Run 2: Start immediately from the conditioned bias state
+.loadstate bias_6ns.state
 ```
 
 ### IV Curve
@@ -415,7 +450,16 @@ Multi-file output can be achieved by separating output commands with the followi
 
 **.file**&emsp;*filepath*
 
-This indicates that every output request that follows this command needs to be stored in the file specified by *filepath*. 
+This indicates that every output request that follows this command needs to be stored in the file specified by *filepath*. Both `.file` and the `-o` (`--output=`) command-line switch automatically select the output format from the file extension:
+
+| Extension | Format | Description |
+| --------- | ------ | ----------- |
+| `.csv` | Comma-Separated Values (ASCII) | Standard comma-separated text table with header row (`time,...`). |
+| `.dat` | Space-Separated Values (ASCII) | Standard space-separated text table with header row. |
+| `.raw` or no extension | SPICE3 Raw (ASCII) | Standard ASCII SPICE rawfile (`Values:` section). |
+| `.bin` | Native JoSIM Binary (`JOSIMBIN`) | High-speed column-major IEEE-754 `float64` binary format with self-describing trace metadata header. ~37x faster to write and ~38% smaller than `.csv`. |
+| `.npy` | NumPy Structured Array (`.npy`) | Standard NumPy v1.0/v2.0 structured array with named `<f8` columns, directly loadable via `numpy.load()` or `scripts/josim_io.py`. |
+| `.rawb` or `.braw` | SPICE3 Binary Raw (`Binary:`) | Standard SPICE3 binary rawfile with ASCII preamble followed by interleaved IEEE-754 `float64` records. |
 
 I.e. 
 
@@ -426,9 +470,19 @@ I.e.
 .plot i(L01) i(L02) i(L03)
 .file output3
 .save v(1) v(2) v(3)
+.file output4.bin
+.print v(1) i(L01) p(B1)
+.file output5.npy
+.print v(1) i(L01) p(B1)
 ```
 
-This will create 3 output files. The first will be a CSV file containing only the phase outputs. The second file will be a space separated file containing only the currents. Lastly, the third file will be in a SPICE RAW format and contain only the voltages.
+This will create 5 output files: a CSV file containing the phase outputs, a space-separated `.dat` file containing the currents, an ASCII SPICE `.raw` file containing the voltages, a native column-major `.bin` binary file, and a NumPy `.npy` structured array file.
+
+Binary `.bin` and `.npy` files can be loaded in Python using [`scripts/josim_io.py`](https://github.com/JoeyDelp/JoSIM/blob/master/scripts/josim_io.py):
+```python
+from scripts.josim_io import load_josim
+data = load_josim("output4.bin")  # dict mapping trace name -> 1D numpy float64 array
+```
 
 The use of this command does not affect the command line option request to output a file. The command line output option, if requested, will output an additional file which contains all of the output requests (phase, current and voltage).
 

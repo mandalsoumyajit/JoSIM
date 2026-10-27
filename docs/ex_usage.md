@@ -102,3 +102,34 @@ This produces the following visualized result:
 Through the representation of the results visually, the user can see the two SFQ pulses at the input and through the output resistor, including the phases of the two junctions.
 
 The same process can be done for every example found in the *test* folder on the repository.
+
+## High-Speed Binary Output & Python Loading
+
+For large simulations with hundreds or thousands of traces, writing and parsing ASCII `.csv` files can dominate total runtime. JoSIM supports writing binary output directly by specifying `.bin` (native column-major `JOSIMBIN`), `.npy` (NumPy structured array), or `.rawb` (SPICE3 binary raw) as the output file extension:
+
+```bash
+# Write native column-major IEEE-754 float64 binary (.bin)
+josim-cli -o ./ex_jtl_basic.bin ./ex_jtl_basic.cir
+
+# Or write a standard NumPy structured array (.npy)
+josim-cli -o ./ex_jtl_basic.npy ./ex_jtl_basic.cir
+```
+
+Both formats can be loaded in Python using [`scripts/josim_io.py`](https://github.com/JoeyDelp/JoSIM/blob/master/scripts/josim_io.py) or `numpy.load`:
+
+```python
+import numpy as np
+from scripts.josim_io import load_josim
+
+# Load .bin, .npy, or .csv into a dictionary of 1D float64 NumPy arrays
+traces = load_josim("./ex_jtl_basic.bin")
+time = traces["time"]
+p_b01 = traces["P(B01)"]
+
+# Or load as a Pandas DataFrame
+df = load_josim("./ex_jtl_basic.bin", as_dataframe=True)
+
+# .npy files also work directly with standard numpy.load:
+arr = np.load("./ex_jtl_basic.npy", mmap_mode="r")
+print(arr.dtype.names)  # ('time', 'V(VIN)', 'I(ROUT)', 'P(B01)', 'P(B02)')
+```

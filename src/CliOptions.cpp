@@ -228,6 +228,19 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
               << "1 for Phase analysis (Default)." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // Corrector iterations
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "-c" << std::setw(3) << std::left << "|"
+              << "Enables implicit predictor-corrector iterations for JJs." << std::endl;
+    std::cout << std::setw(16) << std::left << "--corrector=" << std::setw(3) << std::left << "|"
+              << "Specify max iterations per step (default 2 if -c is given without value)." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // Fixed timestep
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "-f" << std::setw(3) << std::left << "|"
+              << "Disables automatic timestep halving when JJ phase jumps exceed 0.4*pi." << std::endl;
+    std::cout << std::setw(16) << std::left << "--fixed-step" << std::setw(3) << std::left << "|" << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Help menu
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-h" << std::setw(3) << std::left << "|"
@@ -255,8 +268,10 @@ void CliOptions::display_help() {
     // Output
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-o" << std::setw(3) << std::left << "|"
-              << "Specify output file for simulation results (.csv)." << std::endl;
+              << "Specify output file for simulation results." << std::endl;
     std::cout << std::setw(16) << std::left << "--output=" << std::setw(3) << std::left << "|"
+              << "Supported extensions: .csv, .dat, .raw, .bin, .npy, .rawb" << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
               << "Default will be output.csv if no file is specified." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Parallel Processing

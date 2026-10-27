@@ -370,17 +370,19 @@ Simulator options can be configured in the netlist using the `.option` (or `.opt
 | **WARNSTEP** | `.option warnstep` | Prints a diagnostic warning identifying the offending Josephson junction label, halving count, and old/new `TSTEP` whenever automatic step halving or a phase jump occurs. |
 | **CORRECTOR** | `.option corrector=<N>` | Enables up to `N` implicit predictor-corrector (Picard/BDF2) iterations per timestep on active Josephson junctions (default `0`; `-c` on the CLI defaults to `2`). |
 | **CORRECTORTOL** | `.option correctortol=<val>` | Sets the phase convergence threshold (in radians, default `1e-3`) that triggers predictor-corrector iteration when `CORRECTOR` > 0. |
+| **KCUTOFF** / **KMIN** | `.option kcutoff=<val>` | Ignores mutual inductance entries (`K` lines) with $|k| < \text{val}$ during MNA matrix construction, preventing dense LU fill-in from weak parasitic couplings in 3D field-extracted netlists. |
 
 Examples:
 ```cir
 .option seed=4190754512324517577
 .option txinterp warnstep
 .option corrector=2 correctortol=1e-4
+.option kcutoff=1e-3
 ```
 
 ### State Checkpointing (`.savestate` / `.loadstate`)
 
-For large circuits that require a long initial bias-conditioning or settling window before applying data stimuli, JoSIM can serialize and restore the full simulator state (the MNA solution vector $\mathbf{x}$ and all multi-step device and transmission-line history registers) in a compact binary checkpoint file (`JOSIMSTA`):
+For large circuits that require a long initial bias-conditioning or settling window before applying data stimuli, JoSIM can serialize and restore the full simulator state (the MNA solution vector $\mathbf{x}$, all multi-step device history registers, and the complete circular delay ring buffers of all transmission lines) in a compact binary checkpoint file (`JOSIMSTA` v2):
 
 **.savestate**&emsp;*filepath*&emsp;[*save_time*]
 

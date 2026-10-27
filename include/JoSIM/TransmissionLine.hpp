@@ -63,6 +63,17 @@ class TransmissionLine : public BasicComponent {
     int64_t    timestepDelay_ = 0;
     double     fracDelay_     = 0.0;
 
+    struct TxHistEntry {
+        double v1 = 0.0;
+        double v2 = 0.0;
+        double i1 = 0.0;
+        double i2 = 0.0;
+    };
+
+    std::vector<TxHistEntry> hist_;
+    int64_t                  histSize_    = 0;
+    int64_t                  loadedSteps_ = 0;
+
     TransmissionLine(const std::pair<tokens_t, string_o>& s,
                      const NodeConfig&                    ncon,
                      const std::optional<NodeConfig>&     ncon2,

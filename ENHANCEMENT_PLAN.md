@@ -59,3 +59,46 @@ This document captures the architectural audit of **JoSIM** (`v2.7` / `2.6.5.c81
   - Serializes and restores the full MNA solution vector `x_` and all multi-step device history registers (`JJ`, `Inductor`, `Resistor`, `Capacitor`, `VoltageSource`, `CCVS`, `VCCS`, `TransmissionLine`) in binary format (`JOSIMSTA`), allowing long bias-conditioning intervals (e.g., 6 ns xeSFQ conditioning) to be simulated once and reused across margin/logic sweeps.
 - **Implicit Predictor-Corrector Iteration for JJs (`-c`, `.OPTION CORRECTOR=<N>`, `.OPTION CORRECTORTOL=<tol>`):**
   - Performs damped Picard/BDF2 corrector passes on active Josephson junctions after the initial KLU solve when $\max |\phi^{(1)}_n - \phi^{(0)}_n| > \text{tol}$, updating `mObj.nz` and calling `klu_l_refactor` if an `RTYPE=1` junction crosses its gap threshold.
+
+---
+
+### Phase 4: Large-Circuit Scalability (Memory, Partitioned Solver, & Layout Sparsification)
+
+When simulating large superconducting integrated circuits (10k–500k+ Josephson junctions, extracted 3D layouts with thousands of mutual inductances, PTL-routed multi-block chips, and multi-million-step transient runs), the primary bottlenecks shift to trace memory bandwidth, transmission-line lookback storage, LU refactorization scope, and netlist flattening overhead.
+
+#### 1. Self-Contained Circular Ring Buffers for Transmission Lines (`TransmissionLine.hpp`, `Simulation.cpp`, `RelevantTrace.cpp`) — **[Highest ROI: Memory & Cache]**
+- **Problem:** Previously, `Simulation::handle_tx` looked up delayed port voltages/phases and branch currents in `*results.xVector[...][i - k]`. Consequently, `RelevantTrace.cpp` forced all 6 MNA variables (4 nodes + 2 branch currents) of *every* transmission line in the circuit into `mObj.relevantIndices`, allocating 6 full-simulation-length `std::vector<double>(simSize_)` arrays per transmission line even when those nodes were never `.print`ed.
+- **Solution:**
+  - Equip each `TransmissionLine` with a compact circular history buffer `hist_` of length $k + 4$ (`timestepDelay_ + 4`) storing `{v1, v2, i1, i2}` directly inside the `TransmissionLine` object.
+  - Remove transmission-line indices from `mObj.relevantIndices` in `find_relevant_traces` (unless explicitly requested by `.print`/`.save`).
+  - Serialize and restore the transmission-line ring buffer in `.savestate` / `.loadstate` so in-flight PTL pulses across checkpoints are preserved with 100% fidelity.
+
+#### 2. In-Loop Print Windowing & Decimation (`PRSTART` / `PRSTEP`) (`Simulation.cpp`, `Output.cpp`) — **[Highest ROI: Memory & Bandwidth]**
+- **Problem:** Even when `.tran TSTEP TSTOP PRSTART PRSTEP` specifies a late print start (e.g., skipping a 5 ns bias-conditioning window) or a coarse print step (`PRSTEP > TSTEP`), `Simulation::trans_sim` previously allocated and recorded every internal simulation step into `results.xVector` and `results.timeAxis`, only decimating afterward in `Output::write_output`.
+- **Solution:**
+  - When FIR window filtering (`P_WINDOW`) is disabled and no voltage-mode non-JJ phase integration is required, pre-compute the exact print sample schedule in `Simulation::setup` (including 2 lookback steps `j - 1, j - 2` before each print point when Phase-to-Voltage BDF2 differentiation is requested on non-JJ nodes) and record *only* those required steps during `Simulation::trans_sim`.
+  - Reduces `results.xVector` RAM footprint and inner-loop memory writes by **5x–20x** on long conditioning or decimated runs while preserving 100% bit-identical outputs.
+
+#### 3. Block-Partitioned MNA Solver Across PTL Boundaries (`Simulation.hpp`, `Simulation.cpp`) — **[Highest ROI: Solver Speed & Multi-Core Scaling]**
+- **Problem:** In PTL-routed superconducting chips, passive transmission lines (`T` elements) have zero instantaneous off-diagonal coupling between Port 1 and Port 2 in the MNA matrix $A$ (coupling occurs strictly through delayed history sources in $\mathbf{b}$). However, solving the entire chip as a single monolithic KLU matrix forces `klu_l_refactor` across the entire chip whenever *any* single `RTYPE=1` junction switches, and serializes `klu_l_tsolve` on a single thread.
+- **Solution:**
+  - Partition the MNA matrix graph `(rp, ci)` into independent connected components $A_0, A_1, \dots, A_{P-1}$ using Union-Find during `Simulation::setup`.
+  - Maintain an independent KLU `(Symbolic, Numeric, Common)` solver instance and `partitionNeedsLU_[p]` dirty flag per block.
+  - When an `RTYPE=1` junction in block $p$ crosses its gap threshold, only refactor block $p$ ($O(|A_p|)$ instead of $O(|A|)$).
+  - When `-p` (`--parallel`) is enabled and $P \ge 2$, factor and solve all $P$ blocks in parallel across OpenMP threads.
+
+#### 4. Mutual Inductance Coupling Cutoff (`.OPTION KCUTOFF=<val>`) (`Input.cpp`, `Matrix.cpp`) — **[High ROI: Extracted Layouts]**
+- **Problem:** 3D inductance extractors emit thousands of tiny parasitic mutual couplings ($|k| < 10^{-3}$), inflating matrix non-zeros ($NNZ$), increasing LU fill-in, and slowing `Simulation::handle_inductors`.
+- **Solution:**
+  - Support `.OPTION KCUTOFF=<val>` to prune mutual inductance elements with $|k| < \text{kcutoff}$ during `Matrix::handle_mutual_inductance`, reporting the number of pruned vs. retained couplings in verbose mode (`-V 1`).
+
+#### 5. Fast Hierarchical Netlist Flattening & Pre-Reserved CSR Assembly (`Netlist.cpp`, `Matrix.cpp`) — **[High ROI: Setup Time]**
+- **Problem:** `Netlist::expand_maindesign` and `Matrix::create_csr` repeatedly reallocate vectors and construct temporary strings when flattening large hierarchical designs.
+- **Solution:**
+  - Pre-compute total expanded line counts to `reserve` `expNetlist` once, use in-place string appends (`append("|").append(label)`) in `Netlist::expand_io`, and pre-reserve `nz`, `ci`, and `rp` in `Matrix::create_csr`.
+
+#### 6. Future Large-Circuit Roadmap (Phase 5+)
+- **Series $R + L$ Internal Node Elimination & Compact Nodal Stamping:** Fold uncoupled two-terminal resistors/capacitors and series $R$-$L$ JJ shunt branches into nodal/composite stamps to shrink MNA dimension by 35%–50%.
+- **In-Memory Rolling Checkpoints & Local Timestep Rollback:** Replace full $t = 0$ restarts on `needsTR_` with local rollback to a recent in-memory state snapshot using variable-step BDF2 coefficients.
+- **Activity-Driven / Event-Driven Subcircuit Bypass:** Skip device evaluation and block KLU solves on quiescent PTL-decoupled partitions whose terminal states and inputs are idle ($\Delta \phi < \epsilon$).
+- **Streaming Binary Output & Multi-Run `.param` / `.spread` Batch Engine:** Flush binary trace chunks to disk in constant $O(1)$ memory and reuse `klu_l_symbolic` across parallel Monte Carlo / margin sweeps.

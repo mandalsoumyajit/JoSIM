@@ -130,16 +130,6 @@ void JoSIM::find_relevant_traces(Input& iObj, Matrix& mObj) {
         if (i.index2) { mObj.relevantIndices.emplace_back(i.index2.value()); }
         if (i.variableIndex) { mObj.relevantIndices.emplace_back(i.variableIndex.value()); }
     }
-    // Store the indices of all the transmission lines
-    for (const auto& i : mObj.components.txIndices) {
-        const auto& tempLocal = std::get<TransmissionLine>(mObj.components.devices.at(i));
-        if (tempLocal.indexInfo.posIndex_) { mObj.relevantIndices.emplace_back(tempLocal.indexInfo.posIndex_.value()); }
-        if (tempLocal.indexInfo.negIndex_) { mObj.relevantIndices.emplace_back(tempLocal.indexInfo.negIndex_.value()); }
-        if (tempLocal.posIndex2_) { mObj.relevantIndices.emplace_back(tempLocal.posIndex2_.value()); }
-        if (tempLocal.negIndex2_) { mObj.relevantIndices.emplace_back(tempLocal.negIndex2_.value()); }
-        mObj.relevantIndices.emplace_back(tempLocal.indexInfo.currentIndex_.value());
-        mObj.relevantIndices.emplace_back(tempLocal.currentIndex2_);
-    }
     // Remove any dupicate indices used for storing
     mObj.relevantIndices.erase(uniquify(mObj.relevantIndices.begin(), mObj.relevantIndices.end()),
                                mObj.relevantIndices.end());

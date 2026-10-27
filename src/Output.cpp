@@ -92,17 +92,23 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
     for (auto& hanning : firwindow) { hanning = firscale * hanning; }
     // Indices to print
     std::vector<int64_t> result_indices;
-    for (auto i = 0; i < t.size(); ++i) {
-        if (t.at(i) >= tran.prstart()) {
-            result_indices.emplace_back(i);
-            break;
+    if (!sObj.results.printIndices.empty()) {
+        result_indices = sObj.results.printIndices;
+    } else {
+        for (auto i = 0; i < t.size(); ++i) {
+            if (t.at(i) >= tran.prstart()) {
+                result_indices.emplace_back(i);
+                break;
+            }
         }
-    }
-    double next_print_point = tran.prstart() + tran.prstep();
-    for (auto i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
-        if (t.at(i) >= next_print_point) {
-            result_indices.emplace_back(i);
-            next_print_point += tran.prstep();
+        double next_print_point = tran.prstart() + tran.prstep();
+        if (!result_indices.empty()) {
+            for (auto i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
+                if (t.at(i) >= next_print_point) {
+                    result_indices.emplace_back(i);
+                    next_print_point += tran.prstep();
+                }
+            }
         }
     }
     // Create the time trace

@@ -66,21 +66,26 @@ void Netlist::expand_io(Subcircuit& subc, s_map& params, const tokens_t& io, con
         // Set shorthand for long variable name
         tokens_t& tokens = subc.lines.at(k).first;
         // Check for value parameterization
-        if (params.count(tokens.front()) != 0) { insert_parameter(tokens, params); }
-        // Append the label of the parent to the subcircuit label
-        tokens.at(0)      = tokens.at(0) + "|" + label;
+        if (!params.empty() && params.count(tokens.front()) != 0) { insert_parameter(tokens, params); }
+        // Append the label of the parent to the subcircuit label in-place
+        tokens.at(0).reserve(tokens.at(0).size() + 1 + label.size());
+        tokens.at(0).push_back('|');
+        tokens.at(0).append(label);
         // Determine amount of nodes to process
-        int64_t nodeCount = 2;
-        // If device type identifier is any of "EFGHT" check the next two nodes
-        if (std::string("EFGHT").find(tokens.at(0).at(0)) != std::string::npos) { nodeCount = 4; }
+        const char devType   = tokens.at(0).at(0);
+        int64_t    nodeCount = (devType == 'E' || devType == 'F' || devType == 'G' || devType == 'H' || devType == 'T')
+                                       ? 4
+                                       : 2;
         // Loop through all the nodes changing where necessary
         for (int64_t n = 1; n < nodeCount + 1; ++n) {
             // Ensure nodes don't identify as ground
             if (tokens.at(n) != "0" && tokens.at(n) != "GND") {
                 // Ensure the node is not part of the IO
                 if (!rename_io_nodes(tokens.at(n), subc.io, io)) {
-                    // Append the label to the node number to make it unique
-                    tokens.at(n) = tokens.at(n) + "|" + label;
+                    // Append the label to the node number in-place to make it unique
+                    tokens.at(n).reserve(tokens.at(n).size() + 1 + label.size());
+                    tokens.at(n).push_back('|');
+                    tokens.at(n).append(label);
                 }
             }
         }
@@ -214,6 +219,21 @@ void Netlist::expand_maindesign() {
         bar.set_status_text("Expanding Main Circuit");
         bar.set_total((float) maindesign.size());
     }
+    size_t totalExpLines = 0;
+    for (const auto& line : maindesign) {
+        if (!line.empty() && line.front().at(0) == 'X') {
+            for (size_t k = 1; k < line.size(); ++k) {
+                auto it = subcircuits.find(line[k]);
+                if (it != subcircuits.end()) {
+                    totalExpLines += it->second.lines.size();
+                    break;
+                }
+            }
+        } else {
+            ++totalExpLines;
+        }
+    }
+    expNetlist.reserve(totalExpLines);
     // Loop through the identified main design, line by line
     for (auto i = 0; i < maindesign.size(); ++i) {
         std::string subcktName, label;
@@ -236,7 +256,9 @@ void Netlist::expand_maindesign() {
             // Expand the appropriate IO nodes of the subcircuit for this instance
             expand_io(subc, params, io, label);
             // Add the expanded subcircuit lines to the expanded netlist
-            expNetlist.insert(expNetlist.end(), subc.lines.begin(), subc.lines.end());
+            expNetlist.insert(expNetlist.end(),
+                              std::make_move_iterator(subc.lines.begin()),
+                              std::make_move_iterator(subc.lines.end()));
             // If the line is not a subcircuit
         } else {
             // Add the line tokens to the expanded netlist

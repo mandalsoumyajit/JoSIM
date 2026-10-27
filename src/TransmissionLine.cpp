@@ -116,6 +116,10 @@ TransmissionLine::TransmissionLine(const std::pair<tokens_t, string_o>& s,
             timestepDelay_ = static_cast<int64_t>(std::round(rawTd / h));
             fracDelay_     = 0.0;
         }
+        if (timestepDelay_ >= 1) {
+            histSize_ = std::max<int64_t>(timestepDelay_ + 4, 8);
+            hist_.assign(static_cast<size_t>(histSize_), TxHistEntry{});
+        }
     }
     // Set the node configuration type
     indexInfo.nodeConfig_   = ncon;

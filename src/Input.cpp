@@ -338,6 +338,8 @@ void Input::parse_options_and_state_controls() {
                     argCorrector = static_cast<int64_t>(parse_param(tok.substr(10), parameters));
                 } else if (tok.rfind("CORRECTORTOL=", 0) == 0) {
                     argCorrectorTol = parse_param(tok.substr(13), parameters);
+                } else if (tok.rfind("KCUTOFF=", 0) == 0) {
+                    argKCutoff = std::abs(parse_param(tok.substr(8), parameters));
                 }
             }
         }

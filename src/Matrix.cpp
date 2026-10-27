@@ -277,7 +277,8 @@ void Matrix::create_components(Input& iObj) {
 }
 
 void Matrix::handle_mutual_inductance(Input& iObj) {
-    int64_t     cc = 0;
+    int64_t     cc       = 0;
+    int64_t     skippedK = 0;
     ProgressBar bar2;
     if (!iObj.argMin && components.mutualinductances.size() != 0) {
         bar2.create_thread();
@@ -313,6 +314,11 @@ void Matrix::handle_mutual_inductance(Input& iObj) {
         auto&  ind2   = std::get<Inductor>(components.devices.at(ind2Index.value()));
         // Calculate the coupling factor
         double cf     = parse_param(s.first.at(3), iObj.parameters, s.second);
+        if (iObj.argKCutoff > 0.0 && std::abs(cf) < iObj.argKCutoff) {
+            ++skippedK;
+            ++cc;
+            continue;
+        }
         // Calculate the mutual inductance for this pair
         double mutual = cf * std::sqrt(ind1.netlistInfo.value_ * ind2.netlistInfo.value_);
         if (mutual != 0) {
@@ -331,6 +337,10 @@ void Matrix::handle_mutual_inductance(Input& iObj) {
     if (!iObj.argMin && components.mutualinductances.size() != 0) {
         bar2.complete();
         std::cout << "\n";
+    }
+    if (skippedK > 0 && !iObj.argMin && iObj.argVerb >= 1) {
+        std::cout << "JoSIM: Pruned " << skippedK << " of " << components.mutualinductances.size()
+                  << " mutual inductance(s) with |k| < " << iObj.argKCutoff << "\n";
     }
 }
 
@@ -355,17 +365,18 @@ void Matrix::reduce_step(Input& iObj) {
 }
 
 void Matrix::create_csr() {
+    // Create the row pointer vector first so rp.back() gives the exact NNZ count
+    create_rp();
     // Create the non zero vector
     create_nz();
     // Create the column index vector
     create_ci();
-    // Create the row pointer vector
-    create_rp();
 }
 
 void Matrix::create_nz() {
     // Non zero vector should be empty, but clear it to make sure
     nz.clear();
+    if (!rp.empty() && rp.back() > 0) { nz.reserve(static_cast<size_t>(rp.back())); }
     // Loop through all the node connections
     for (const auto& it : nc) {
         // Loop through each connection
@@ -391,6 +402,7 @@ void Matrix::create_nz() {
 void Matrix::create_ci() {
     // Clear the column index vector as safety precaution
     ci.clear();
+    if (!rp.empty() && rp.back() > 0) { ci.reserve(static_cast<size_t>(rp.back())); }
     // Loop through all the node connections
     for (const auto& it : nc) {
         // Loop through each connection
@@ -413,6 +425,7 @@ void Matrix::create_ci() {
 void Matrix::create_rp() {
     // Clear the row pointer vector
     rp.clear();
+    rp.reserve(nc.size() + components.devices.size() * 2 + 1);
     // First entry should always be zero
     rp.emplace_back(0);
     // Add the number of node connections in each row to the row pointer vector

@@ -44,7 +44,10 @@ This enhanced fork of JoSIM delivers significant single-core, multi-threaded (`-
 - **2.2x–3.2x faster end-to-end simulation + output** on large extracted superconducting IC netlists when combining the solver optimizations with binary output (`.bin` / `.npy`).
 - **$O(1)$ hash-map lookups** (`deviceMap`, `csMap`) for mutual inductances (`K`) and `.print`/`.save` traces, eliminating $O(N^2)$ setup bottlenecks on extracted layouts with thousands of mutual couplings.
 - **In-place CSR updates & `klu_l_refactor`** whenever `RTYPE=1` Josephson junctions cross their gap voltage threshold ($V_g \pm \frac{1}{2}\Delta V$), avoiding per-transition matrix rebuilds and heap allocations.
-- **Homogeneous device arrays & zero-allocation hot loop**, cached `PWL`/`PWS` time segments, pre-computed `CUS` cubic splines, and functional OpenMP multi-threading (`-p`) across device evaluation and output formatting.
+- **Block-Partitioned KLU Solver across PTLs**: Automatically detects connected components of the MNA matrix separated by lossless transmission lines (`T` elements), creating independent `klu_l_symbolic`/`klu_l_numeric` sub-matrices (`KluPartition`). Only blocks containing a transitioning junction are refactored (`klu_l_refactor`), and with `-p` (`--parallel`), blocks are refactored and solved in parallel across OpenMP threads.
+- **Self-Contained Transmission-Line Ring Buffers & Mid-Flight Checkpointing**: Each transmission line maintains a compact circular ring buffer (`hist_`) of length $k + 4$ instead of forcing all 6 of its port/current variables into `results.xVector` for the entire simulation length ($N_{\text{steps}}$), reducing transmission-line memory by **100x–1,000x** and supporting exact `.savestate`/`.loadstate` resumption even while SFQ pulses are mid-flight inside PTLs.
+- **In-Loop Print Windowing & Decimation (`PRSTART` / `PRSTEP`)**: When `.tran` specifies `PRSTART > 0` or `PRSTEP > TSTEP` (without FIR windowing), `Simulation::trans_sim` stores only the required output steps (plus 2-step BDF2 lookback points when phase-to-voltage differentiation is requested), slashing RAM usage on long transient runs.
+- **Homogeneous device arrays & zero-allocation hot loop**, cached `PWL`/`PWS` time segments, pre-computed `CUS` cubic splines, fast pre-reserved subcircuit flattening, and functional OpenMP multi-threading (`-p`) across device evaluation, block KLU solves, and output formatting.
 
 ### 2. High-Speed Binary Output Formats (`.bin`, `.npy`, `.rawb`)
 Specify the output format via the file extension in `-o <file>` or `.file <file>`:
@@ -80,11 +83,17 @@ arr = load_josim_npy("output.npy")       # Zero-copy memory-mapped structured ar
   Performs up to `N` damped Picard/BDF2 corrector iterations per timestep on active Josephson junctions (with optional `.option correctortol=<tol>`, default `1e-3` rad).
 - **Fixed-Step Enforcement & Step-Halving Diagnostics (`-f` / `.option fixedstep` / `.option warnstep`)**:
   Disable automatic step-halving restarts (`-f` / `--fixed-step` or `.option fixedstep`) or print detailed diagnostics naming the junction that triggered step reduction (`.option warnstep` or `-V 1`).
+- **Mutual Inductance Coupling Cutoff (`.option kcutoff=<val>`)**:
+  Automatically prunes parasitic mutual inductance entries (`K` lines) with $|k| < \text{kcutoff}$ during matrix construction to prevent dense LU fill-in on 3D field-extracted (e.g. InductEx) netlists:
+  ```spice
+  .option kcutoff=1e-3
+  ```
 
 ### 4. WSL Build, Benchmark & Verification Scripts
 - [`scripts/build_wsl.sh`](scripts/build_wsl.sh): Configures and builds JoSIM in WSL using Ninja (`-DCMAKE_BUILD_TYPE=Release -DPARALLEL=ON`) and runs the 23-test CTest suite.
 - [`scripts/benchmark_wsl.sh`](scripts/benchmark_wsl.sh): Benchmarks upstream vs. optimized JoSIM and verifies 100% bit-identical CSV outputs.
 - [`scripts/test_phase3_wsl.sh`](scripts/test_phase3_wsl.sh): Tests and benchmarks `.bin`/`.npy`/`.rawb` binary outputs, fractional TX delay interpolation, `.savestate`/`.loadstate` checkpointing, `-f` fixed-step control, and `-c` JJ predictor-corrector iteration.
+- [`scripts/test_phase4_wsl.sh`](scripts/test_phase4_wsl.sh): Tests transmission-line circular ring buffers, mid-flight PTL `.savestate`/`.loadstate` checkpointing, in-loop `PRSTART`/`PRSTEP` decimation, `.option kcutoff`, and OpenMP block-partitioned KLU solving across PTL boundaries.
 
 ---
 
@@ -93,11 +102,15 @@ arr = load_josim_npy("output.npy")       # Zero-copy memory-mapped structured ar
 - Added high-speed binary output formats: `.bin` (column-major `JOSIMBIN` float64), `.npy` (NumPy structured array), and `.rawb` (SPICE3 binary raw), along with Python loader [`scripts/josim_io.py`](scripts/josim_io.py).
 - Implemented $O(1)$ hash-map lookups for mutual inductance (`K`) and `.print`/`.save` trace resolution.
 - Implemented in-place CSR value updates and `klu_l_refactor` on `RTYPE=1` Josephson junction state transitions.
+- Implemented block-partitioned KLU solver (`KluPartition`) across lossless transmission lines (`T` elements) with selective per-block `klu_l_refactor` and OpenMP parallel block solves (`-p`).
+- Replaced full-history `results.xVector` forcing for transmission lines with self-contained circular ring buffers (`hist_`) of length $k + 4$, and added v2 `.savestate`/`.loadstate` serialization for mid-flight PTL pulses.
+- Implemented in-loop `PRSTART`/`PRSTEP` print windowing and decimation in `Simulation::trans_sim` to avoid storing unprinted transient steps in RAM.
+- Added `.option kcutoff=<val>` (`kmin=<val>`) to prune weak parasitic mutual inductances during matrix setup.
 - Partitioned devices into contiguous homogeneous arrays (`Simulation::setup`) and eliminated per-timestep heap allocations in `Simulation::trans_sim` and `Simulation::setup_b`.
 - Cached `PWL`/`PWS` active segment indices for $O(1)$ amortized source evaluation and pre-computed `CUS` cubic splines once during setup.
-- Replaced per-line/per-token `std::regex` construction in netlist parsing with linear whitespace scanning and fixed `ProgressBar` busy-wait CPU spin.
+- Replaced per-line/per-token `std::regex` construction in netlist parsing with linear whitespace scanning, optimized hierarchical subcircuit flattening, and fixed `ProgressBar` busy-wait CPU spin.
 - Fixed `Resistor::update_timestep` scaling factor in Phase mode (`factor * factor`).
-- Implemented OpenMP parallelization (`-p` / `--parallel`) across device RHS updates and output formatting (`Output::write_output`).
+- Implemented OpenMP parallelization (`-p` / `--parallel`) across device RHS updates, block-partitioned KLU solves, and output formatting (`Output::write_output`).
 - Added fractional delay interpolation for transmission lines via `.option txinterp` (`.option fractx`) or per-element `interp=1`.
 - Added binary simulation state checkpointing via `.savestate <file> [time]` (`.savebias`) and `.loadstate <file>` (`.loadbias`).
 - Added implicit predictor-corrector JJ iteration via `-c [N]` (`--corrector=N`), `.option corrector=<N>`, and `.option correctortol=<tol>`.

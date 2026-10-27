@@ -41,6 +41,7 @@ class Input {
     bool                                                         argTxInterp     = false;
     int64_t                                                      argCorrector    = 0;
     double                                                       argCorrectorTol = 1e-3;
+    double                                                       argKCutoff      = 0.0;
     std::optional<std::pair<std::string, std::optional<double>>> saveStateFile;
     std::optional<std::string>                                   loadStateFile;
 

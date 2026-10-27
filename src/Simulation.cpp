@@ -28,17 +28,7 @@ Simulation::Simulation(Input& iObj, Matrix& mObj) {
         // Do generic simulation setup for given step size
         setup(iObj, mObj);
         // Do solver setup
-#ifdef SLU
-        // SLU setup
-        lu.create_matrix(mObj.rp.size() - 1, mObj.nz, mObj.ci, mObj.rp);
-        lu.factorize();
-#else
-        // KLU setup
-        simOK_ = klu_l_defaults(&Common_);
-        assert(simOK_);
-        Symbolic_ = klu_l_analyze(mObj.rp.size() - 1, &mObj.rp.front(), &mObj.ci.front(), &Common_);
-        Numeric_  = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
-#endif
+        factorize_lu(mObj);
 
         // Run transient simulation
         trans_sim(mObj);
@@ -46,14 +36,7 @@ Simulation::Simulation(Input& iObj, Matrix& mObj) {
         if (needsTR_) { reduce_step(iObj, mObj); }
 
         // Do solver cleanup
-#ifdef SLU
-        // SLU cleanup
-        lu.free();
-#else
-        // KLU cleanup
-        klu_l_free_symbolic(&Symbolic_, &Common_);
-        klu_l_free_numeric(&Numeric_, &Common_);
-#endif
+        free_lu();
     }
 }
 
@@ -146,24 +129,328 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
         vccss_.push_back(std::get<VCCS>(mObj.components.devices[idx]));
     }
 
+    // Determine whether in-loop print windowing / decimation can be used
+    useDecimation_ = false;
+    keepStep_.clear();
+    results.printIndices.clear();
+    int64_t reserveSteps = simSize_;
+    if (iObj.transSim.prfirwindow() <= 0.0 && (prstart_ > 0.0 || prstep_ > stepSize_ * (1.0 + 1e-9))) {
+        bool needsFullHistoryPhase = false;
+        bool needsBDF2Lookback     = false;
+        for (const auto& tr : mObj.relevantTraces) {
+            const bool isJJ = (tr.deviceLabel.has_value() && tr.deviceLabel->size() > 3 && tr.deviceLabel->at(3) == 'B'
+                               && tr.variableIndex.has_value());
+            if (atyp_ == AnalysisType::Voltage && tr.storageType == StorageType::Phase && !isJJ) {
+                needsFullHistoryPhase = true;
+            }
+            if (atyp_ == AnalysisType::Phase && tr.storageType == StorageType::Voltage && !isJJ) {
+                needsBDF2Lookback = true;
+            }
+        }
+        if (!needsFullHistoryPhase && simSize_ > 0) {
+            std::vector<int64_t> printSteps;
+            int64_t              firstStep = -1;
+            for (int64_t i = 0; i < simSize_; ++i) {
+                if (i * stepSize_ >= prstart_) {
+                    firstStep = i;
+                    printSteps.push_back(i);
+                    break;
+                }
+            }
+            if (firstStep != -1) {
+                double nextPrintPoint = prstart_ + prstep_;
+                for (int64_t i = firstStep; i < simSize_; ++i) {
+                    if (i * stepSize_ >= nextPrintPoint) {
+                        printSteps.push_back(i);
+                        nextPrintPoint += prstep_;
+                    }
+                }
+            }
+            keepStep_.assign(static_cast<size_t>(simSize_), 0);
+            for (int64_t p : printSteps) {
+                keepStep_[p] = 2; // 2 = print point (and kept)
+                if (needsBDF2Lookback) {
+                    if (p >= 1 && keepStep_[p - 1] == 0) { keepStep_[p - 1] = 1; }
+                    if (p >= 2 && keepStep_[p - 2] == 0) { keepStep_[p - 2] = 1; }
+                }
+            }
+            int64_t keptCount = 0;
+            results.printIndices.reserve(printSteps.size());
+            for (int64_t i = 0; i < simSize_; ++i) {
+                if (keepStep_[i] != 0) {
+                    if (keepStep_[i] == 2) { results.printIndices.push_back(keptCount); }
+                    ++keptCount;
+                }
+            }
+            if (keptCount < simSize_) {
+                useDecimation_ = true;
+                reserveSteps   = keptCount;
+            } else {
+                keepStep_.clear();
+                results.printIndices.clear();
+            }
+        }
+    }
+
     b_.assign(mObj.rp.size(), 0.0);
     x_.assign(mObj.rp.size(), 0.0);
     if (!mObj.relevantTraces.empty()) {
         results.xVector.resize(mObj.branchIndex);
         for (const auto& i : mObj.relevantIndices) {
             results.xVector.at(i).emplace();
-            results.xVector.at(i)->reserve(simSize_);
+            results.xVector.at(i)->reserve(reserveSteps);
         }
     } else {
         results.xVector.resize(mObj.branchIndex, std::vector<double>(0));
-        for (auto& v : results.xVector) { v->reserve(simSize_); }
+        for (auto& v : results.xVector) { v->reserve(reserveSteps); }
     }
+
+    setup_partitions(mObj);
+}
+
+void Simulation::setup_partitions(Matrix& mObj) {
+#ifndef SLU
+    usePartitions_ = false;
+    partitions_.clear();
+    jjPartIdx_.clear();
+    jjPartNzIdx_.clear();
+    const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
+    if (N < 32) { return; }
+
+    std::vector<int64_t> parent(N);
+    for (int64_t i = 0; i < N; ++i) { parent[i] = i; }
+    auto find_root = [&](int64_t x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x         = parent[x];
+        }
+        return x;
+    };
+    for (int64_t r = 0; r < N; ++r) {
+        const int64_t rowStart = mObj.rp[r];
+        const int64_t rowEnd   = mObj.rp[r + 1];
+        if (rowStart == rowEnd) { return; } // Singular empty row; let standard KLU handle error
+        const int64_t rootR = find_root(r);
+        for (int64_t k = rowStart; k < rowEnd; ++k) {
+            const int64_t c = mObj.ci[k];
+            if (c >= 0 && c < N) {
+                const int64_t rootC = find_root(c);
+                if (rootR != rootC) { parent[rootC] = rootR; }
+            }
+        }
+    }
+
+    std::unordered_map<int64_t, int64_t> rootToPart;
+    std::vector<int64_t>                 rowPart(N);
+    for (int64_t r = 0; r < N; ++r) {
+        const int64_t root = find_root(r);
+        auto          it   = rootToPart.find(root);
+        if (it == rootToPart.end()) {
+            const int64_t newPart = static_cast<int64_t>(rootToPart.size());
+            rootToPart.emplace(root, newPart);
+            rowPart[r] = newPart;
+        } else {
+            rowPart[r] = it->second;
+        }
+    }
+
+    const int64_t nParts = static_cast<int64_t>(rootToPart.size());
+    if (nParts < 2) { return; }
+
+    partitions_.resize(nParts);
+    std::vector<int64_t> localRow(N, 0);
+    for (int64_t r = 0; r < N; ++r) {
+        const int64_t p  = rowPart[r];
+        localRow[r]      = partitions_[p].n++;
+        partitions_[p].globalRows.push_back(r);
+    }
+
+    std::vector<int64_t> globalNzToPartNz(mObj.nz.size(), -1);
+    for (int64_t p = 0; p < nParts; ++p) {
+        auto& part = partitions_[p];
+        part.rp.reserve(part.n + 1);
+        part.rp.push_back(0);
+        part.xLocal.assign(part.n, 0.0);
+        for (int64_t locR = 0; locR < part.n; ++locR) {
+            const int64_t globR    = part.globalRows[locR];
+            const int64_t rowStart = mObj.rp[globR];
+            const int64_t rowEnd   = mObj.rp[globR + 1];
+            for (int64_t k = rowStart; k < rowEnd; ++k) {
+                globalNzToPartNz[k] = static_cast<int64_t>(part.nz.size());
+                part.ci.push_back(localRow[mObj.ci[k]]);
+                part.nz.push_back(mObj.nz[k]);
+            }
+            part.rp.push_back(static_cast<int64_t>(part.nz.size()));
+        }
+    }
+
+    jjPartIdx_.resize(jjs_.size(), 0);
+    jjPartNzIdx_.resize(jjs_.size(), 0);
+    for (size_t idx = 0; idx < jjs_.size(); ++idx) {
+        const int64_t globR = jjs_[idx].indexInfo.currentIndex_.value();
+        jjPartIdx_[idx]     = rowPart[globR];
+        jjPartNzIdx_[idx]   = globalNzToPartNz[jjs_[idx].nzBackIndex_];
+    }
+
+    usePartitions_ = true;
+    if (verb_ >= 1 && !minOut_) {
+        std::cout << "JoSIM: Partitioned MNA matrix (" << N << " equations) into " << nParts
+                  << " independent KLU blocks\n";
+    }
+#else
+    (void) mObj;
+#endif
+}
+
+void Simulation::factorize_lu(Matrix& mObj) {
+#ifdef SLU
+    lu.create_matrix(mObj.rp.size() - 1, mObj.nz, mObj.ci, mObj.rp);
+    lu.factorize();
+#else
+    if (usePartitions_) {
+        const int64_t nParts = static_cast<int64_t>(partitions_.size());
+#ifdef _OPENMP
+        if (parallel_ && nParts >= 2) {
+#pragma omp parallel for schedule(dynamic)
+            for (int64_t p = 0; p < nParts; ++p) {
+                auto&   part = partitions_[p];
+                int64_t ok   = klu_l_defaults(&part.common);
+                assert(ok);
+                (void) ok;
+                part.symbolic = klu_l_analyze(part.n, &part.rp.front(), &part.ci.front(), &part.common);
+                part.numeric  = klu_l_factor(
+                        &part.rp.front(), &part.ci.front(), &part.nz.front(), part.symbolic, &part.common);
+            }
+            return;
+        }
+#endif
+        for (int64_t p = 0; p < nParts; ++p) {
+            auto&   part = partitions_[p];
+            int64_t ok   = klu_l_defaults(&part.common);
+            assert(ok);
+            (void) ok;
+            part.symbolic = klu_l_analyze(part.n, &part.rp.front(), &part.ci.front(), &part.common);
+            part.numeric
+                    = klu_l_factor(&part.rp.front(), &part.ci.front(), &part.nz.front(), part.symbolic, &part.common);
+        }
+    } else {
+        simOK_ = klu_l_defaults(&Common_);
+        assert(simOK_);
+        Symbolic_ = klu_l_analyze(mObj.rp.size() - 1, &mObj.rp.front(), &mObj.ci.front(), &Common_);
+        Numeric_  = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
+    }
+#endif
+}
+
+void Simulation::refactor_lu(Matrix& mObj) {
+#ifdef SLU
+    lu.factorize(true);
+#else
+    if (usePartitions_) {
+        const int64_t nParts = static_cast<int64_t>(partitions_.size());
+#ifdef _OPENMP
+        if (parallel_ && nParts >= 2) {
+#pragma omp parallel for schedule(dynamic)
+            for (int64_t p = 0; p < nParts; ++p) {
+                auto& part = partitions_[p];
+                if (!part.needsLU) { continue; }
+                int64_t ok = klu_l_refactor(&part.rp.front(),
+                                            &part.ci.front(),
+                                            &part.nz.front(),
+                                            part.symbolic,
+                                            part.numeric,
+                                            &part.common);
+                if (!ok) {
+                    klu_l_free_numeric(&part.numeric, &part.common);
+                    part.numeric = klu_l_factor(
+                            &part.rp.front(), &part.ci.front(), &part.nz.front(), part.symbolic, &part.common);
+                }
+                part.needsLU = false;
+            }
+            return;
+        }
+#endif
+        for (int64_t p = 0; p < nParts; ++p) {
+            auto& part = partitions_[p];
+            if (!part.needsLU) { continue; }
+            int64_t ok = klu_l_refactor(
+                    &part.rp.front(), &part.ci.front(), &part.nz.front(), part.symbolic, part.numeric, &part.common);
+            if (!ok) {
+                klu_l_free_numeric(&part.numeric, &part.common);
+                part.numeric = klu_l_factor(
+                        &part.rp.front(), &part.ci.front(), &part.nz.front(), part.symbolic, &part.common);
+            }
+            part.needsLU = false;
+        }
+    } else {
+        simOK_ = klu_l_refactor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, Numeric_, &Common_);
+        if (!simOK_) {
+            klu_l_free_numeric(&Numeric_, &Common_);
+            Numeric_ = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
+        }
+    }
+#endif
+}
+
+void Simulation::solve_lu(Matrix& mObj) {
+#ifdef SLU
+    std::copy(b_.begin(), b_.end(), x_.begin());
+    lu.solve(x_);
+#else
+    if (usePartitions_) {
+        const int64_t nParts = static_cast<int64_t>(partitions_.size());
+        bool          anyErr = false;
+#ifdef _OPENMP
+        if (parallel_ && nParts >= 2) {
+#pragma omp parallel for schedule(dynamic) reduction(|| : anyErr)
+            for (int64_t p = 0; p < nParts; ++p) {
+                auto& part = partitions_[p];
+                for (int64_t i = 0; i < part.n; ++i) { part.xLocal[i] = b_[part.globalRows[i]]; }
+                int64_t ok = klu_l_tsolve(part.symbolic, part.numeric, part.n, 1, part.xLocal.data(), &part.common);
+                if (!ok) { anyErr = true; }
+                for (int64_t i = 0; i < part.n; ++i) { x_[part.globalRows[i]] = part.xLocal[i]; }
+            }
+            if (anyErr) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+            return;
+        }
+#endif
+        for (int64_t p = 0; p < nParts; ++p) {
+            auto& part = partitions_[p];
+            for (int64_t i = 0; i < part.n; ++i) { part.xLocal[i] = b_[part.globalRows[i]]; }
+            int64_t ok = klu_l_tsolve(part.symbolic, part.numeric, part.n, 1, part.xLocal.data(), &part.common);
+            if (!ok) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+            for (int64_t i = 0; i < part.n; ++i) { x_[part.globalRows[i]] = part.xLocal[i]; }
+        }
+    } else {
+        std::copy(b_.begin(), b_.end(), x_.begin());
+        simOK_ = klu_l_tsolve(Symbolic_, Numeric_, mObj.rp.size() - 1, 1, &x_.front(), &Common_);
+        if (!simOK_) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+    }
+#endif
+}
+
+void Simulation::free_lu() {
+#ifdef SLU
+    lu.free();
+#else
+    if (usePartitions_) {
+        for (auto& part : partitions_) {
+            if (part.symbolic) { klu_l_free_symbolic(&part.symbolic, &part.common); }
+            if (part.numeric) { klu_l_free_numeric(&part.numeric, &part.common); }
+        }
+        partitions_.clear();
+        usePartitions_ = false;
+    } else {
+        if (Symbolic_) { klu_l_free_symbolic(&Symbolic_, &Common_); }
+        if (Numeric_) { klu_l_free_numeric(&Numeric_, &Common_); }
+    }
+#endif
 }
 
 void Simulation::trans_sim(Matrix& mObj) {
     // Ensure time axis is cleared and pre-allocated
     results.timeAxis.clear();
-    results.timeAxis.reserve(simSize_);
+    results.timeAxis.reserve(useDecimation_ ? results.printIndices.size() * 3 : simSize_);
     ProgressBar bar;
     if (!minOut_) {
         bar.create_thread();
@@ -185,16 +472,8 @@ void Simulation::trans_sim(Matrix& mObj) {
             // Setup the b matrix
             setup_b(mObj, i, i * stepSize_);
             if (needsTR_) { return; }
-            // Assign x_prev the new b without reallocating
-            std::copy(b_.begin(), b_.end(), x_.begin());
             // Solve Ax=b, storing the results in x_
-#ifdef SLU
-            lu.solve(x_);
-#else
-            simOK_ = klu_l_tsolve(Symbolic_, Numeric_, mObj.rp.size() - 1, 1, &x_.front(), &Common_);
-            // If anything is a amiss, complain about it
-            if (!simOK_) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
-#endif
+            solve_lu(mObj);
             if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
         }
     }
@@ -208,35 +487,29 @@ void Simulation::trans_sim(Matrix& mObj) {
         // Setup the b matrix
         setup_b(mObj, i, step);
         if (needsTR_) { return; }
-        // Assign x_prev the new b without reallocating
-        std::copy(b_.begin(), b_.end(), x_.begin());
         // Solve Ax=b, storing the results in x_
-#ifdef SLU
-        lu.solve(x_);
-#else
-        simOK_ = klu_l_tsolve(Symbolic_, Numeric_, mObj.rp.size() - 1, 1, &x_.front(), &Common_);
-        // If anything is a amiss, complain about it
-        if (!simOK_) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
-#endif
+        solve_lu(mObj);
         if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
-        // Store results (only requested, to prevent massive memory usage)
-        if (hasRelevantTraces) {
-            for (const auto& j : mObj.relevantIndices) { results.xVector[j]->emplace_back(x_[j]); }
-        } else {
-            for (size_t j = 0; j < results.xVector.size(); ++j) {
-                if (results.xVector[j]) { results.xVector[j]->emplace_back(x_[j]); }
+        // Store results (only requested, and only kept steps when decimation is active)
+        if (!useDecimation_ || keepStep_[i] != 0) {
+            if (hasRelevantTraces) {
+                for (const auto& j : mObj.relevantIndices) { results.xVector[j]->emplace_back(x_[j]); }
+            } else {
+                for (size_t j = 0; j < results.xVector.size(); ++j) {
+                    if (results.xVector[j]) { results.xVector[j]->emplace_back(x_[j]); }
+                }
             }
+            // Store the time step
+            results.timeAxis.emplace_back(step);
         }
-        // Store the time step
-        results.timeAxis.emplace_back(step);
         if (!stateSaved && saveStateFile_.has_value() && saveStateFile_->second.has_value()
             && step >= saveStateFile_->second.value()) {
-            save_state(saveStateFile_->first, mObj);
+            save_state(saveStateFile_->first, mObj, i);
             stateSaved = true;
         }
     }
     if (!stateSaved && saveStateFile_.has_value()) {
-        save_state(saveStateFile_->first, mObj);
+        save_state(saveStateFile_->first, mObj, simSize_ - 1);
         stateSaved = true;
     }
 
@@ -317,15 +590,7 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
     if (needsTR_) { return; }
     // Re-factorize the LU if any jj transitions (mObj.nz is updated in-place in handle_jj)
     if (needsLU_) {
-#ifdef SLU
-        lu.factorize(true);
-#else
-        simOK_ = klu_l_refactor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, Numeric_, &Common_);
-        if (!simOK_) {
-            klu_l_free_numeric(&Numeric_, &Common_);
-            Numeric_ = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
-        }
-#endif
+        refactor_lu(mObj);
         needsLU_ = false;
     }
     // Handle current sources
@@ -578,8 +843,16 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
             if (model.rtype() == 1) {
                 auto testLU = temp.update_value(v0);
                 if (testLU) {
-                    mObj.nz[temp.nzBackIndex_] = temp.matrixInfo.nonZeros_.back();
-                    localNeedsLU               = true;
+                    const double newNz         = temp.matrixInfo.nonZeros_.back();
+                    mObj.nz[temp.nzBackIndex_] = newNz;
+#ifndef SLU
+                    if (usePartitions_) {
+                        const int64_t p                     = jjPartIdx_[idx];
+                        partitions_[p].nz[jjPartNzIdx_[idx]] = newNz;
+                        partitions_[p].needsLU              = true;
+                    }
+#endif
+                    localNeedsLU = true;
                 }
             }
             const auto&  cpr        = model.cpr();
@@ -692,7 +965,15 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
         if (model.rtype() == 1) {
             auto testLU = temp.update_value(v0);
             if (testLU) {
-                mObj.nz[temp.nzBackIndex_] = temp.matrixInfo.nonZeros_.back();
+                const double newNz         = temp.matrixInfo.nonZeros_.back();
+                mObj.nz[temp.nzBackIndex_] = newNz;
+#ifndef SLU
+                if (usePartitions_) {
+                    const int64_t p                      = jjPartIdx_[idx];
+                    partitions_[p].nz[jjPartNzIdx_[idx]] = newNz;
+                    partitions_[p].needsLU               = true;
+                }
+#endif
                 if (!needsLU_) { needsLU_ = true; }
             }
         }
@@ -771,8 +1052,16 @@ void Simulation::corrector_jj(Matrix& mObj) {
             const auto& model = temp.model_;
             if (model.rtype() == 1) {
                 if (temp.update_value(vNew)) {
-                    mObj.nz[temp.nzBackIndex_] = temp.matrixInfo.nonZeros_.back();
-                    corrNeedsLU                = true;
+                    const double newNz         = temp.matrixInfo.nonZeros_.back();
+                    mObj.nz[temp.nzBackIndex_] = newNz;
+#ifndef SLU
+                    if (usePartitions_) {
+                        const int64_t p                      = jjPartIdx_[idx];
+                        partitions_[p].nz[jjPartNzIdx_[idx]] = newNz;
+                        partitions_[p].needsLU               = true;
+                    }
+#endif
+                    corrNeedsLU = true;
                 }
             }
             const auto&  cpr        = model.cpr();
@@ -808,24 +1097,8 @@ void Simulation::corrector_jj(Matrix& mObj) {
             }
         }
         if (maxDiff <= correctorTol_ && !corrNeedsLU) { break; }
-        if (corrNeedsLU) {
-#ifdef SLU
-            lu.factorize(true);
-#else
-            simOK_ = klu_l_refactor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, Numeric_, &Common_);
-            if (!simOK_) {
-                klu_l_free_numeric(&Numeric_, &Common_);
-                Numeric_ = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
-            }
-#endif
-        }
-        std::copy(b_.begin(), b_.end(), x_.begin());
-#ifdef SLU
-        lu.solve(x_);
-#else
-        simOK_ = klu_l_tsolve(Symbolic_, Numeric_, mObj.rp.size() - 1, 1, &x_.front(), &Common_);
-        if (!simOK_) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
-#endif
+        if (corrNeedsLU) { refactor_lu(mObj); }
+        solve_lu(mObj);
     }
 }
 
@@ -924,81 +1197,95 @@ void Simulation::handle_vccs(Matrix& mObj) {
 }
 
 void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double factor) {
-    auto sample_port = [&](JoSIM::NodeConfig nc, const int_o& pInd, const int_o& nInd, int64_t idx) -> double {
-        if (idx < 0) { return 0.0; }
-        if (nc == NodeConfig::POSGND) { return (*results.xVector[pInd.value()])[idx]; }
-        if (nc == NodeConfig::GNDNEG) { return -(*results.xVector[nInd.value()])[idx]; }
-        if (nc == NodeConfig::POSNEG) {
-            return (*results.xVector[pInd.value()])[idx] - (*results.xVector[nInd.value()])[idx];
-        }
-        return 0.0;
-    };
+    (void) mObj;
+    (void) step;
     for (auto& temp : txlines_) {
         // Z0
-        double&            Z    = temp.netlistInfo.value_;
+        double&            Z       = temp.netlistInfo.value_;
         // Td == k
-        int64_t&           k    = temp.timestepDelay_;
+        int64_t&           k       = temp.timestepDelay_;
         // Shorthands
-        JoSIM::NodeConfig &nc = temp.indexInfo.nodeConfig_, &nc2 = temp.nodeConfig2_;
-        int_o &posInd = temp.indexInfo.posIndex_, &negInd = temp.indexInfo.negIndex_, &posInd2 = temp.posIndex2_,
-              &negInd2  = temp.negIndex2_;
-        int64_t &curInd = temp.indexInfo.currentIndex_.value(), &curInd2 = temp.currentIndex2_;
+        JoSIM::NodeConfig &nc      = temp.indexInfo.nodeConfig_, &nc2 = temp.nodeConfig2_;
+        int_o &            posInd  = temp.indexInfo.posIndex_, &negInd = temp.indexInfo.negIndex_, &posInd2 = temp.posIndex2_,
+              &negInd2             = temp.negIndex2_;
+        int64_t &          curInd  = temp.indexInfo.currentIndex_.value(), &curInd2 = temp.currentIndex2_;
+        const int64_t      effStep = temp.loadedSteps_ + i;
+
+        // Record the completed previous step (i - 1) into the transmission line's circular ring buffer
+        if (i > 0) {
+            double v1_prev = 0.0;
+            if (nc == NodeConfig::POSGND) {
+                v1_prev = x_[posInd.value()];
+            } else if (nc == NodeConfig::GNDNEG) {
+                v1_prev = -x_[negInd.value()];
+            } else if (nc == NodeConfig::POSNEG) {
+                v1_prev = x_[posInd.value()] - x_[negInd.value()];
+            }
+            double v2_prev = 0.0;
+            if (nc2 == NodeConfig::POSGND) {
+                v2_prev = x_[posInd2.value()];
+            } else if (nc2 == NodeConfig::GNDNEG) {
+                v2_prev = -x_[negInd2.value()];
+            } else if (nc2 == NodeConfig::POSNEG) {
+                v2_prev = x_[posInd2.value()] - x_[negInd2.value()];
+            }
+            temp.hist_[(effStep - 1) % temp.histSize_] = {v1_prev, v2_prev, x_[curInd], x_[curInd2]};
+            if (atyp_ == AnalysisType::Phase) {
+                temp.n2_1_ = temp.n1_1_;
+                temp.n2_2_ = temp.n1_2_;
+                temp.n1_1_ = v1_prev;
+                temp.n1_2_ = v2_prev;
+            }
+        }
+
         if (temp.fracDelay_ > 0.0) {
-            const double alpha = temp.fracDelay_;
-            const double oma   = 1.0 - alpha;
-            auto         interp_port
-                    = [&](JoSIM::NodeConfig cfg, const int_o& pI, const int_o& nI, int64_t m) -> double {
+            const double alpha     = temp.fracDelay_;
+            const double oma       = 1.0 - alpha;
+            auto         interp_v1 = [&](int64_t m) -> double {
                 if (m < 0) { return 0.0; }
-                return oma * sample_port(cfg, pI, nI, m) + alpha * sample_port(cfg, pI, nI, m - 1);
+                const double s0 = temp.hist_[m % temp.histSize_].v1;
+                const double s1 = (m >= 1) ? temp.hist_[(m - 1) % temp.histSize_].v1 : 0.0;
+                return oma * s0 + alpha * s1;
             };
-            auto interp_cur = [&](int64_t cIdx, int64_t m) -> double {
+            auto interp_v2 = [&](int64_t m) -> double {
                 if (m < 0) { return 0.0; }
-                const auto& vec = *results.xVector[cIdx];
-                return oma * vec[m] + (m >= 1 ? alpha * vec[m - 1] : 0.0);
+                const double s0 = temp.hist_[m % temp.histSize_].v2;
+                const double s1 = (m >= 1) ? temp.hist_[(m - 1) % temp.histSize_].v2 : 0.0;
+                return oma * s0 + alpha * s1;
+            };
+            auto interp_i1 = [&](int64_t m) -> double {
+                if (m < 0) { return 0.0; }
+                const double s0 = temp.hist_[m % temp.histSize_].i1;
+                const double s1 = (m >= 1) ? temp.hist_[(m - 1) % temp.histSize_].i1 : 0.0;
+                return oma * s0 + alpha * s1;
+            };
+            auto interp_i2 = [&](int64_t m) -> double {
+                if (m < 0) { return 0.0; }
+                const double s0 = temp.hist_[m % temp.histSize_].i2;
+                const double s1 = (m >= 1) ? temp.hist_[(m - 1) % temp.histSize_].i2 : 0.0;
+                return oma * s0 + alpha * s1;
             };
             if (atyp_ == AnalysisType::Voltage) {
-                if (i >= k) {
-                    const int64_t m    = i - k;
-                    temp.nk_1_         = interp_port(nc, posInd, negInd, m);
-                    temp.nk_2_         = interp_port(nc2, posInd2, negInd2, m);
-                    const double  I1nk = interp_cur(curInd, m);
-                    const double  I2nk = interp_cur(curInd2, m);
+                if (effStep >= k) {
+                    const int64_t m    = effStep - k;
+                    temp.nk_1_         = interp_v1(m);
+                    temp.nk_2_         = interp_v2(m);
+                    const double  I1nk = interp_i1(m);
+                    const double  I2nk = interp_i2(m);
                     b_[curInd]         = Z * I2nk + temp.nk_2_;
                     b_[curInd2]        = Z * I1nk + temp.nk_1_;
                 }
             } else if (atyp_ == AnalysisType::Phase) {
-                if (i > 0) {
-                    temp.n2_1_ = temp.n1_1_;
-                    temp.n2_2_ = temp.n1_2_;
-                    if (nc == NodeConfig::POSGND) {
-                        temp.n1_1_ = x_[posInd.value()];
-                    } else if (nc == NodeConfig::GNDNEG) {
-                        temp.n1_1_ = -x_[negInd.value()];
-                    } else if (nc == NodeConfig::POSNEG) {
-                        temp.n1_1_ = x_[posInd.value()] - x_[negInd.value()];
-                    } else {
-                        temp.n1_1_ = 0.0;
-                    }
-                    if (nc2 == NodeConfig::POSGND) {
-                        temp.n1_2_ = x_[posInd2.value()];
-                    } else if (nc2 == NodeConfig::GNDNEG) {
-                        temp.n1_2_ = -x_[negInd2.value()];
-                    } else if (nc2 == NodeConfig::POSNEG) {
-                        temp.n1_2_ = x_[posInd2.value()] - x_[negInd2.value()];
-                    } else {
-                        temp.n1_2_ = 0.0;
-                    }
-                }
-                if (i >= k) {
-                    const int64_t m    = i - k;
-                    temp.nk_1_         = interp_port(nc, posInd, negInd, m);
-                    temp.nk_2_         = interp_port(nc2, posInd2, negInd2, m);
-                    temp.nk1_1_        = interp_port(nc, posInd, negInd, m - 1);
-                    temp.nk1_2_        = interp_port(nc2, posInd2, negInd2, m - 1);
-                    temp.nk2_1_        = interp_port(nc, posInd, negInd, m - 2);
-                    temp.nk2_2_        = interp_port(nc2, posInd2, negInd2, m - 2);
-                    const double  I1nk = interp_cur(curInd, m);
-                    const double  I2nk = interp_cur(curInd2, m);
+                if (effStep >= k) {
+                    const int64_t m    = effStep - k;
+                    temp.nk_1_         = interp_v1(m);
+                    temp.nk_2_         = interp_v2(m);
+                    temp.nk1_1_        = interp_v1(m - 1);
+                    temp.nk1_2_        = interp_v2(m - 1);
+                    temp.nk2_1_        = interp_v1(m - 2);
+                    temp.nk2_2_        = interp_v2(m - 2);
+                    const double  I1nk = interp_i1(m);
+                    const double  I2nk = interp_i2(m);
                     b_[curInd]         = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
                                  + (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_ + temp.nk_2_
                                  - (4.0 / 3.0) * temp.nk1_2_ + (1.0 / 3.0) * temp.nk2_2_;
@@ -1013,121 +1300,37 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
             continue;
         }
         if (atyp_ == AnalysisType::Voltage) {
-            if (i >= k) {
-                // φ1n-k
-                if (nc == NodeConfig::POSGND) {
-                    temp.nk_1_ = (*results.xVector[posInd.value()])[i - k];
-                } else if (nc == NodeConfig::GNDNEG) {
-                    temp.nk_1_ = -(*results.xVector[negInd.value()])[i - k];
-                } else if (nc == NodeConfig::POSNEG) {
-                    temp.nk_1_ = (*results.xVector[posInd.value()])[i - k] - (*results.xVector[negInd.value()])[i - k];
-                } else {
-                    temp.nk_1_ = 0.0;
-                }
-                // φ2n-k
-                if (nc2 == NodeConfig::POSGND) {
-                    temp.nk_2_ = (*results.xVector[posInd2.value()])[i - k];
-                } else if (nc2 == NodeConfig::GNDNEG) {
-                    temp.nk_2_ = -(*results.xVector[negInd2.value()])[i - k];
-                } else if (nc2 == NodeConfig::POSNEG) {
-                    temp.nk_2_
-                            = (*results.xVector[posInd2.value()])[i - k] - (*results.xVector[negInd2.value()])[i - k];
-                } else {
-                    temp.nk_2_ = 0.0;
-                }
-                // I1n-k
-                double& I1nk = (*results.xVector[curInd])[i - k];
-                // I2n-k
-                double& I2nk = (*results.xVector[curInd2])[i - k];
+            if (effStep >= k) {
+                const auto& h_k = temp.hist_[(effStep - k) % temp.histSize_];
+                temp.nk_1_      = h_k.v1;
+                temp.nk_2_      = h_k.v2;
                 // I1 = ZI2n-k + V2n-k
-                b_[curInd]   = Z * I2nk + temp.nk_2_;
+                b_[curInd]      = Z * h_k.i2 + temp.nk_2_;
                 // I2 = ZI1n-k + V1n-k
-                b_[curInd2]  = Z * I1nk + temp.nk_1_;
+                b_[curInd2]     = Z * h_k.i1 + temp.nk_1_;
             }
         } else if (atyp_ == AnalysisType::Phase) {
-            if (i > 0) {
-                temp.n2_1_ = temp.n1_1_;
-                temp.n2_2_ = temp.n1_2_;
-                // φ1n-1
-                if (nc == NodeConfig::POSGND) {
-                    temp.n1_1_ = x_[posInd.value()];
-                } else if (nc == NodeConfig::GNDNEG) {
-                    temp.n1_1_ = -x_[negInd.value()];
-                } else if (nc == NodeConfig::POSNEG) {
-                    temp.n1_1_ = x_[posInd.value()] - x_[negInd.value()];
-                } else {
-                    temp.n1_1_ = 0.0;
-                }
-                // φ2n-1
-                if (nc2 == NodeConfig::POSGND) {
-                    temp.n1_2_ = x_[posInd2.value()];
-                } else if (nc2 == NodeConfig::GNDNEG) {
-                    temp.n1_2_ = -x_[negInd2.value()];
-                } else if (nc2 == NodeConfig::POSNEG) {
-                    temp.n1_2_ = x_[posInd2.value()] - x_[negInd2.value()];
-                } else {
-                    temp.n1_2_ = 0.0;
-                }
-            }
-            if (i >= k) {
-                // φ1n-k
-                if (nc == NodeConfig::POSGND) {
-                    temp.nk_1_ = (*results.xVector[posInd.value()])[i - k];
-                } else if (nc == NodeConfig::GNDNEG) {
-                    temp.nk_1_ = -(*results.xVector[negInd.value()])[i - k];
-                } else if (nc == NodeConfig::POSNEG) {
-                    temp.nk_1_ = (*results.xVector[posInd.value()])[i - k] - (*results.xVector[negInd.value()])[i - k];
-                } else {
-                    temp.nk_1_ = 0.0;
-                }
-                // φ2n-k
-                if (nc2 == NodeConfig::POSGND) {
-                    temp.nk_2_ = (*results.xVector[posInd2.value()])[i - k];
-                } else if (nc2 == NodeConfig::GNDNEG) {
-                    temp.nk_2_ = -(*results.xVector[negInd2.value()])[i - k];
-                } else if (nc2 == NodeConfig::POSNEG) {
-                    temp.nk_2_
-                            = (*results.xVector[posInd2.value()])[i - k] - (*results.xVector[negInd2.value()])[i - k];
-                } else {
-                    temp.nk_2_ = 0.0;
-                }
-                // I1n-k
-                double& I1nk = (*results.xVector[curInd])[i - k];
-                // I2n-k
-                double& I2nk = (*results.xVector[curInd2])[i - k];
-                if (i == k) {
+            if (effStep >= k) {
+                const int64_t m    = effStep - k;
+                const auto&   h_k  = temp.hist_[m % temp.histSize_];
+                temp.nk_1_         = h_k.v1;
+                temp.nk_2_         = h_k.v2;
+                const double  I1nk = h_k.i1;
+                const double  I2nk = h_k.i2;
+                if (effStep == k) {
                     // I1 = Z(2e/hbar)(2h/3)I2n-k + (4/3)φ1n-1 - (1/3)φ1n-2 + φ2n-k
                     b_[curInd]  = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
                                  + (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_ + temp.nk_2_;
                     // I2 = Z(2e/hbar)(2h/3)I1n-k + (4/3)φ2n-1 - (1/3)φ2n-2 + φ1n-k
                     b_[curInd2] = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
                                   + (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_ + temp.nk_1_;
-                } else if (i == k + 1) {
-                    // φ1n-k-1
-                    if (nc == NodeConfig::POSGND) {
-                        temp.nk1_1_ = (*results.xVector[posInd.value()])[i - k - 1];
-                    } else if (nc == NodeConfig::GNDNEG) {
-                        temp.nk1_1_ = -(*results.xVector[negInd.value()])[i - k - 1];
-                    } else if (nc == NodeConfig::POSNEG) {
-                        temp.nk1_1_ = (*results.xVector[posInd.value()])[i - k - 1]
-                                      - (*results.xVector[negInd.value()])[i - k - 1];
-                    } else {
-                        temp.nk1_1_ = 0.0;
-                    }
-                    // φ2n-k-1
-                    if (nc2 == NodeConfig::POSGND) {
-                        temp.nk1_2_ = (*results.xVector[posInd2.value()])[i - k - 1];
-                    } else if (nc2 == NodeConfig::GNDNEG) {
-                        temp.nk1_2_ = -(*results.xVector[negInd2.value()])[i - k - 1];
-                    } else if (nc2 == NodeConfig::POSNEG) {
-                        temp.nk1_2_ = (*results.xVector[posInd2.value()])[i - k - 1]
-                                      - (*results.xVector[negInd2.value()])[i - k - 1];
-                    } else {
-                        temp.nk1_2_ = 0.0;
-                    }
+                } else if (effStep == k + 1) {
+                    const auto& h_k1 = temp.hist_[(m - 1) % temp.histSize_];
+                    temp.nk1_1_      = h_k1.v1;
+                    temp.nk1_2_      = h_k1.v2;
                     // I1 = Z(2e/hbar)(2h/3)I2n-k + (4/3)φ1n-1 - (1/3)φ1n-2 +
                     //      φ2n-k - (4/3)φ2n-k-1
-                    b_[curInd]  = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
+                    b_[curInd]       = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
                                  + (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_ + temp.nk_2_
                                  - (4.0 / 3.0) * temp.nk1_2_;
                     // I2 = Z(2e/hbar)(2h/3)I1n-k + (4/3)φ2n-1 - (1/3)φ2n-2 +
@@ -1135,54 +1338,16 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
                     b_[curInd2] = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
                                   + (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_ + temp.nk_1_
                                   - (4.0 / 3.0) * temp.nk1_1_;
-                } else if (i > k + 1) {
-                    // φ1n-k-1
-                    if (nc == NodeConfig::POSGND) {
-                        temp.nk1_1_ = (*results.xVector[posInd.value()])[i - k - 1];
-                    } else if (nc == NodeConfig::GNDNEG) {
-                        temp.nk1_1_ = -(*results.xVector[negInd.value()])[i - k - 1];
-                    } else if (nc == NodeConfig::POSNEG) {
-                        temp.nk1_1_ = (*results.xVector[posInd.value()])[i - k - 1]
-                                      - (*results.xVector[negInd.value()])[i - k - 1];
-                    } else {
-                        temp.nk1_1_ = 0.0;
-                    }
-                    // φ2n-k-1
-                    if (nc2 == NodeConfig::POSGND) {
-                        temp.nk1_2_ = (*results.xVector[posInd2.value()])[i - k - 1];
-                    } else if (nc2 == NodeConfig::GNDNEG) {
-                        temp.nk1_2_ = -(*results.xVector[negInd2.value()])[i - k - 1];
-                    } else if (nc2 == NodeConfig::POSNEG) {
-                        temp.nk1_2_ = (*results.xVector[posInd2.value()])[i - k - 1]
-                                      - (*results.xVector[negInd2.value()])[i - k - 1];
-                    } else {
-                        temp.nk1_2_ = 0.0;
-                    }
-                    // φ1n-k-2
-                    if (nc == NodeConfig::POSGND) {
-                        temp.nk2_1_ = (*results.xVector[posInd.value()])[i - k - 2];
-                    } else if (nc == NodeConfig::GNDNEG) {
-                        temp.nk2_1_ = -(*results.xVector[negInd.value()])[i - k - 2];
-                    } else if (nc == NodeConfig::POSNEG) {
-                        temp.nk2_1_ = (*results.xVector[posInd.value()])[i - k - 2]
-                                      - (*results.xVector[negInd.value()])[i - k - 2];
-                    } else {
-                        temp.nk2_1_ = 0.0;
-                    }
-                    // φ2n-k-2
-                    if (nc2 == NodeConfig::POSGND) {
-                        temp.nk2_2_ = (*results.xVector[posInd2.value()])[i - k - 2];
-                    } else if (nc2 == NodeConfig::GNDNEG) {
-                        temp.nk2_2_ = -(*results.xVector[negInd2.value()])[i - k - 2];
-                    } else if (nc2 == NodeConfig::POSNEG) {
-                        temp.nk2_2_ = (*results.xVector[posInd2.value()])[i - k - 2]
-                                      - (*results.xVector[negInd2.value()])[i - k - 2];
-                    } else {
-                        temp.nk2_2_ = 0.0;
-                    }
+                } else if (effStep > k + 1) {
+                    const auto& h_k1 = temp.hist_[(m - 1) % temp.histSize_];
+                    const auto& h_k2 = temp.hist_[(m - 2) % temp.histSize_];
+                    temp.nk1_1_      = h_k1.v1;
+                    temp.nk1_2_      = h_k1.v2;
+                    temp.nk2_1_      = h_k2.v1;
+                    temp.nk2_2_      = h_k2.v2;
                     // I1 = Z(2e/hbar)(2h/3)I2n-k + (4/3)φ1n-1 - (1/3)φ1n-2 +
                     //      φ2n-k - (4/3)φ2n-k-1 + (1/3)φ2n-k-2
-                    b_[curInd]  = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
+                    b_[curInd]       = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
                                  + (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_ + temp.nk_2_
                                  - (4.0 / 3.0) * temp.nk1_2_ + (1.0 / 3.0) * temp.nk2_2_;
                     // I2 = Z(2e/hbar)(2h/3)I1n-k + (4/3)φ2n-1 - (1/3)φ2n-2 +
@@ -1201,14 +1366,14 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
     }
 }
 
-void Simulation::save_state(const std::string& filename, const Matrix& mObj) const {
+void Simulation::save_state(const std::string& filename, const Matrix& mObj, int64_t currentStep) const {
     std::ofstream out(filename, std::ios::out | std::ios::binary);
     if (!out.is_open()) {
         Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
         return;
     }
     const char     magic[8] = {'J', 'O', 'S', 'I', 'M', 'S', 'T', 'A'};
-    const uint32_t version  = 1;
+    const uint32_t version  = 2;
     out.write(magic, 8);
     out.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
     auto write_u64 = [&](uint64_t v) { out.write(reinterpret_cast<const char*>(&v), sizeof(uint64_t)); };
@@ -1273,10 +1438,43 @@ void Simulation::save_state(const std::string& filename, const Matrix& mObj) con
 
     write_u64(static_cast<uint64_t>(txlines_.size()));
     for (const auto& tx : txlines_) {
-        const double vals[10] = {tx.n1_1_,
-                                 tx.n1_2_,
-                                 tx.n2_1_,
-                                 tx.n2_2_,
+        std::vector<TransmissionLine::TxHistEntry> histCopy = tx.hist_;
+        double                                     n1_1     = tx.n1_1_;
+        double                                     n1_2     = tx.n1_2_;
+        double                                     n2_1     = tx.n2_1_;
+        double                                     n2_2     = tx.n2_2_;
+        int64_t                                    effSteps = tx.loadedSteps_;
+        if (currentStep >= 0 && tx.histSize_ > 0) {
+            const JoSIM::NodeConfig nc     = tx.indexInfo.nodeConfig_;
+            const JoSIM::NodeConfig nc2    = tx.nodeConfig2_;
+            double                  v1Curr = 0.0;
+            if (nc == NodeConfig::POSGND) {
+                v1Curr = x_[tx.indexInfo.posIndex_.value()];
+            } else if (nc == NodeConfig::GNDNEG) {
+                v1Curr = -x_[tx.indexInfo.negIndex_.value()];
+            } else if (nc == NodeConfig::POSNEG) {
+                v1Curr = x_[tx.indexInfo.posIndex_.value()] - x_[tx.indexInfo.negIndex_.value()];
+            }
+            double v2Curr = 0.0;
+            if (nc2 == NodeConfig::POSGND) {
+                v2Curr = x_[tx.posIndex2_.value()];
+            } else if (nc2 == NodeConfig::GNDNEG) {
+                v2Curr = -x_[tx.negIndex2_.value()];
+            } else if (nc2 == NodeConfig::POSNEG) {
+                v2Curr = x_[tx.posIndex2_.value()] - x_[tx.negIndex2_.value()];
+            }
+            const int64_t slot = (tx.loadedSteps_ + currentStep) % tx.histSize_;
+            histCopy[slot] = {v1Curr, v2Curr, x_[tx.indexInfo.currentIndex_.value()], x_[tx.currentIndex2_]};
+            effSteps       = tx.loadedSteps_ + currentStep + 1;
+            n2_1           = tx.n1_1_;
+            n2_2           = tx.n1_2_;
+            n1_1           = v1Curr;
+            n1_2           = v2Curr;
+        }
+        const double vals[10] = {n1_1,
+                                 n1_2,
+                                 n2_1,
+                                 n2_2,
                                  tx.nk_1_,
                                  tx.nk_2_,
                                  tx.nk1_1_,
@@ -1284,6 +1482,12 @@ void Simulation::save_state(const std::string& filename, const Matrix& mObj) con
                                  tx.nk2_1_,
                                  tx.nk2_2_};
         out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+        write_u64(static_cast<uint64_t>(effSteps));
+        write_u64(static_cast<uint64_t>(histCopy.size()));
+        if (!histCopy.empty()) {
+            out.write(reinterpret_cast<const char*>(histCopy.data()),
+                      static_cast<std::streamsize>(histCopy.size() * sizeof(TransmissionLine::TxHistEntry)));
+        }
     }
     (void) write_f64;
     (void) mObj;
@@ -1299,7 +1503,7 @@ void Simulation::load_state(const std::string& filename, Matrix& mObj) {
     uint32_t version  = 0;
     in.read(magic, 8);
     in.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
-    if (std::string(magic, 8) != "JOSIMSTA" || version != 1) {
+    if (std::string(magic, 8) != "JOSIMSTA" || (version != 1 && version != 2)) {
         Errors::input_errors(InputErrors::CANNOT_OPEN_FILE, filename);
         return;
     }
@@ -1341,7 +1545,14 @@ void Simulation::load_state(const std::string& filename, Matrix& mObj) {
             if (jj.matrixInfo.nonZeros_.back() != vals[12]) {
                 jj.matrixInfo.nonZeros_.back() = vals[12];
                 mObj.nz[jj.nzBackIndex_]       = vals[12];
-                nzChange                       = true;
+#ifndef SLU
+                if (usePartitions_) {
+                    const int64_t p               = jjPartIdx_[i];
+                    partitions_[p].nz[jjPartNzIdx_[i]] = vals[12];
+                    partitions_[p].needsLU        = true;
+                }
+#endif
+                nzChange = true;
             }
         }
     }
@@ -1424,6 +1635,17 @@ void Simulation::load_state(const std::string& filename, Matrix& mObj) {
     for (uint64_t i = 0; i < nTX; ++i) {
         double vals[10] = {};
         in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        uint64_t                                   effSteps = 0;
+        std::vector<TransmissionLine::TxHistEntry> histRead;
+        if (version >= 2) {
+            effSteps                = read_u64();
+            const uint64_t histSize = read_u64();
+            histRead.resize(histSize);
+            if (histSize > 0) {
+                in.read(reinterpret_cast<char*>(histRead.data()),
+                        static_cast<std::streamsize>(histSize * sizeof(TransmissionLine::TxHistEntry)));
+            }
+        }
         if (i < txlines_.size()) {
             txlines_[i].n1_1_  = vals[0];
             txlines_[i].n1_2_  = vals[1];
@@ -1435,18 +1657,12 @@ void Simulation::load_state(const std::string& filename, Matrix& mObj) {
             txlines_[i].nk1_2_ = vals[7];
             txlines_[i].nk2_1_ = vals[8];
             txlines_[i].nk2_2_ = vals[9];
+            if (version >= 2 && histRead.size() == static_cast<size_t>(txlines_[i].histSize_)) {
+                txlines_[i].loadedSteps_ = static_cast<int64_t>(effSteps);
+                txlines_[i].hist_        = std::move(histRead);
+            }
         }
     }
 
-    if (nzChange) {
-#ifdef SLU
-        lu.factorize(true);
-#else
-        simOK_ = klu_l_refactor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, Numeric_, &Common_);
-        if (!simOK_) {
-            klu_l_free_numeric(&Numeric_, &Common_);
-            Numeric_ = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
-        }
-#endif
-    }
+    if (nzChange) { refactor_lu(mObj); }
 }

@@ -43,6 +43,8 @@ class Input {
     int64_t                                                      argCorrector    = 0;
     double                                                       argCorrectorTol = 1e-3;
     double                                                       argKCutoff      = 0.0;
+    int64_t                                                      argMcRuns       = 1;
+    bool                                                         argMcAll        = false;
     std::optional<std::pair<std::string, std::optional<double>>> saveStateFile;
     std::optional<std::string>                                   loadStateFile;
 
@@ -57,6 +59,7 @@ class Input {
         argGpu                     = cli_options.gpu;
         argFixedStep               = cli_options.fixedStep;
         argCorrector               = cli_options.corrector;
+        argMcRuns                  = cli_options.batchRuns;
         cli_output_file            = cli_options.output_file;
         netlist.sanityCheck        = cli_options.sanityCheck;
         netlist.sanityCheckSubckts = cli_options.sanityCheckSubckts;

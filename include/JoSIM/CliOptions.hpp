@@ -31,6 +31,7 @@ struct CliOptions {
     bool                            gpu           = false;
     bool                            fixedStep     = false;
     int64_t                         corrector     = 0;
+    int64_t                         batchRuns     = 1;
     bool                            sanityCheck   = false;
     std::unordered_set<std::string> sanityCheckSubckts;
 

@@ -338,15 +338,15 @@ As mentioned in the technical discussion, noise can be automatically inserted as
 
 **.neb**&emsp;*Bandwidth in Hertz*
 
-### Spread
+### Spread & Batched Monte Carlo Robustness Analysis
 
 JoSIM allows each value of inductors, resistors, capacitors and JJ (area/Ic) to be spread uniformly within a specified percentage range from the nominal value. Each time the value is used (in matrix creation), a new random value from the uniform distribution is chosen.
 
-This allows for process variation to be simulated.
+This allows for process variation and robustness margins to be simulated.
 
 To set the spread globally, the following control needs to be set:
 
-**.spread**&emsp;*Normalized percentage*&emsp;*[L=Inductor spread]*&emsp;*[B=JJ spread]*&emsp;*[C=Capacitor spread]*&emsp;*[R=Resistor spread]*
+**.spread**&emsp;*Normalized percentage*&emsp;*[L=Inductor spread]*&emsp;*[B=JJ spread]*&emsp;*[C=Capacitor spread]*&emsp;*[R=Resistor spread]*&emsp;*[runs=N]*
 
 Each individual component can also be spread by adding the **spread=** named parameter to the component declaration line.
 
@@ -355,6 +355,20 @@ The order of precedence is taken as local, specific global and then global. This
 An example:
 
 If an inductor has a value of *2pH*, this is its nominal value. If a local spread of *0.2* is specified this means a random value can be chosen anywhere between *1.6pH* and *2.4pH*. If global inductor specific spread is specified as *0.3* and the local spread is not defined, the value can be anything within the range *1.4pH -  2.6pH*. Similarly if the global spread is defined as *0.5* then the value each time the simulation is run can be anywhere between *1pH* and *3pH*.
+
+#### Batched Monte Carlo Execution (`-b <N>`, `.option mc=<N>`, `.spread ... runs=<N>`)
+
+When `N > 1` Monte Carlo trials are requested via `-b <N>` (`--batch=<N>`), `.option mc=<N>` (`.option batch=<N>`), or `.spread ... runs=<N>`, JoSIM parses the netlist and performs symbolic graph partitioning **only once**, then executes all `N` independent fabrication-yield trials simultaneously in a single invocation using either:
+- **Multi-Core OpenMP (`-p` / `--parallel`)**: Distributes independent Monte Carlo trials and circuit partitions across CPU threads using deterministic per-trial seeds (`baseSeed ^ (b * 0x9E3779B97F4A7C15ULL)`).
+- **NVIDIA CUDA GPU (`-g` / `--gpu`, `.option gpu`)**: Packs all `N` trials into a coalesced batch-minor layout (`[baseIdx * N + b]`) and solves them in lockstep using the hardware-adaptive `advance_mc_coalesced_kernel` with shared symbolic CSR indices in on-chip shared memory.
+
+By default, batched Monte Carlo outputs 4 ensemble statistics traces per requested `.print`/`.save` variable (computed via Welford's numerically stable online algorithm):
+- `<Trace>`: Ensemble mean across all `N` trials
+- `<Trace>_STD`: Sample standard deviation across all `N` trials
+- `<Trace>_MIN`: Minimum envelope across all `N` trials
+- `<Trace>_MAX`: Maximum envelope across all `N` trials
+
+If `.option mcall` is specified, individual per-trial waveforms `<Trace>_MC0`, `<Trace>_MC1`, ..., `<Trace>_MC{N-1}` are also appended to the output file. In addition, a **Monte Carlo Robustness Summary** table is printed to standard output at the end of the run.
 
 ### Options and Reproducibility (`.option`)
 
@@ -372,6 +386,8 @@ Simulator options can be configured in the netlist using the `.option` (or `.opt
 | **CORRECTORTOL** | `.option correctortol=<val>` | Sets the phase convergence threshold (in radians, default `1e-3`) that triggers predictor-corrector iteration when `CORRECTOR` > 0. |
 | **KCUTOFF** / **KMIN** | `.option kcutoff=<val>` | Ignores mutual inductance entries (`K` lines) with $|k| < \text{val}$ during MNA matrix construction, preventing dense LU fill-in from weak parasitic couplings in 3D field-extracted netlists. |
 | **GPU** / **CUDA** | `.option gpu` | Enables NVIDIA CUDA GPU acceleration (`CudaPartitionSolver`) when compiled with `-DUSING_CUDA=ON`. Equivalent to the `-g` (`--gpu`) CLI switch. |
+| **MC** / **BATCH** / **RUNS** | `.option mc=<N>` | Executes a batched Monte Carlo ensemble of `N` fabrication-spread (`.spread`) trials in a single simulation run. Equivalent to `-b <N>` (`--batch=<N>`) or `.spread ... runs=<N>`. |
+| **MCALL** | `.option mcall` | When running batched Monte Carlo (`mc > 1`), appends all individual trial waveforms (`<Trace>_MC0 .. <Trace>_MC{N-1}`) to the output file in addition to the ensemble `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, and `<Trace>_MAX` traces. |
 
 Examples:
 ```cir

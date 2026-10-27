@@ -43,6 +43,8 @@ class Capacitor : public BasicComponent {
 
   public:
     double pn1_ = 0.0, pn2_ = 0.0, pn3_ = 0.0, pn4_ = 0.0, pn5_ = 0.0, pn6_ = 0.0, pn7_ = 0.0;
+    double nominalValue_ = 0.0;
+    double spread_       = 1.0;
     Capacitor(const std::pair<tokens_t, string_o>& s,
               const NodeConfig&                    ncon,
               const nodemap&                       nm,

@@ -345,6 +345,16 @@ void Input::parse_options_and_state_controls() {
                     argPar = true;
                 } else if (tok == "GPU=0" || tok == "GPU=FALSE") {
                     argGpu = false;
+                } else if (tok.rfind("MC=", 0) == 0) {
+                    argMcRuns = std::max<int64_t>(1, static_cast<int64_t>(parse_param(tok.substr(3), parameters)));
+                } else if (tok.rfind("BATCH=", 0) == 0) {
+                    argMcRuns = std::max<int64_t>(1, static_cast<int64_t>(parse_param(tok.substr(6), parameters)));
+                } else if (tok.rfind("RUNS=", 0) == 0) {
+                    argMcRuns = std::max<int64_t>(1, static_cast<int64_t>(parse_param(tok.substr(5), parameters)));
+                } else if (tok == "MCALL" || tok == "MCALL=1" || tok == "MCALL=TRUE") {
+                    argMcAll = true;
+                } else if (tok == "MCALL=0" || tok == "MCALL=FALSE") {
+                    argMcAll = false;
                 }
             }
         }

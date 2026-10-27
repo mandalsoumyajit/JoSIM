@@ -54,7 +54,9 @@ Inductor::Inductor(const std::pair<tokens_t, string_o>& s,
     // Add the label to the known labels list
     lm.emplace(s.first.at(0));
     // Set the value (Inductance), this should be the 4th token
-    netlistInfo.value_ = spread.spread_value(parse_param(s.first.at(3), iObj.parameters, s.second), Spread::IND, spr);
+    nominalValue_      = parse_param(s.first.at(3), iObj.parameters, s.second);
+    spread_            = spr;
+    netlistInfo.value_ = spread.spread_value(nominalValue_, Spread::IND, spread_);
     // Set the node configuration type
     indexInfo.nodeConfig_   = ncon;
     // Set current index and increment it

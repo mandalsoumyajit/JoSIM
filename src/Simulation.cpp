@@ -10,6 +10,7 @@
 #include "JoSIM/Model.hpp"
 #include "JoSIM/ProgressBar.hpp"
 #include "JoSIM/Rng.hpp"
+#include "JoSIM/Spread.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -53,9 +54,18 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     minOut_                  = iObj.argMin;
     parallel_                = iObj.argPar;
     gpu_                     = iObj.argGpu;
+#ifdef JOSIM_CUDA
+    if (gpu_) { CudaPartitionSolver::warmup_device(); }
+#endif
     fixedStep_               = iObj.argFixedStep;
     warnStep_                = iObj.argWarnStep;
     verb_                    = iObj.argVerb;
+    mcRuns_                  = std::max<int64_t>(1, iObj.argMcRuns);
+    results.mcRuns           = 1;
+    results.mcNumRows        = 0;
+    results.mcNumKeptSteps   = 0;
+    results.mcRowToSlot.clear();
+    results.mcTraceOut.clear();
     correctorIter_           = iObj.argCorrector;
     correctorTol_            = iObj.argCorrectorTol;
     saveStateFile_           = iObj.saveStateFile;
@@ -233,11 +243,19 @@ void Simulation::setup_partitions(Matrix& mObj) {
     partitions_.clear();
     jjPartIdx_.clear();
     jjPartNzIdx_.clear();
+    resPartIdx_.clear();
+    resPartNzIdx_.clear();
+    capPartIdx_.clear();
+    capPartNzIdx_.clear();
+    indPartIdx_.clear();
+    indPartNzIdx_.clear();
+    indMutPartNzIdx_.clear();
 #ifdef JOSIM_CUDA
     cudaSolver_.reset();
 #endif
     const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
-    if (N < 32) { return; }
+    if (N < 32 && mcRuns_ <= 1) { return; }
+    if (N < 4) { return; }
 
     std::vector<int64_t> parent(N);
     for (int64_t i = 0; i < N; ++i) { parent[i] = i; }
@@ -285,7 +303,7 @@ void Simulation::setup_partitions(Matrix& mObj) {
     }
 
     const int64_t nParts = static_cast<int64_t>(rootToPart.size());
-    if (nParts < 2) { return; }
+    if (nParts < 2 && mcRuns_ <= 1 && !(gpu_ && N <= 4096)) { return; }
 
     partitions_.resize(nParts);
     std::vector<int64_t> localRow(N, 0);
@@ -323,17 +341,51 @@ void Simulation::setup_partitions(Matrix& mObj) {
         jjPartNzIdx_[idx]   = globalNzToPartNz[jjs_[idx].nzBackIndex_];
         partitions_[p].jjIndices.push_back(static_cast<int64_t>(idx));
     }
+    auto find_part_nz = [&](int64_t p, int64_t globR, int64_t globC) -> int64_t {
+        const auto&   part = partitions_[p];
+        const int64_t locR = localRow[globR];
+        const int64_t locC = localRow[globC];
+        for (int64_t k = part.rp[locR]; k < part.rp[locR + 1]; ++k) {
+            if (part.ci[k] == locC) { return k; }
+        }
+        return -1;
+    };
+
+    resPartIdx_.resize(resistors_.size(), 0);
+    resPartNzIdx_.resize(resistors_.size(), -1);
     for (size_t idx = 0; idx < resistors_.size(); ++idx) {
-        partitions_[rowPart[resistors_[idx].indexInfo.currentIndex_.value()]].resIndices.push_back(
-                static_cast<int64_t>(idx));
+        const int64_t globR = resistors_[idx].indexInfo.currentIndex_.value();
+        const int64_t p     = rowPart[globR];
+        resPartIdx_[idx]    = p;
+        resPartNzIdx_[idx]  = find_part_nz(p, globR, globR);
+        partitions_[p].resIndices.push_back(static_cast<int64_t>(idx));
     }
+
+    indPartIdx_.resize(inductors_.size(), 0);
+    indPartNzIdx_.resize(inductors_.size(), -1);
+    indMutPartNzIdx_.resize(inductors_.size());
     for (size_t idx = 0; idx < inductors_.size(); ++idx) {
-        partitions_[rowPart[inductors_[idx].indexInfo.currentIndex_.value()]].indIndices.push_back(
-                static_cast<int64_t>(idx));
+        const int64_t globR = inductors_[idx].indexInfo.currentIndex_.value();
+        const int64_t p     = rowPart[globR];
+        indPartIdx_[idx]    = p;
+        indPartNzIdx_[idx]  = find_part_nz(p, globR, globR);
+        const auto& muts    = inductors_[idx].get_mutualInductance();
+        indMutPartNzIdx_[idx].resize(muts.size(), -1);
+        for (size_t mIdx = 0; mIdx < muts.size(); ++mIdx) {
+            const int64_t globC           = inductors_[muts[mIdx].first].indexInfo.currentIndex_.value();
+            indMutPartNzIdx_[idx][mIdx]   = find_part_nz(p, globR, globC);
+        }
+        partitions_[p].indIndices.push_back(static_cast<int64_t>(idx));
     }
+
+    capPartIdx_.resize(capacitors_.size(), 0);
+    capPartNzIdx_.resize(capacitors_.size(), -1);
     for (size_t idx = 0; idx < capacitors_.size(); ++idx) {
-        partitions_[rowPart[capacitors_[idx].indexInfo.currentIndex_.value()]].capIndices.push_back(
-                static_cast<int64_t>(idx));
+        const int64_t globR = capacitors_[idx].indexInfo.currentIndex_.value();
+        const int64_t p     = rowPart[globR];
+        capPartIdx_[idx]    = p;
+        capPartNzIdx_[idx]  = find_part_nz(p, globR, globR);
+        partitions_[p].capIndices.push_back(static_cast<int64_t>(idx));
     }
     for (size_t idx = 0; idx < vsources_.size(); ++idx) {
         partitions_[rowPart[vsources_[idx].indexInfo.currentIndex_.value()]].vsIndices.push_back(
@@ -361,7 +413,7 @@ void Simulation::setup_partitions(Matrix& mObj) {
         partitions_[rowPart[vccss_[idx].indexInfo.currentIndex_.value()]].vccsIndices.push_back(
                 static_cast<int64_t>(idx));
     }
-    int64_t kMin = 1024;
+    int64_t kMin = txlines_.empty() ? 8192 : 1024;
     for (size_t idx = 0; idx < txlines_.size(); ++idx) {
         const auto& tx = txlines_[idx];
         kMin           = std::min<int64_t>(kMin, tx.timestepDelay_);
@@ -369,7 +421,7 @@ void Simulation::setup_partitions(Matrix& mObj) {
                 static_cast<int64_t>(idx));
         partitions_[rowPart[tx.currentIndex2_]].txPort2Indices.push_back(static_cast<int64_t>(idx));
     }
-    windowSize_ = (kMin >= 1) ? std::min<int64_t>(std::min<int64_t>(kMin, 1024), std::max<int64_t>(1, simSize_)) : 0;
+    windowSize_ = (kMin >= 1) ? std::min<int64_t>(kMin, std::max<int64_t>(1, simSize_)) : 0;
 
     if (!mObj.relevantTraces.empty()) {
         for (const auto& globR : mObj.relevantIndices) {
@@ -984,7 +1036,7 @@ void Simulation::factorize_lu(Matrix& mObj) {
                 int64_t ok   = klu_l_defaults(&part.common);
                 assert(ok);
                 (void) ok;
-                if (gpu_) {
+                if (gpu_ || mcRuns_ > 1) {
                     part.common.btf   = 0;
                     part.common.scale = 0;
                 }
@@ -1000,7 +1052,7 @@ void Simulation::factorize_lu(Matrix& mObj) {
             int64_t ok   = klu_l_defaults(&part.common);
             assert(ok);
             (void) ok;
-            if (gpu_) {
+            if (gpu_ || mcRuns_ > 1) {
                 part.common.btf   = 0;
                 part.common.scale = 0;
             }
@@ -1124,6 +1176,1307 @@ void Simulation::free_lu() {
         if (Symbolic_) { klu_l_free_symbolic(&Symbolic_, &Common_); }
         if (Numeric_) { klu_l_free_numeric(&Numeric_, &Common_); }
     }
+#endif
+}
+
+void Simulation::trans_sim_mc(Matrix& mObj) {
+#ifndef SLU
+    const int64_t B      = mcRuns_;
+    const int64_t nParts = static_cast<int64_t>(partitions_.size());
+    const int64_t N      = static_cast<int64_t>(mObj.rp.size()) - 1;
+
+    std::vector<int32_t> globalToAbsLocal(N, 0);
+    int32_t              baseRowOffset = 0;
+    for (int64_t p = 0; p < nParts; ++p) {
+        const auto& part = partitions_[p];
+        for (int64_t locR = 0; locR < part.n; ++locR) {
+            globalToAbsLocal[part.globalRows[locR]] = baseRowOffset + static_cast<int32_t>(locR);
+        }
+        baseRowOffset += static_cast<int32_t>(part.n);
+    }
+
+    std::vector<GpuPartDesc> baseParts(nParts);
+    std::vector<int32_t>     baseP;
+    std::vector<int32_t>     baseQ;
+    std::vector<int32_t>     baseLuRp;
+    std::vector<int32_t>     baseLuDiag;
+    std::vector<int32_t>     baseLuCi;
+    std::vector<int32_t>     baseLuSrcNz;
+    std::vector<double>      baseLuVal;
+    std::vector<double>      basePartNz;
+    std::vector<double>      baseXInit(baseRowOffset, 0.0);
+    for (int64_t r = 0; r < N; ++r) { baseXInit[globalToAbsLocal[r]] = x_[r]; }
+
+    baseP.reserve(baseRowOffset);
+    baseQ.reserve(baseRowOffset);
+    baseLuDiag.reserve(baseRowOffset);
+    baseLuRp.reserve(baseRowOffset + nParts);
+
+    std::vector<GpuJJ>       baseJJs;
+    std::vector<GpuRes>      baseRess;
+    std::vector<GpuInd>      baseInds;
+    std::vector<GpuMut>      baseMuts;
+    std::vector<GpuCap>      baseCaps;
+    std::vector<GpuVS>       baseVSs;
+    std::vector<GpuPS>       basePSs;
+    std::vector<GpuCS>       baseCSs;
+    std::vector<GpuCCVS>     baseCCVSs;
+    std::vector<GpuVCCS>     baseVCCSs;
+    std::vector<GpuTxHalf>   baseTxHalves;
+    std::vector<GpuRelTrace> baseRelTraces;
+
+    std::vector<int32_t> globalIndToGpuInd(inductors_.size(), -1);
+    std::vector<int32_t> globalJJToGpuJJ(jjs_.size(), -1);
+    std::vector<int32_t> globalResToGpuRes(resistors_.size(), -1);
+    std::vector<int32_t> globalCapToGpuCap(capacitors_.size(), -1);
+    {
+        int32_t gIndCounter = 0;
+        for (int64_t p = 0; p < nParts; ++p) {
+            for (int64_t idx : partitions_[p].indIndices) { globalIndToGpuInd[idx] = gIndCounter++; }
+        }
+    }
+
+    results.mcRowToSlot.assign(static_cast<size_t>(N), -1);
+
+    int32_t curRowOff = 0;
+    for (int64_t p = 0; p < nParts; ++p) {
+        const auto& part = partitions_[p];
+        if (!part.symbolic || !part.numeric || !part.symbolic->Q || !part.numeric->Pnum) {
+            Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR);
+            return;
+        }
+        const int32_t n    = static_cast<int32_t>(part.n);
+        GpuPartDesc&  desc = baseParts[p];
+        desc.n             = n;
+        desc.rowStart      = curRowOff;
+        desc.rpStart       = static_cast<int32_t>(baseLuRp.size());
+        desc.luStart       = static_cast<int32_t>(baseLuCi.size());
+        desc.nzStart       = static_cast<int32_t>(basePartNz.size());
+        desc.nzCount       = static_cast<int32_t>(part.nz.size());
+
+        basePartNz.insert(basePartNz.end(), part.nz.begin(), part.nz.end());
+
+        std::vector<int32_t> invQ(n, 0);
+        for (int32_t j = 0; j < n; ++j) {
+            const int32_t pRow = static_cast<int32_t>(part.symbolic->Q[j]);
+            const int32_t qCol = static_cast<int32_t>(part.numeric->Pnum[j]);
+            baseP.push_back(pRow);
+            baseQ.push_back(qCol);
+            invQ[qCol] = j;
+        }
+
+        for (int32_t r = 0; r < n; ++r) {
+            baseLuRp.push_back(static_cast<int32_t>(baseLuCi.size()) - desc.luStart);
+            const int32_t origR  = baseP[curRowOff + r];
+            const int64_t kStart = part.rp[origR];
+            const int64_t kEnd   = part.rp[origR + 1];
+
+            std::vector<std::pair<int32_t, int32_t>> origCols;
+            origCols.reserve(static_cast<size_t>(kEnd - kStart + 4));
+            for (int64_t k = kStart; k < kEnd; ++k) {
+                origCols.emplace_back(invQ[part.ci[k]], desc.nzStart + static_cast<int32_t>(k));
+            }
+            std::sort(origCols.begin(), origCols.end());
+            if (origCols.size() > 1) {
+                size_t writePos = 0;
+                for (size_t readPos = 1; readPos < origCols.size(); ++readPos) {
+                    if (origCols[readPos].first == origCols[writePos].first) {
+                        basePartNz[origCols[writePos].second] += basePartNz[origCols[readPos].second];
+                    } else {
+                        origCols[++writePos] = origCols[readPos];
+                    }
+                }
+                origCols.resize(writePos + 1);
+            }
+
+            std::vector<std::pair<int32_t, int32_t>> rowEntries = origCols;
+            {
+                auto itDiag = std::lower_bound(rowEntries.begin(), rowEntries.end(), std::make_pair(r, -1));
+                if (itDiag == rowEntries.end() || itDiag->first != r) {
+                    rowEntries.insert(itDiag, std::make_pair(r, -1));
+                }
+            }
+            for (size_t idx = 0; idx < rowEntries.size(); ++idx) {
+                const int32_t colK = rowEntries[idx].first;
+                if (colK >= r) { break; }
+                const int32_t kDiag = baseLuDiag[curRowOff + colK];
+                const int32_t kEndU = baseLuRp[desc.rpStart + colK + 1];
+                for (int32_t idxU = kDiag + 1; idxU < kEndU; ++idxU) {
+                    const int32_t colU = baseLuCi[desc.luStart + idxU];
+                    auto          it
+                            = std::lower_bound(rowEntries.begin(), rowEntries.end(), std::make_pair(colU, -1));
+                    if (it == rowEntries.end() || it->first != colU) {
+                        const size_t curIdx = idx;
+                        rowEntries.insert(it, std::make_pair(colU, -1));
+                        idx = curIdx;
+                    }
+                }
+            }
+
+            const int32_t rStart = static_cast<int32_t>(baseLuCi.size()) - desc.luStart;
+            int32_t       rDiag  = -1;
+            for (const auto& kv : rowEntries) {
+                const int32_t localIdx = static_cast<int32_t>(baseLuCi.size()) - desc.luStart;
+                if (kv.first == r) { rDiag = localIdx; }
+                baseLuCi.push_back(kv.first);
+                baseLuSrcNz.push_back(kv.second);
+                baseLuVal.push_back((kv.second >= 0) ? basePartNz[kv.second] : 0.0);
+            }
+            if (rDiag < 0) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+            baseLuDiag.push_back(rDiag);
+
+            for (int32_t idxL = rStart; idxL < rDiag; ++idxL) {
+                const int32_t colK  = baseLuCi[desc.luStart + idxL];
+                const int32_t kDiag = baseLuDiag[curRowOff + colK];
+                const int32_t kEndU = baseLuRp[desc.rpStart + colK + 1];
+                const double  piv   = baseLuVal[desc.luStart + kDiag];
+                if (piv == 0.0) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+                const double mult               = baseLuVal[desc.luStart + idxL] / piv;
+                baseLuVal[desc.luStart + idxL]  = mult;
+                int32_t pI                      = idxL + 1;
+                for (int32_t idxU = kDiag + 1; idxU < kEndU; ++idxU) {
+                    const int32_t colU = baseLuCi[desc.luStart + idxU];
+                    while (baseLuCi[desc.luStart + pI] < colU) { ++pI; }
+                    baseLuVal[desc.luStart + pI] -= mult * baseLuVal[desc.luStart + idxU];
+                }
+            }
+            if (baseLuVal[desc.luStart + rDiag] == 0.0) {
+                Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR);
+            }
+        }
+        baseLuRp.push_back(static_cast<int32_t>(baseLuCi.size()) - desc.luStart);
+        desc.luNnz = static_cast<int32_t>(baseLuCi.size()) - desc.luStart;
+
+        desc.jjStart = static_cast<int32_t>(baseJJs.size());
+        desc.jjCount = static_cast<int32_t>(part.jjIndices.size());
+        for (int64_t jIdx : part.jjIndices) {
+            globalJJToGpuJJ[jIdx] = static_cast<int32_t>(baseJJs.size());
+            const auto& jj        = jjs_[jIdx];
+            const auto& m         = jj.model_;
+            GpuJJ       gjj{};
+            gjj.posIdx       = jj.indexInfo.posIndex_ ? globalToAbsLocal[jj.indexInfo.posIndex_.value()] : -1;
+            gjj.negIdx       = jj.indexInfo.negIndex_ ? globalToAbsLocal[jj.indexInfo.negIndex_.value()] : -1;
+            gjj.curIdx       = globalToAbsLocal[jj.indexInfo.currentIndex_.value()];
+            gjj.varIdx       = globalToAbsLocal[jj.variableIndex_];
+            gjj.nzIdx        = desc.nzStart + static_cast<int32_t>(jjPartNzIdx_[jIdx]);
+            gjj.rtype        = m.rtype();
+            gjj.tDep         = m.tDep() ? 1 : 0;
+            const auto& cpr  = m.cpr();
+            gjj.cprLen       = std::min<int32_t>(8, static_cast<int32_t>(cpr.size()));
+            for (int32_t h = 0; h < gjj.cprLen; ++h) { gjj.cpr[h] = cpr[h]; }
+            gjj.ic           = m.ic();
+            gjj.c            = m.c();
+            gjj.r0           = m.r0();
+            gjj.rn           = m.rn();
+            gjj.phiOff       = m.phiOff();
+            gjj.t            = m.t();
+            gjj.d            = m.d();
+            gjj.del          = jj.del_;
+            gjj.lowerB       = jj.lowerB_;
+            gjj.upperB       = jj.upperB_;
+            gjj.gLarge       = jj.gLarge_;
+            gjj.negInvSubgap = jj.negInvSubgap_;
+            gjj.negInvTrans  = jj.negInvTrans_;
+            gjj.negInvNormal = jj.negInvNormal_;
+            gjj.pn1          = jj.pn1_;
+            gjj.pn2          = jj.pn2_;
+            gjj.pn3          = jj.pn3_;
+            gjj.pn4          = jj.pn4_;
+            gjj.phi0         = jj.phi0_;
+            gjj.vn1          = jj.vn1_;
+            gjj.vn2          = jj.vn2_;
+            gjj.vn3          = jj.vn3_;
+            gjj.vn4          = jj.vn4_;
+            gjj.vn5          = jj.vn5_;
+            gjj.vn6          = jj.vn6_;
+            gjj.it           = jj.it_;
+            gjj.curNzVal     = jj.matrixInfo.nonZeros_.back();
+            baseJJs.push_back(gjj);
+        }
+
+        desc.resStart = static_cast<int32_t>(baseRess.size());
+        desc.resCount = static_cast<int32_t>(part.resIndices.size());
+        for (int64_t rIdx : part.resIndices) {
+            globalResToGpuRes[rIdx] = static_cast<int32_t>(baseRess.size());
+            const auto& res         = resistors_[rIdx];
+            GpuRes      gres{};
+            gres.posIdx = res.indexInfo.posIndex_ ? globalToAbsLocal[res.indexInfo.posIndex_.value()] : -1;
+            gres.negIdx = res.indexInfo.negIndex_ ? globalToAbsLocal[res.indexInfo.negIndex_.value()] : -1;
+            gres.curIdx = globalToAbsLocal[res.indexInfo.currentIndex_.value()];
+            gres.pn1    = res.pn1_;
+            gres.pn2    = res.pn2_;
+            baseRess.push_back(gres);
+        }
+
+        desc.indStart = static_cast<int32_t>(baseInds.size());
+        desc.indCount = static_cast<int32_t>(part.indIndices.size());
+        for (int64_t lIdx : part.indIndices) {
+            const auto& ind = inductors_[lIdx];
+            GpuInd      gind{};
+            gind.curIdx   = globalToAbsLocal[ind.indexInfo.currentIndex_.value()];
+            gind.L        = ind.netlistInfo.value_;
+            gind.In2      = ind.In2_;
+            gind.In3      = ind.In3_;
+            gind.In4      = ind.In4_;
+            gind.mutStart = static_cast<int32_t>(baseMuts.size());
+            gind.mutCount = static_cast<int32_t>(ind.get_mutualInductance().size());
+            for (const auto& m : ind.get_mutualInductance()) {
+                GpuMut gmut{};
+                gmut.targetIndIdx = globalIndToGpuInd[m.first];
+                gmut.targetCurIdx = globalToAbsLocal[inductors_[m.first].indexInfo.currentIndex_.value()];
+                gmut.M            = m.second;
+                baseMuts.push_back(gmut);
+            }
+            baseInds.push_back(gind);
+        }
+
+        desc.capStart = static_cast<int32_t>(baseCaps.size());
+        desc.capCount = static_cast<int32_t>(part.capIndices.size());
+        for (int64_t cIdx : part.capIndices) {
+            globalCapToGpuCap[cIdx] = static_cast<int32_t>(baseCaps.size());
+            const auto& cap         = capacitors_[cIdx];
+            GpuCap      gcap{};
+            gcap.posIdx = cap.indexInfo.posIndex_ ? globalToAbsLocal[cap.indexInfo.posIndex_.value()] : -1;
+            gcap.negIdx = cap.indexInfo.negIndex_ ? globalToAbsLocal[cap.indexInfo.negIndex_.value()] : -1;
+            gcap.curIdx = globalToAbsLocal[cap.indexInfo.currentIndex_.value()];
+            gcap.pn1    = cap.pn1_;
+            gcap.pn2    = cap.pn2_;
+            gcap.pn3    = cap.pn3_;
+            gcap.pn4    = cap.pn4_;
+            baseCaps.push_back(gcap);
+        }
+
+        desc.vsStart = static_cast<int32_t>(baseVSs.size());
+        desc.vsCount = static_cast<int32_t>(part.vsIndices.size());
+        for (int64_t vIdx : part.vsIndices) {
+            const auto& vs = vsources_[vIdx];
+            GpuVS       gvs{};
+            gvs.posIdx = vs.indexInfo.posIndex_ ? globalToAbsLocal[vs.indexInfo.posIndex_.value()] : -1;
+            gvs.negIdx = vs.indexInfo.negIndex_ ? globalToAbsLocal[vs.indexInfo.negIndex_.value()] : -1;
+            gvs.curIdx = globalToAbsLocal[vs.indexInfo.currentIndex_.value()];
+            gvs.srcIdx = static_cast<int32_t>(vs.sourceIndex_);
+            gvs.pn1    = vs.pn1_;
+            gvs.pn2    = vs.pn2_;
+            baseVSs.push_back(gvs);
+        }
+
+        desc.psStart = static_cast<int32_t>(basePSs.size());
+        desc.psCount = static_cast<int32_t>(part.psIndices.size());
+        for (int64_t pIdx : part.psIndices) {
+            const auto& ps = psources_[pIdx];
+            GpuPS       gps{};
+            gps.curIdx = globalToAbsLocal[ps.indexInfo.currentIndex_.value()];
+            gps.srcIdx = static_cast<int32_t>(ps.sourceIndex_);
+            basePSs.push_back(gps);
+        }
+
+        desc.csStart = static_cast<int32_t>(baseCSs.size());
+        desc.csCount = static_cast<int32_t>(part.csIndices.size());
+        for (int64_t cIdx : part.csIndices) {
+            const auto& cs = mObj.components.currentsources[cIdx];
+            GpuCS       gcs{};
+            gcs.posIdx = cs.indexInfo.posIndex_ ? globalToAbsLocal[cs.indexInfo.posIndex_.value()] : -1;
+            gcs.negIdx = cs.indexInfo.negIndex_ ? globalToAbsLocal[cs.indexInfo.negIndex_.value()] : -1;
+            gcs.srcIdx = static_cast<int32_t>(cs.sourceIndex_);
+            baseCSs.push_back(gcs);
+        }
+
+        desc.ccvsStart = static_cast<int32_t>(baseCCVSs.size());
+        desc.ccvsCount = static_cast<int32_t>(part.ccvsIndices.size());
+        for (int64_t idx : part.ccvsIndices) {
+            const auto& ccvs = ccvss_[idx];
+            GpuCCVS     gccvs{};
+            gccvs.posIdx = ccvs.indexInfo.posIndex_ ? globalToAbsLocal[ccvs.indexInfo.posIndex_.value()] : -1;
+            gccvs.negIdx = ccvs.indexInfo.negIndex_ ? globalToAbsLocal[ccvs.indexInfo.negIndex_.value()] : -1;
+            gccvs.curIdx = globalToAbsLocal[ccvs.indexInfo.currentIndex_.value()];
+            baseCCVSs.push_back(gccvs);
+        }
+
+        desc.vccsStart = static_cast<int32_t>(baseVCCSs.size());
+        desc.vccsCount = static_cast<int32_t>(part.vccsIndices.size());
+        for (int64_t idx : part.vccsIndices) {
+            const auto& vccs = vccss_[idx];
+            GpuVCCS     gvccs{};
+            gvccs.posIdx2 = vccs.posIndex2_ ? globalToAbsLocal[vccs.posIndex2_.value()] : -1;
+            gvccs.negIdx2 = vccs.negIndex2_ ? globalToAbsLocal[vccs.negIndex2_.value()] : -1;
+            gvccs.curIdx  = globalToAbsLocal[vccs.indexInfo.currentIndex_.value()];
+            baseVCCSs.push_back(gvccs);
+        }
+
+        desc.txHalfStart = static_cast<int32_t>(baseTxHalves.size());
+        for (int64_t tIdx : part.txPort1Indices) {
+            const auto& tx = txlines_[tIdx];
+            GpuTxHalf   gtxh{};
+            gtxh.txIdx   = static_cast<int32_t>(tIdx);
+            gtxh.isPort2 = 0;
+            gtxh.posIdx  = tx.indexInfo.posIndex_ ? globalToAbsLocal[tx.indexInfo.posIndex_.value()] : -1;
+            gtxh.negIdx  = tx.indexInfo.negIndex_ ? globalToAbsLocal[tx.indexInfo.negIndex_.value()] : -1;
+            gtxh.curIdx  = globalToAbsLocal[tx.indexInfo.currentIndex_.value()];
+            gtxh.n1      = tx.n1_1_;
+            gtxh.n2      = tx.n2_1_;
+            baseTxHalves.push_back(gtxh);
+        }
+        for (int64_t tIdx : part.txPort2Indices) {
+            const auto& tx = txlines_[tIdx];
+            GpuTxHalf   gtxh{};
+            gtxh.txIdx   = static_cast<int32_t>(tIdx);
+            gtxh.isPort2 = 1;
+            gtxh.posIdx  = tx.posIndex2_ ? globalToAbsLocal[tx.posIndex2_.value()] : -1;
+            gtxh.negIdx  = tx.negIndex2_ ? globalToAbsLocal[tx.negIndex2_.value()] : -1;
+            gtxh.curIdx  = globalToAbsLocal[tx.currentIndex2_];
+            gtxh.n1      = tx.n1_2_;
+            gtxh.n2      = tx.n2_2_;
+            baseTxHalves.push_back(gtxh);
+        }
+        desc.txHalfCount = static_cast<int32_t>(baseTxHalves.size()) - desc.txHalfStart;
+
+        desc.relStart = static_cast<int32_t>(baseRelTraces.size());
+        desc.relCount = static_cast<int32_t>(part.traceGlobalRows.size());
+        for (int64_t globR : part.traceGlobalRows) {
+            const int32_t slot          = static_cast<int32_t>(baseRelTraces.size());
+            results.mcRowToSlot[globR]  = slot;
+            GpuRelTrace grt{};
+            grt.localAbsIdx = globalToAbsLocal[globR];
+            grt.traceSlot   = slot;
+            baseRelTraces.push_back(grt);
+        }
+
+        curRowOff += n;
+    }
+
+    std::vector<GpuTxLine>      baseTxLines(txlines_.size());
+    std::vector<GpuTxHistEntry> baseTxHist;
+    int32_t                     baseHistOff = 0;
+    for (size_t idx = 0; idx < txlines_.size(); ++idx) {
+        const auto& tx      = txlines_[idx];
+        GpuTxLine&  gtx     = baseTxLines[idx];
+        gtx.z0              = tx.netlistInfo.value_;
+        gtx.k               = tx.timestepDelay_;
+        gtx.fracDelay       = tx.fracDelay_;
+        gtx.loadedSteps     = tx.loadedSteps_;
+        gtx.histOffset      = baseHistOff;
+        gtx.histSize        = static_cast<int32_t>(tx.histSize_);
+        baseHistOff        += gtx.histSize;
+        for (const auto& h : tx.hist_) { baseTxHist.push_back({h.v1, h.v2, h.i1, h.i2}); }
+    }
+
+    // Replicate and perturb across all B Monte Carlo trials in parallel
+    const int64_t nPartsTotal   = B * nParts;
+    const int32_t nBaseRows     = baseRowOffset;
+    const int64_t nBaseRp       = static_cast<int64_t>(baseLuRp.size());
+    const int64_t nBaseLu       = static_cast<int64_t>(baseLuCi.size());
+    const int64_t nBasePartNz   = static_cast<int64_t>(basePartNz.size());
+    const int64_t nBaseJJs      = static_cast<int64_t>(baseJJs.size());
+    const int64_t nBaseRess     = static_cast<int64_t>(baseRess.size());
+    const int64_t nBaseInds     = static_cast<int64_t>(baseInds.size());
+    const int64_t nBaseMuts     = static_cast<int64_t>(baseMuts.size());
+    const int64_t nBaseCaps     = static_cast<int64_t>(baseCaps.size());
+    const int64_t nBaseVSs      = static_cast<int64_t>(baseVSs.size());
+    const int64_t nBasePSs      = static_cast<int64_t>(basePSs.size());
+    const int64_t nBaseCSs      = static_cast<int64_t>(baseCSs.size());
+    const int64_t nBaseCCVSs    = static_cast<int64_t>(baseCCVSs.size());
+    const int64_t nBaseVCCSs    = static_cast<int64_t>(baseVCCSs.size());
+    const int64_t nBaseTxHalves = static_cast<int64_t>(baseTxHalves.size());
+    const int64_t nBaseTraces   = static_cast<int64_t>(baseRelTraces.size());
+    const int64_t nBaseTxLines  = static_cast<int64_t>(baseTxLines.size());
+    const int64_t nBaseTxHist   = static_cast<int64_t>(baseTxHist.size());
+
+    std::vector<GpuPartDesc>    allParts(nPartsTotal);
+    std::vector<int32_t>        allP(B * nBaseRows);
+    std::vector<int32_t>        allQ(B * nBaseRows);
+    std::vector<int32_t>        allLuRp(B * nBaseRp);
+    std::vector<int32_t>        allLuDiag(B * nBaseRows);
+    std::vector<int32_t>        allLuCi(B * nBaseLu);
+    std::vector<int32_t>        allLuSrcNz(B * nBaseLu);
+    std::vector<double>         allLuVal(B * nBaseLu);
+    std::vector<double>         allPartNz(B * nBasePartNz);
+    std::vector<double>         allXInit(B * nBaseRows);
+    std::vector<GpuJJ>          allJJs(B * nBaseJJs);
+    std::vector<GpuRes>         allRess(B * nBaseRess);
+    std::vector<GpuInd>         allInds(B * nBaseInds);
+    std::vector<GpuMut>         allMuts(B * nBaseMuts);
+    std::vector<GpuCap>         allCaps(B * nBaseCaps);
+    std::vector<GpuVS>          allVSs(B * nBaseVSs);
+    std::vector<GpuPS>          allPSs(B * nBasePSs);
+    std::vector<GpuCS>          allCSs(B * nBaseCSs);
+    std::vector<GpuCCVS>        allCCVSs(B * nBaseCCVSs);
+    std::vector<GpuVCCS>        allVCCSs(B * nBaseVCCSs);
+    std::vector<GpuTxHalf>      allTxHalves(B * nBaseTxHalves);
+    std::vector<GpuRelTrace>    allRelTraces(B * nBaseTraces);
+    std::vector<GpuTxLine>      allTxLines(B * nBaseTxLines);
+    std::vector<GpuTxHistEntry> allTxHist(B * nBaseTxHist);
+
+    bool setupSingErr = false;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (parallel_ || gpu_) reduction(|| : setupSingErr)
+#endif
+    for (int64_t b = 0; b < B; ++b) {
+        const int32_t rowOffB    = static_cast<int32_t>(b * nBaseRows);
+        const int32_t rpOffB     = static_cast<int32_t>(b * nBaseRp);
+        const int32_t luOffB     = static_cast<int32_t>(b * nBaseLu);
+        const int32_t nzOffB     = static_cast<int32_t>(b * nBasePartNz);
+        const int32_t jjOffB     = static_cast<int32_t>(b * nBaseJJs);
+        const int32_t resOffB    = static_cast<int32_t>(b * nBaseRess);
+        const int32_t indOffB    = static_cast<int32_t>(b * nBaseInds);
+        const int32_t mutOffB    = static_cast<int32_t>(b * nBaseMuts);
+        const int32_t capOffB    = static_cast<int32_t>(b * nBaseCaps);
+        const int32_t vsOffB     = static_cast<int32_t>(b * nBaseVSs);
+        const int32_t psOffB     = static_cast<int32_t>(b * nBasePSs);
+        const int32_t csOffB     = static_cast<int32_t>(b * nBaseCSs);
+        const int32_t ccvsOffB   = static_cast<int32_t>(b * nBaseCCVSs);
+        const int32_t vccsOffB   = static_cast<int32_t>(b * nBaseVCCSs);
+        const int32_t txHalfOffB = static_cast<int32_t>(b * nBaseTxHalves);
+        const int32_t relOffB    = static_cast<int32_t>(b * nBaseTraces);
+        const int32_t txLineOffB = static_cast<int32_t>(b * nBaseTxLines);
+        const int32_t txHistOffB = static_cast<int32_t>(b * nBaseTxHist);
+
+        std::copy(baseP.begin(), baseP.end(), allP.begin() + rowOffB);
+        std::copy(baseQ.begin(), baseQ.end(), allQ.begin() + rowOffB);
+        std::copy(baseLuRp.begin(), baseLuRp.end(), allLuRp.begin() + rpOffB);
+        std::copy(baseLuDiag.begin(), baseLuDiag.end(), allLuDiag.begin() + rowOffB);
+        std::copy(baseLuCi.begin(), baseLuCi.end(), allLuCi.begin() + luOffB);
+        for (int64_t idx = 0; idx < nBaseLu; ++idx) {
+            const int32_t src         = baseLuSrcNz[idx];
+            allLuSrcNz[luOffB + idx]  = (src >= 0) ? (src + nzOffB) : -1;
+        }
+        std::copy(baseLuVal.begin(), baseLuVal.end(), allLuVal.begin() + luOffB);
+        std::copy(basePartNz.begin(), basePartNz.end(), allPartNz.begin() + nzOffB);
+        std::copy(baseXInit.begin(), baseXInit.end(), allXInit.begin() + rowOffB);
+
+        for (int64_t p = 0; p < nParts; ++p) {
+            GpuPartDesc desc  = baseParts[p];
+            desc.rowStart    += rowOffB;
+            desc.rpStart     += rpOffB;
+            desc.luStart     += luOffB;
+            desc.nzStart     += nzOffB;
+            desc.jjStart     += jjOffB;
+            desc.resStart    += resOffB;
+            desc.indStart    += indOffB;
+            desc.capStart    += capOffB;
+            desc.vsStart     += vsOffB;
+            desc.psStart     += psOffB;
+            desc.csStart     += csOffB;
+            desc.ccvsStart   += ccvsOffB;
+            desc.vccsStart   += vccsOffB;
+            desc.txHalfStart += txHalfOffB;
+            desc.relStart    += relOffB;
+            allParts[b * nParts + p] = desc;
+        }
+
+        for (int64_t idx = 0; idx < nBaseJJs; ++idx) {
+            GpuJJ gjj   = baseJJs[idx];
+            if (gjj.posIdx >= 0) { gjj.posIdx += rowOffB; }
+            if (gjj.negIdx >= 0) { gjj.negIdx += rowOffB; }
+            gjj.curIdx += rowOffB;
+            gjj.varIdx += rowOffB;
+            gjj.nzIdx  += nzOffB;
+            allJJs[jjOffB + idx] = gjj;
+        }
+        for (int64_t idx = 0; idx < nBaseRess; ++idx) {
+            GpuRes gres = baseRess[idx];
+            if (gres.posIdx >= 0) { gres.posIdx += rowOffB; }
+            if (gres.negIdx >= 0) { gres.negIdx += rowOffB; }
+            gres.curIdx += rowOffB;
+            allRess[resOffB + idx] = gres;
+        }
+        for (int64_t idx = 0; idx < nBaseInds; ++idx) {
+            GpuInd gind    = baseInds[idx];
+            gind.curIdx   += rowOffB;
+            gind.mutStart += mutOffB;
+            allInds[indOffB + idx] = gind;
+        }
+        for (int64_t idx = 0; idx < nBaseMuts; ++idx) {
+            GpuMut gmut        = baseMuts[idx];
+            gmut.targetIndIdx += indOffB;
+            gmut.targetCurIdx += rowOffB;
+            allMuts[mutOffB + idx] = gmut;
+        }
+        for (int64_t idx = 0; idx < nBaseCaps; ++idx) {
+            GpuCap gcap = baseCaps[idx];
+            if (gcap.posIdx >= 0) { gcap.posIdx += rowOffB; }
+            if (gcap.negIdx >= 0) { gcap.negIdx += rowOffB; }
+            gcap.curIdx += rowOffB;
+            allCaps[capOffB + idx] = gcap;
+        }
+        for (int64_t idx = 0; idx < nBaseVSs; ++idx) {
+            GpuVS gvs = baseVSs[idx];
+            if (gvs.posIdx >= 0) { gvs.posIdx += rowOffB; }
+            if (gvs.negIdx >= 0) { gvs.negIdx += rowOffB; }
+            gvs.curIdx += rowOffB;
+            allVSs[vsOffB + idx] = gvs;
+        }
+        for (int64_t idx = 0; idx < nBasePSs; ++idx) {
+            GpuPS gps   = basePSs[idx];
+            gps.curIdx += rowOffB;
+            allPSs[psOffB + idx] = gps;
+        }
+        for (int64_t idx = 0; idx < nBaseCSs; ++idx) {
+            GpuCS gcs = baseCSs[idx];
+            if (gcs.posIdx >= 0) { gcs.posIdx += rowOffB; }
+            if (gcs.negIdx >= 0) { gcs.negIdx += rowOffB; }
+            allCSs[csOffB + idx] = gcs;
+        }
+        for (int64_t idx = 0; idx < nBaseCCVSs; ++idx) {
+            GpuCCVS gccvs = baseCCVSs[idx];
+            if (gccvs.posIdx >= 0) { gccvs.posIdx += rowOffB; }
+            if (gccvs.negIdx >= 0) { gccvs.negIdx += rowOffB; }
+            gccvs.curIdx += rowOffB;
+            allCCVSs[ccvsOffB + idx] = gccvs;
+        }
+        for (int64_t idx = 0; idx < nBaseVCCSs; ++idx) {
+            GpuVCCS gvccs = baseVCCSs[idx];
+            if (gvccs.posIdx2 >= 0) { gvccs.posIdx2 += rowOffB; }
+            if (gvccs.negIdx2 >= 0) { gvccs.negIdx2 += rowOffB; }
+            gvccs.curIdx += rowOffB;
+            allVCCSs[vccsOffB + idx] = gvccs;
+        }
+        for (int64_t idx = 0; idx < nBaseTxHalves; ++idx) {
+            GpuTxHalf gtxh = baseTxHalves[idx];
+            gtxh.txIdx    += txLineOffB;
+            if (gtxh.posIdx >= 0) { gtxh.posIdx += rowOffB; }
+            if (gtxh.negIdx >= 0) { gtxh.negIdx += rowOffB; }
+            gtxh.curIdx += rowOffB;
+            allTxHalves[txHalfOffB + idx] = gtxh;
+        }
+        for (int64_t idx = 0; idx < nBaseTraces; ++idx) {
+            GpuRelTrace grt  = baseRelTraces[idx];
+            grt.localAbsIdx += rowOffB;
+            grt.traceSlot   += relOffB;
+            allRelTraces[relOffB + idx] = grt;
+        }
+        for (int64_t idx = 0; idx < nBaseTxLines; ++idx) {
+            GpuTxLine gtx   = baseTxLines[idx];
+            gtx.histOffset += txHistOffB;
+            allTxLines[txLineOffB + idx] = gtx;
+        }
+        std::copy(baseTxHist.begin(), baseTxHist.end(), allTxHist.begin() + txHistOffB);
+
+        if (b > 0) {
+            std::mt19937_64 rng(Rng::base_seed() + static_cast<uint64_t>(b) * 0x9E3779B97F4A7C15ULL);
+
+            std::vector<double> newIndL(inductors_.size(), 0.0);
+            for (size_t lIdx = 0; lIdx < inductors_.size(); ++lIdx) {
+                const auto&   ind   = inductors_[lIdx];
+                const double  baseL = ind.netlistInfo.value_;
+                const double  L     = mObj.spread.spread_value_rng(ind.nominalValue_, Spread::IND, ind.spread_, rng);
+                newIndL[lIdx]       = L;
+                const int32_t gInd  = globalIndToGpuInd[lIdx];
+                if (gInd >= 0) { allInds[indOffB + gInd].L = L; }
+                const int64_t p     = indPartIdx_[lIdx];
+                const int64_t nzLoc = indPartNzIdx_[lIdx];
+                if (nzLoc >= 0) {
+                    const double baseDiag = (atyp_ == AnalysisType::Voltage) ? (-(3.0 / (2.0 * stepSize_)) * baseL)
+                                                                             : (-(baseL / Constants::SIGMA));
+                    const double newDiag  = (atyp_ == AnalysisType::Voltage) ? (-(3.0 / (2.0 * stepSize_)) * L)
+                                                                             : (-(L / Constants::SIGMA));
+                    allPartNz[nzOffB + baseParts[p].nzStart + nzLoc] += (newDiag - baseDiag);
+                }
+            }
+
+            for (size_t lIdx = 0; lIdx < inductors_.size(); ++lIdx) {
+                const auto&   ind   = inductors_[lIdx];
+                const auto&   muts  = ind.get_mutualInductance();
+                const int32_t gInd  = globalIndToGpuInd[lIdx];
+                const int64_t p     = indPartIdx_[lIdx];
+                const double  baseL = ind.netlistInfo.value_;
+                const double  L1    = newIndL[lIdx];
+                for (size_t mIdx = 0; mIdx < muts.size(); ++mIdx) {
+                    const int64_t tIdx   = muts[mIdx].first;
+                    const double  baseM  = muts[mIdx].second;
+                    const double  baseL2 = inductors_[tIdx].netlistInfo.value_;
+                    const double  L2     = newIndL[tIdx];
+                    const double  denom  = baseL * baseL2;
+                    const double  M      = (denom > 0.0) ? (baseM * std::sqrt((L1 * L2) / denom)) : baseM;
+                    if (gInd >= 0) {
+                        const int32_t mSlot = allInds[indOffB + gInd].mutStart + static_cast<int32_t>(mIdx);
+                        allMuts[mSlot].M    = M;
+                    }
+                    const int64_t nzLoc = indMutPartNzIdx_[lIdx][mIdx];
+                    if (nzLoc >= 0) {
+                        const double baseOff = (atyp_ == AnalysisType::Voltage) ? (-(3.0 / (2.0 * stepSize_)) * baseM)
+                                                                                : (-(baseM / Constants::SIGMA));
+                        const double newOff  = (atyp_ == AnalysisType::Voltage) ? (-(3.0 / (2.0 * stepSize_)) * M)
+                                                                                : (-(M / Constants::SIGMA));
+                        allPartNz[nzOffB + baseParts[p].nzStart + nzLoc] += (newOff - baseOff);
+                    }
+                }
+            }
+
+            for (size_t rIdx = 0; rIdx < resistors_.size(); ++rIdx) {
+                const auto&   res   = resistors_[rIdx];
+                const double  baseR = res.netlistInfo.value_;
+                const double  R     = mObj.spread.spread_value_rng(res.nominalValue_, Spread::RES, res.spread_, rng);
+                const int64_t p     = resPartIdx_[rIdx];
+                const int64_t nzLoc = resPartNzIdx_[rIdx];
+                if (nzLoc >= 0) {
+                    const double baseDiag = (atyp_ == AnalysisType::Voltage)
+                                                    ? (-baseR)
+                                                    : (-((2.0 * stepSize_) / (3.0 * Constants::SIGMA * baseR)));
+                    const double newDiag  = (atyp_ == AnalysisType::Voltage)
+                                                    ? (-R)
+                                                    : (-((2.0 * stepSize_) / (3.0 * Constants::SIGMA * R)));
+                    allPartNz[nzOffB + baseParts[p].nzStart + nzLoc] += (newDiag - baseDiag);
+                }
+            }
+
+            for (size_t cIdx = 0; cIdx < capacitors_.size(); ++cIdx) {
+                const auto&   cap   = capacitors_[cIdx];
+                const double  baseC = cap.netlistInfo.value_;
+                const double  C     = mObj.spread.spread_value_rng(cap.nominalValue_, Spread::CAP, cap.spread_, rng);
+                const int64_t p     = capPartIdx_[cIdx];
+                const int64_t nzLoc = capPartNzIdx_[cIdx];
+                if (nzLoc >= 0) {
+                    const double baseDiag = (atyp_ == AnalysisType::Voltage)
+                                                    ? (-((2.0 * stepSize_) / (3.0 * baseC)))
+                                                    : (-((4.0 * stepSize_ * stepSize_)
+                                                         / (9.0 * Constants::SIGMA * baseC)));
+                    const double newDiag  = (atyp_ == AnalysisType::Voltage)
+                                                    ? (-((2.0 * stepSize_) / (3.0 * C)))
+                                                    : (-((4.0 * stepSize_ * stepSize_)
+                                                         / (9.0 * Constants::SIGMA * C)));
+                    allPartNz[nzOffB + baseParts[p].nzStart + nzLoc] += (newDiag - baseDiag);
+                }
+            }
+
+            for (size_t jIdx = 0; jIdx < jjs_.size(); ++jIdx) {
+                const auto&   jj    = jjs_[jIdx];
+                const double  area  = mObj.spread.spread_value_rng(jj.nominalArea_, Spread::JJ, jj.spread_, rng);
+                const int32_t gJJ   = globalJJToGpuJJ[jIdx];
+                const int64_t p     = jjPartIdx_[jIdx];
+                const int64_t nzLoc = jjPartNzIdx_[jIdx];
+                if (gJJ >= 0) {
+                    GpuJJ&       gjj     = allJJs[jjOffB + gJJ];
+                    const double baseNz  = gjj.curNzVal;
+                    const double baseIc  = jj.nominalIc_.has_value() ? jj.nominalIc_.value() : jj.baseModel_.ic();
+                    gjj.ic               = baseIc * area;
+                    gjj.r0               = jj.baseModel_.r0() / area;
+                    gjj.rn               = jj.baseModel_.rn() / area;
+                    gjj.c                = jj.baseModel_.c() * area;
+                    gjj.gLarge           = (jj.baseModel_.ic() / jj.del_)
+                                 * ((jj.upperB_ + jj.lowerB_) / (jj.upperB_ - jj.lowerB_));
+                    gjj.negInvSubgap     = -(1.0 / (((3.0 * gjj.c) / (2.0 * stepSize_)) + (1.0 / gjj.r0)));
+                    gjj.negInvNormal     = -(1.0 / (((3.0 * gjj.c) / (2.0 * stepSize_)) + (1.0 / gjj.rn)));
+                    gjj.negInvTrans      = -(1.0 / (((3.0 * gjj.c) / (2.0 * stepSize_)) + gjj.gLarge));
+                    gjj.curNzVal         = (gjj.rtype == 1) ? gjj.negInvSubgap : gjj.negInvNormal;
+                    if (nzLoc >= 0) {
+                        allPartNz[nzOffB + baseParts[p].nzStart + nzLoc] += (gjj.curNzVal - baseNz);
+                    }
+                }
+            }
+
+            // Refactorize all partitions of Trial b using sparse IKJ elimination
+            for (int64_t p = 0; p < nParts; ++p) {
+                const GpuPartDesc& desc = allParts[b * nParts + p];
+                for (int32_t idx = 0; idx < desc.luNnz; ++idx) {
+                    const int32_t src             = allLuSrcNz[desc.luStart + idx];
+                    allLuVal[desc.luStart + idx]  = (src >= 0) ? allPartNz[src] : 0.0;
+                }
+                for (int32_t r = 0; r < desc.n; ++r) {
+                    const int32_t rStart = allLuRp[desc.rpStart + r];
+                    const int32_t rDiag  = allLuDiag[desc.rowStart + r];
+                    for (int32_t idxL = rStart; idxL < rDiag; ++idxL) {
+                        const int32_t colK  = allLuCi[desc.luStart + idxL];
+                        const int32_t kDiag = allLuDiag[desc.rowStart + colK];
+                        const int32_t kEndU = allLuRp[desc.rpStart + colK + 1];
+                        const double  piv   = allLuVal[desc.luStart + kDiag];
+                        if (piv == 0.0) {
+                            setupSingErr = true;
+                            break;
+                        }
+                        const double mult              = allLuVal[desc.luStart + idxL] / piv;
+                        allLuVal[desc.luStart + idxL]  = mult;
+                        int32_t pI                     = idxL + 1;
+                        for (int32_t idxU = kDiag + 1; idxU < kEndU; ++idxU) {
+                            const int32_t colU = allLuCi[desc.luStart + idxU];
+                            while (allLuCi[desc.luStart + pI] < colU) { ++pI; }
+                            allLuVal[desc.luStart + pI] -= mult * allLuVal[desc.luStart + idxU];
+                        }
+                    }
+                    if (setupSingErr || allLuVal[desc.luStart + rDiag] == 0.0) {
+                        setupSingErr = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (setupSingErr) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+
+    results.timeAxis.clear();
+    results.timeAxis.reserve(static_cast<size_t>(numKeptSteps_));
+    for (int64_t i = 0; i < simSize_; ++i) {
+        if (keptSlot_[i] >= 0) { results.timeAxis.push_back(i * stepSize_); }
+    }
+
+#ifdef JOSIM_CUDA
+    if (gpu_) {
+        cudaSolver_   = std::make_unique<CudaPartitionSolver>();
+        const bool ok = cudaSolver_->initialize(static_cast<int32_t>(nPartsTotal),
+                                                static_cast<int32_t>(B * nBaseRows),
+                                                static_cast<int32_t>(mObj.sourcegen.size()),
+                                                static_cast<int32_t>(windowSize_),
+                                                static_cast<int32_t>(allRelTraces.size()),
+                                                static_cast<int32_t>(numKeptSteps_),
+                                                simSize_,
+                                                stepSize_,
+                                                (atyp_ == AnalysisType::Voltage) ? 0 : 1,
+                                                allParts,
+                                                allP,
+                                                allQ,
+                                                allLuRp,
+                                                allLuDiag,
+                                                allLuCi,
+                                                allLuSrcNz,
+                                                allLuVal,
+                                                allPartNz,
+                                                allXInit,
+                                                allJJs,
+                                                allRess,
+                                                allInds,
+                                                allMuts,
+                                                allCaps,
+                                                allVSs,
+                                                allPSs,
+                                                allCSs,
+                                                allCCVSs,
+                                                allVCCSs,
+                                                allTxHalves,
+                                                allTxLines,
+                                                allTxHist,
+                                                allRelTraces,
+                                                keptSlot_,
+                                                static_cast<int32_t>(B));
+        if (ok) {
+            if (verb_ >= 1) {
+                std::cout << "JoSIM: Initialized CUDA GPU Batched Monte Carlo Solver (" << B << " trials x " << nParts
+                          << " partitions = " << nPartsTotal << " blocks, window W = " << windowSize_ << ")\n";
+            }
+            ProgressBar bar;
+            if (!minOut_) {
+                bar.create_thread();
+                bar.set_bar_width(30);
+                bar.fill_bar_progress_with("O");
+                bar.fill_bar_remainder_with(" ");
+                bar.set_status_text("Simulating MC (GPU)");
+                bar.set_total(static_cast<float>(simSize_));
+            }
+            const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
+            std::vector<double> h_srcWindow(
+                    static_cast<size_t>((windowSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
+            for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
+                if (!minOut_) { bar.update(static_cast<float>(i0)); }
+                const int64_t i1 = std::min<int64_t>(simSize_, i0 + windowSize_);
+                const int64_t w  = i1 - i0;
+                if (numSrc > 0) {
+                    for (int64_t s = -2; s < w; ++s) {
+                        const int64_t stepIdx = i0 + s;
+                        const double  t       = (stepIdx >= 0) ? (stepIdx * stepSize_) : 0.0;
+                        double*       row     = h_srcWindow.data() + (s + 2) * numSrc;
+                        if (stepIdx >= 0) {
+                            for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) {
+                                row[srcIdx] = mObj.sourcegen[srcIdx].value(t);
+                            }
+                        } else {
+                            std::fill(row, row + numSrc, 0.0);
+                        }
+                    }
+                }
+                if (!cudaSolver_->step_window(i0, i1, numSrc > 0 ? h_srcWindow.data() : nullptr)) {
+                    needsTR_ = true;
+                    if (!minOut_) {
+                        bar.complete();
+                        std::cout << "\n";
+                    }
+                    return;
+                }
+            }
+            std::vector<double> h_xFinal;
+            cudaSolver_->download_results(results.mcTraceOut, h_xFinal);
+            int64_t curRowOff0 = 0;
+            for (const auto& part : partitions_) {
+                for (int64_t locR = 0; locR < part.n; ++locR) {
+                    x_[part.globalRows[locR]] = h_xFinal[curRowOff0 + locR];
+                }
+                curRowOff0 += part.n;
+                for (int64_t globR : part.traceGlobalRows) {
+                    const int32_t slot = results.mcRowToSlot[globR];
+                    auto&         dst  = *results.xVector[globR];
+                    const double* src  = results.mcTraceOut.data() + static_cast<size_t>(slot) * numKeptSteps_;
+                    dst.assign(src, src + numKeptSteps_);
+                }
+            }
+            results.mcRuns         = B;
+            results.mcNumRows      = nBaseTraces;
+            results.mcNumKeptSteps = numKeptSteps_;
+            if (!minOut_) {
+                bar.complete();
+                std::cout << "\n";
+            }
+            return;
+        }
+        cudaSolver_.reset();
+    }
+#endif
+
+    // Host Batched Monte Carlo Solver (Serial 1T or OpenMP -p across B trials)
+    if (verb_ >= 1) {
+        std::cout << "JoSIM: Running CPU Batched Monte Carlo Solver (" << B << " trials x " << nParts
+                  << " partitions = " << nPartsTotal << " blocks)\n";
+    }
+    ProgressBar bar;
+    if (!minOut_) {
+        bar.create_thread();
+        bar.set_bar_width(30);
+        bar.fill_bar_progress_with("O");
+        bar.fill_bar_remainder_with(" ");
+        bar.set_status_text(parallel_ ? "Simulating MC (OMP)" : "Simulating MC");
+        bar.set_total(static_cast<float>(B));
+    }
+
+    const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
+    std::vector<double> srcAll(static_cast<size_t>((simSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
+    if (numSrc > 0) {
+        for (int64_t i = 0; i < simSize_; ++i) {
+            const double t   = i * stepSize_;
+            double*      row = srcAll.data() + (i + 2) * numSrc;
+            for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) { row[srcIdx] = mObj.sourcegen[srcIdx].value(t); }
+        }
+    }
+
+    results.mcTraceOut.assign(static_cast<size_t>(B * nBaseTraces * numKeptSteps_), 0.0);
+    bool anyNeedsTR = false;
+    bool anySingErr = false;
+
+#ifdef _OPENMP
+    const int nThreads = parallel_ ? std::min<int>(omp_get_max_threads(), static_cast<int>(B)) : 1;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) if (parallel_) reduction(|| : anyNeedsTR, anySingErr)
+#endif
+    for (int64_t b = 0; b < B; ++b) {
+        if (anyNeedsTR || anySingErr) { continue; }
+        if (!minOut_ && (!parallel_ || b % 4 == 0)) { bar.update(static_cast<float>(b)); }
+
+        const int32_t       rowOffB    = static_cast<int32_t>(b * nBaseRows);
+        const int32_t       txLineOffB = static_cast<int32_t>(b * nBaseTxLines);
+        double*             xPtr       = allXInit.data() - rowOffB + rowOffB; // global index -> allXInit[idx]
+        std::vector<double> bTrial(nBaseRows, 0.0);
+        std::vector<double> yTrial(nBaseRows, 0.0);
+        double*             bPtr = bTrial.data() - rowOffB;
+        double*             yPtr = yTrial.data() - rowOffB;
+
+        std::vector<double> txRem1(static_cast<size_t>(std::max<int64_t>(1, nBaseTxLines) * windowSize_), 0.0);
+        std::vector<double> txRem2(static_cast<size_t>(std::max<int64_t>(1, nBaseTxLines) * windowSize_), 0.0);
+
+        auto fetch_delayed = [&](const GpuTxLine& tx, int64_t step, int32_t which) -> double {
+            const int64_t delayed = tx.loadedSteps + step - tx.k;
+            if (delayed < 0) { return 0.0; }
+            const int32_t         idx = tx.histOffset + static_cast<int32_t>(delayed % tx.histSize);
+            const GpuTxHistEntry& e   = allTxHist[idx];
+            double                v   = (which == 0) ? e.v1 : ((which == 1) ? e.v2 : ((which == 2) ? e.i1 : e.i2));
+            if (tx.fracDelay > 0.0) {
+                double vPrev = 0.0;
+                if (delayed >= 1) {
+                    const int32_t         idxPrev = tx.histOffset + static_cast<int32_t>((delayed - 1) % tx.histSize);
+                    const GpuTxHistEntry& ep      = allTxHist[idxPrev];
+                    vPrev = (which == 0) ? ep.v1 : ((which == 1) ? ep.v2 : ((which == 2) ? ep.i1 : ep.i2));
+                }
+                v = (1.0 - tx.fracDelay) * v + tx.fracDelay * vPrev;
+            }
+            return v;
+        };
+
+        for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
+            if (anyNeedsTR || anySingErr) { break; }
+            const int64_t i1 = std::min<int64_t>(simSize_, i0 + windowSize_);
+            const int64_t w  = i1 - i0;
+
+            // 1. Precompute remote transmission line delayed history terms for Trial b across [i0, i1)
+            for (int64_t tLocal = 0; tLocal < nBaseTxLines; ++tLocal) {
+                const GpuTxLine& tx = allTxLines[txLineOffB + tLocal];
+                const double     Z0 = tx.z0;
+                for (int64_t s = 0; s < w; ++s) {
+                    const int64_t i = i0 + s;
+                    if (atyp_ == AnalysisType::Voltage) {
+                        const double v1k          = fetch_delayed(tx, i, 0);
+                        const double v2k          = fetch_delayed(tx, i, 1);
+                        const double i1k          = fetch_delayed(tx, i, 2);
+                        const double i2k          = fetch_delayed(tx, i, 3);
+                        txRem1[tLocal * w + s]    = Z0 * i2k + v2k;
+                        txRem2[tLocal * w + s]    = Z0 * i1k + v1k;
+                    } else {
+                        const double c2           = (2.0 * stepSize_ * Z0) / (3.0 * Constants::SIGMA);
+                        const double p1k          = fetch_delayed(tx, i, 0);
+                        const double p2k          = fetch_delayed(tx, i, 1);
+                        const double p1k1         = fetch_delayed(tx, i - 1, 0);
+                        const double p2k1         = fetch_delayed(tx, i - 1, 1);
+                        const double p1k2         = fetch_delayed(tx, i - 2, 0);
+                        const double p2k2         = fetch_delayed(tx, i - 2, 1);
+                        const double i1k          = fetch_delayed(tx, i, 2);
+                        const double i2k          = fetch_delayed(tx, i, 3);
+                        txRem1[tLocal * w + s]    = c2 * i2k + p2k - (4.0 / 3.0) * p2k1 + (1.0 / 3.0) * p2k2;
+                        txRem2[tLocal * w + s]    = c2 * i1k + p1k - (4.0 / 3.0) * p1k1 + (1.0 / 3.0) * p1k2;
+                    }
+                }
+            }
+
+            // 2. Advance each partition p of Trial b across [i0, i1)
+            for (int64_t p = 0; p < nParts; ++p) {
+                const GpuPartDesc& part = allParts[b * nParts + p];
+                for (int64_t s = 0; s < w; ++s) {
+                    const int64_t i          = i0 + s;
+                    const bool    checkPhase = (static_cast<double>(i) / static_cast<double>(simSize_) > 0.01);
+
+                    for (int32_t r = 0; r < part.n; ++r) { bPtr[part.rowStart + r] = 0.0; }
+
+                    bool partNeedsLU = false;
+                    for (int32_t k = 0; k < part.jjCount; ++k) {
+                        GpuJJ&       jj   = allJJs[part.jjStart + k];
+                        const double vPos = (jj.posIdx >= 0) ? xPtr[jj.posIdx] : 0.0;
+                        const double vNeg = (jj.negIdx >= 0) ? xPtr[jj.negIdx] : 0.0;
+                        jj.pn1            = vPos - vNeg;
+                        if (i > 0) {
+                            if (atyp_ == AnalysisType::Voltage) {
+                                jj.vn1 = jj.pn1;
+                                jj.pn1 = xPtr[jj.varIdx];
+                            } else {
+                                jj.vn1 = xPtr[jj.varIdx];
+                            }
+                        }
+                        const double v0 = 2.5 * jj.vn1 - 2.0 * jj.vn2 + 0.5 * jj.vn3;
+                        jj.phi0         = (4.0 / 3.0) * jj.pn1 - (1.0 / 3.0) * jj.pn2
+                                  + ((2.0 * stepSize_) / (3.0 * Constants::SIGMA)) * v0;
+                        if (checkPhase && std::abs(jj.phi0 - jj.pn1) > (0.20 * 2.0 * Constants::PI)) {
+                            anyNeedsTR = true;
+                            break;
+                        }
+                        if (atyp_ == AnalysisType::Voltage) {
+                            bPtr[jj.varIdx]
+                                    = Constants::SIGMA
+                                      * (-(2.0 / stepSize_) * jj.pn1 + (1.0 / (2.0 * stepSize_)) * jj.pn2);
+                        } else {
+                            bPtr[jj.varIdx] = (4.0 / 3.0) * jj.pn1 - (1.0 / 3.0) * jj.pn2;
+                        }
+                        jj.pn4 = jj.pn3;
+                        jj.pn3 = jj.pn2;
+                        jj.pn2 = jj.pn1;
+                        jj.vn6 = jj.vn5;
+                        jj.vn5 = jj.vn4;
+                        jj.vn4 = jj.vn3;
+                        jj.vn3 = jj.vn2;
+
+                        if (jj.rtype == 1) {
+                            bool         updated = false;
+                            const double absV    = std::abs(v0);
+                            if (absV < jj.lowerB) {
+                                jj.it = 0.0;
+                                if (jj.curNzVal != jj.negInvSubgap) {
+                                    jj.curNzVal = jj.negInvSubgap;
+                                    updated     = true;
+                                }
+                            } else if (absV < jj.upperB) {
+                                jj.it = jj.lowerB * ((1.0 / jj.r0) - jj.gLarge);
+                                if (v0 < 0.0) { jj.it = -jj.it; }
+                                if (jj.curNzVal != jj.negInvTrans) {
+                                    jj.curNzVal = jj.negInvTrans;
+                                    updated     = true;
+                                }
+                            } else {
+                                jj.it = 0.0;
+                                if (jj.curNzVal != jj.negInvNormal) {
+                                    jj.curNzVal = jj.negInvNormal;
+                                    updated     = true;
+                                }
+                            }
+                            if (updated) {
+                                allPartNz[jj.nzIdx] = jj.curNzVal;
+                                partNeedsLU         = true;
+                            }
+                        }
+
+                        double ic_sin_phi = 0.0;
+                        if (jj.cprLen == 1) {
+                            ic_sin_phi += jj.ic * (jj.cpr[0] * std::sin(1.0 * (jj.phi0 - jj.phiOff)));
+                        } else {
+                            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                                ic_sin_phi += jj.ic * (jj.cpr[harm] * std::sin((harm + 1) * (jj.phi0 - jj.phiOff)));
+                            }
+                        }
+                        if (!jj.tDep) {
+                            bPtr[jj.curIdx] = jj.curNzVal
+                                              * (ic_sin_phi - (((2.0 * jj.c) / stepSize_) * jj.vn1)
+                                                 + ((jj.c / (2.0 * stepSize_)) * jj.vn2) + jj.it);
+                        } else {
+                            double sin2_half_phi = 0.0;
+                            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                                sin2_half_phi += jj.cpr[harm] * std::sin((harm + 1) * (jj.phi0 - jj.phiOff) / 2.0);
+                            }
+                            sin2_half_phi  = sin2_half_phi * sin2_half_phi;
+                            double sin_phi = 0.0;
+                            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                                sin_phi += jj.cpr[harm] * std::sin((harm + 1) * (jj.phi0 - jj.phiOff));
+                            }
+                            const double sqrt_part = std::sqrt(1.0 - jj.d * sin2_half_phi);
+                            bPtr[jj.curIdx]
+                                    = jj.curNzVal
+                                      * ((((Constants::PI * jj.del) / (2.0 * Constants::EV * jj.rn))
+                                          * (sin_phi / sqrt_part)
+                                          * std::tanh(jj.del / (2.0 * Constants::BOLTZMANN * jj.t) * sqrt_part))
+                                         - (((2.0 * jj.c) / stepSize_) * jj.vn1)
+                                         + ((jj.c / (2.0 * stepSize_)) * jj.vn2) + jj.it);
+                        }
+                        jj.vn2 = jj.vn1;
+                    }
+                    if (anyNeedsTR) { break; }
+
+                    if (partNeedsLU) {
+                        for (int32_t idx = 0; idx < part.luNnz; ++idx) {
+                            const int32_t src             = allLuSrcNz[part.luStart + idx];
+                            allLuVal[part.luStart + idx]  = (src >= 0) ? allPartNz[src] : 0.0;
+                        }
+                        for (int32_t r = 0; r < part.n; ++r) {
+                            const int32_t rStart = allLuRp[part.rpStart + r];
+                            const int32_t rDiag  = allLuDiag[part.rowStart + r];
+                            for (int32_t idxL = rStart; idxL < rDiag; ++idxL) {
+                                const int32_t colK  = allLuCi[part.luStart + idxL];
+                                const int32_t kDiag = allLuDiag[part.rowStart + colK];
+                                const int32_t kEndU = allLuRp[part.rpStart + colK + 1];
+                                const double  piv   = allLuVal[part.luStart + kDiag];
+                                if (piv == 0.0) {
+                                    anySingErr = true;
+                                    break;
+                                }
+                                const double mult              = allLuVal[part.luStart + idxL] / piv;
+                                allLuVal[part.luStart + idxL]  = mult;
+                                int32_t pI                     = idxL + 1;
+                                for (int32_t idxU = kDiag + 1; idxU < kEndU; ++idxU) {
+                                    const int32_t colU = allLuCi[part.luStart + idxU];
+                                    while (allLuCi[part.luStart + pI] < colU) { ++pI; }
+                                    allLuVal[part.luStart + pI] -= mult * allLuVal[part.luStart + idxU];
+                                }
+                            }
+                        }
+                    }
+
+                    // Current Sources
+                    for (int32_t k = 0; k < part.csCount; ++k) {
+                        const GpuCS& cs     = allCSs[part.csStart + k];
+                        const double srcVal = srcAll[(i + 2) * numSrc + cs.srcIdx];
+                        if (cs.posIdx >= 0) { bPtr[cs.posIdx] -= srcVal; }
+                        if (cs.negIdx >= 0) { bPtr[cs.negIdx] += srcVal; }
+                    }
+
+                    // Resistors (Phase mode)
+                    if (atyp_ == AnalysisType::Phase) {
+                        for (int32_t k = 0; k < part.resCount; ++k) {
+                            GpuRes&      res  = allRess[part.resStart + k];
+                            const double vPos = (res.posIdx >= 0) ? xPtr[res.posIdx] : 0.0;
+                            const double vNeg = (res.negIdx >= 0) ? xPtr[res.negIdx] : 0.0;
+                            res.pn1           = vPos - vNeg;
+                            bPtr[res.curIdx]  = (4.0 / 3.0) * res.pn1 - (1.0 / 3.0) * res.pn2;
+                            res.pn2           = res.pn1;
+                        }
+                    }
+
+                    // Inductors (Voltage mode)
+                    if (atyp_ == AnalysisType::Voltage) {
+                        for (int32_t k = 0; k < part.indCount; ++k) {
+                            const GpuInd& ind = allInds[part.indStart + k];
+                            const double  iCur = xPtr[ind.curIdx];
+                            double rhs = -(2.0 * ind.L / stepSize_) * iCur + (ind.L / (2.0 * stepSize_)) * ind.In2;
+                            for (int32_t m = 0; m < ind.mutCount; ++m) {
+                                const GpuMut& mut  = allMuts[ind.mutStart + m];
+                                const GpuInd& tInd = allInds[mut.targetIndIdx];
+                                rhs += -((2.0 * mut.M) / stepSize_) * xPtr[mut.targetCurIdx]
+                                       + (mut.M / (2.0 * stepSize_)) * tInd.In2;
+                            }
+                            bPtr[ind.curIdx] = rhs;
+                        }
+                        for (int32_t k = 0; k < part.indCount; ++k) {
+                            GpuInd& ind = allInds[part.indStart + k];
+                            ind.In2     = xPtr[ind.curIdx];
+                        }
+                    }
+
+                    // Capacitors
+                    for (int32_t k = 0; k < part.capCount; ++k) {
+                        GpuCap&      cap  = allCaps[part.capStart + k];
+                        const double vPos = (cap.posIdx >= 0) ? xPtr[cap.posIdx] : 0.0;
+                        const double vNeg = (cap.negIdx >= 0) ? xPtr[cap.negIdx] : 0.0;
+                        cap.pn1           = vPos - vNeg;
+                        if (atyp_ == AnalysisType::Voltage) {
+                            bPtr[cap.curIdx] = (4.0 / 3.0) * cap.pn1 - (1.0 / 3.0) * cap.pn2;
+                        } else {
+                            bPtr[cap.curIdx] = (8.0 / 3.0) * cap.pn1 - (22.0 / 9.0) * cap.pn2 + (8.0 / 9.0) * cap.pn3
+                                               - (1.0 / 9.0) * cap.pn4;
+                            cap.pn4 = cap.pn3;
+                            cap.pn3 = cap.pn2;
+                        }
+                        cap.pn2 = cap.pn1;
+                    }
+
+                    // Voltage Sources
+                    for (int32_t k = 0; k < part.vsCount; ++k) {
+                        GpuVS&       vs     = allVSs[part.vsStart + k];
+                        const double srcVal = srcAll[(i + 2) * numSrc + vs.srcIdx];
+                        if (atyp_ == AnalysisType::Voltage) {
+                            bPtr[vs.curIdx] = srcVal;
+                        } else {
+                            const double vPos = (vs.posIdx >= 0) ? xPtr[vs.posIdx] : 0.0;
+                            const double vNeg = (vs.negIdx >= 0) ? xPtr[vs.negIdx] : 0.0;
+                            vs.pn1            = vPos - vNeg;
+                            bPtr[vs.curIdx]   = ((2.0 * stepSize_) / (3.0 * Constants::SIGMA)) * srcVal
+                                              + (4.0 / 3.0) * vs.pn1 - (1.0 / 3.0) * vs.pn2;
+                            vs.pn2            = vs.pn1;
+                        }
+                    }
+
+                    // Phase Sources
+                    for (int32_t k = 0; k < part.psCount; ++k) {
+                        const GpuPS& ps = allPSs[part.psStart + k];
+                        const double s0 = srcAll[(i + 2) * numSrc + ps.srcIdx];
+                        if (atyp_ == AnalysisType::Phase) {
+                            bPtr[ps.curIdx] = s0;
+                        } else {
+                            const double s1 = srcAll[(i + 1) * numSrc + ps.srcIdx];
+                            const double s2 = srcAll[i * numSrc + ps.srcIdx];
+                            if (i == 0) {
+                                bPtr[ps.curIdx] = (Constants::SIGMA / stepSize_) * (1.5 * s0);
+                            } else if (i == 1) {
+                                bPtr[ps.curIdx] = (Constants::SIGMA / stepSize_) * (1.5 * s0 - 2.0 * s1);
+                            } else {
+                                bPtr[ps.curIdx] = (Constants::SIGMA / stepSize_) * (1.5 * s0 - 2.0 * s1 + 0.5 * s2);
+                            }
+                        }
+                    }
+
+                    // CCVS & VCCS (Phase mode)
+                    if (atyp_ == AnalysisType::Phase) {
+                        for (int32_t k = 0; k < part.ccvsCount; ++k) {
+                            GpuCCVS&     ccvs = allCCVSs[part.ccvsStart + k];
+                            const double vPos = (ccvs.posIdx >= 0) ? xPtr[ccvs.posIdx] : 0.0;
+                            const double vNeg = (ccvs.negIdx >= 0) ? xPtr[ccvs.negIdx] : 0.0;
+                            ccvs.pn1          = vPos - vNeg;
+                            bPtr[ccvs.curIdx] = (4.0 / 3.0) * ccvs.pn1 - (1.0 / 3.0) * ccvs.pn2;
+                            ccvs.pn2          = ccvs.pn1;
+                        }
+                        for (int32_t k = 0; k < part.vccsCount; ++k) {
+                            GpuVCCS&     vccs = allVCCSs[part.vccsStart + k];
+                            const double vPos = (vccs.posIdx2 >= 0) ? xPtr[vccs.posIdx2] : 0.0;
+                            const double vNeg = (vccs.negIdx2 >= 0) ? xPtr[vccs.negIdx2] : 0.0;
+                            vccs.pn1          = vPos - vNeg;
+                            bPtr[vccs.curIdx] = (4.0 / 3.0) * vccs.pn1 - (1.0 / 3.0) * vccs.pn2;
+                            vccs.pn2          = vccs.pn1;
+                        }
+                    }
+
+                    // Transmission Line Port Halves
+                    for (int32_t k = 0; k < part.txHalfCount; ++k) {
+                        const GpuTxHalf& txh    = allTxHalves[part.txHalfStart + k];
+                        const int32_t    tLocal = txh.txIdx - txLineOffB;
+                        const double     rem
+                                = (txh.isPort2 == 0) ? txRem1[tLocal * w + s] : txRem2[tLocal * w + s];
+                        if (atyp_ == AnalysisType::Voltage) {
+                            bPtr[txh.curIdx] = rem;
+                        } else {
+                            bPtr[txh.curIdx] = (4.0 / 3.0) * txh.n1 - (1.0 / 3.0) * txh.n2 + rem;
+                        }
+                    }
+
+                    // Forward substitution: L * y = P * b
+                    for (int32_t r = 0; r < part.n; ++r) {
+                        double        sum    = bPtr[part.rowStart + allP[part.rowStart + r]];
+                        const int32_t rStart = allLuRp[part.rpStart + r];
+                        const int32_t rDiag  = allLuDiag[part.rowStart + r];
+                        for (int32_t idx = rStart; idx < rDiag; ++idx) {
+                            sum -= allLuVal[part.luStart + idx]
+                                   * yPtr[part.rowStart + allLuCi[part.luStart + idx]];
+                        }
+                        yPtr[part.rowStart + r] = sum;
+                    }
+                    // Backward substitution: U * z = y, x[Q[r]] = z[r]
+                    for (int32_t r = part.n - 1; r >= 0; --r) {
+                        double        sum   = yPtr[part.rowStart + r];
+                        const int32_t rDiag = allLuDiag[part.rowStart + r];
+                        const int32_t rEnd  = allLuRp[part.rpStart + r + 1];
+                        for (int32_t idx = rDiag + 1; idx < rEnd; ++idx) {
+                            sum -= allLuVal[part.luStart + idx]
+                                   * yPtr[part.rowStart + allLuCi[part.luStart + idx]];
+                        }
+                        const double z                              = sum / allLuVal[part.luStart + rDiag];
+                        yPtr[part.rowStart + r]                     = z;
+                        xPtr[part.rowStart + allQ[part.rowStart + r]] = z;
+                    }
+
+                    // Update transmission line circular history and local port phase history
+                    for (int32_t k = 0; k < part.txHalfCount; ++k) {
+                        GpuTxHalf&       txh  = allTxHalves[part.txHalfStart + k];
+                        const GpuTxLine& tx   = allTxLines[txh.txIdx];
+                        const double     vPos = (txh.posIdx >= 0) ? xPtr[txh.posIdx] : 0.0;
+                        const double     vNeg = (txh.negIdx >= 0) ? xPtr[txh.negIdx] : 0.0;
+                        const double     vPort = vPos - vNeg;
+                        const double     iPort = xPtr[txh.curIdx];
+                        const int32_t    slot
+                                = tx.histOffset + static_cast<int32_t>((tx.loadedSteps + i) % tx.histSize);
+                        if (txh.isPort2 == 0) {
+                            allTxHist[slot].v1 = vPort;
+                            allTxHist[slot].i1 = iPort;
+                        } else {
+                            allTxHist[slot].v2 = vPort;
+                            allTxHist[slot].i2 = iPort;
+                        }
+                        if (atyp_ == AnalysisType::Phase) {
+                            txh.n2 = txh.n1;
+                            txh.n1 = vPort;
+                        }
+                    }
+
+                    // Record kept trace outputs
+                    const int32_t kSlot = keptSlot_[i];
+                    if (kSlot >= 0) {
+                        for (int32_t k = 0; k < part.relCount; ++k) {
+                            const GpuRelTrace& rt = allRelTraces[part.relStart + k];
+                            results.mcTraceOut[static_cast<size_t>(rt.traceSlot) * numKeptSteps_ + kSlot]
+                                    = xPtr[rt.localAbsIdx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (anySingErr) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+    if (anyNeedsTR) {
+        needsTR_ = true;
+        if (!minOut_) {
+            bar.complete();
+            std::cout << "\n";
+        }
+        return;
+    }
+
+    // Copy Trial 0 traces into xVector and final state into x_
+    int64_t curRowOff0 = 0;
+    for (const auto& part : partitions_) {
+        for (int64_t locR = 0; locR < part.n; ++locR) {
+            x_[part.globalRows[locR]] = allXInit[curRowOff0 + locR];
+        }
+        curRowOff0 += part.n;
+        for (int64_t globR : part.traceGlobalRows) {
+            const int32_t slot = results.mcRowToSlot[globR];
+            auto&         dst  = *results.xVector[globR];
+            const double* src  = results.mcTraceOut.data() + static_cast<size_t>(slot) * numKeptSteps_;
+            dst.assign(src, src + numKeptSteps_);
+        }
+    }
+    results.mcRuns         = B;
+    results.mcNumRows      = nBaseTraces;
+    results.mcNumKeptSteps = numKeptSteps_;
+
+    if (!minOut_) {
+        bar.complete();
+        std::cout << "\n";
+    }
+#else
+    (void) mObj;
 #endif
 }
 
@@ -1871,6 +3224,11 @@ void Simulation::trans_sim(Matrix& mObj) {
     }
 
 #ifndef SLU
+    if (mcRuns_ > 1 && usePartitions_ && windowSize_ >= 1 && !hasJJThermalNoise_ && !hasResistorThermalNoise_
+        && correctorIter_ == 0 && !saveStateFile_.has_value()) {
+        trans_sim_mc(mObj);
+        return;
+    }
 #ifdef JOSIM_CUDA
     if (gpu_) {
         if (setup_gpu_solver(mObj) && cudaSolver_) {

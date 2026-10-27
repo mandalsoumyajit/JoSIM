@@ -42,6 +42,8 @@ class Inductor : public BasicComponent {
 
   public:
     double          In2_ = 0.0, In3_ = 0.0, In4_ = 0.0;
+    double          nominalValue_ = 0.0;
+    double          spread_       = 1.0;
     mutualinductors mutualInductances_;
 
     Inductor(const std::pair<tokens_t, string_o>& s,

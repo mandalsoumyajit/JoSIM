@@ -179,4 +179,44 @@ for k in s:
 PY
 
 echo ""
-echo "=== ALL PHASE 4 TESTS PASSED SUCCESSFULLY ==="
+echo "=== [5/5] Testing Tier 2 Batched Monte Carlo (.spread) Solver (-b 32 Serial vs OpenMP) ==="
+cat > "${TMP_DIR}/mc_test.cir" << 'EOF'
+* Tier 2 Batched Monte Carlo JTL test (32 runs)
+.spread l=0.10 r=0.10 c=0.10 b=0.05 runs=32
+.model jjmod jj(rtype=1, vg=2.8m, cap=0.07p, r0=160, rn=16, icrit=0.12m)
+VIN 1 0 pwl(0 0 10p 0 12p 0.7m 14p 0)
+L1 1 2 2p
+B1 2 0 jjmod area=2.0
+R1 2 0 4.5
+L2 2 3 2p
+B2 3 0 jjmod area=2.0
+R2 3 0 4.5
+C2 3 0 0.05p
+IB1 0 2 pwl(0 0 5p 280u)
+IB2 0 3 pwl(0 0 5p 280u)
+.tran 0.25p 100p 0 0.5p
+.print V(2) V(3) P(B2)
+.end
+EOF
+
+JOSIM_SEED=42 "${JOSIM_BIN}" -m -o "${TMP_DIR}/mc_ser.bin" "${TMP_DIR}/mc_test.cir"
+JOSIM_SEED=42 "${JOSIM_BIN}" -p -m -o "${TMP_DIR}/mc_omp.bin" "${TMP_DIR}/mc_test.cir"
+
+python3 - << 'PY'
+import sys
+import numpy as np
+sys.path.insert(0, "/mnt/c/dev/JoSIM/scripts")
+from josim_io import load_josim_bin
+
+s = load_josim_bin("/tmp/josim_phase4_test/mc_ser.bin")
+p = load_josim_bin("/tmp/josim_phase4_test/mc_omp.bin")
+assert "V(3)_STD" in s and "V(3)_MIN" in s and "V(3)_MAX" in s, f"Missing MC ensemble columns: {list(s.keys())}"
+assert np.max(s["V(3)_STD"]) > 1e-6, "Expected non-zero standard deviation across 32 MC runs!"
+for k in s:
+    diff = np.max(np.abs(s[k] - p[k]))
+    print(f"Batched MC (B=32) Serial vs OpenMP trace {k}: max diff = {diff:.3e}")
+    assert diff < 1e-13, f"Batched MC mismatch on {k}: {diff}"
+PY
+
+echo ""
+echo "=== ALL PHASE 4 & TIER 2 MONTE CARLO TESTS PASSED SUCCESSFULLY ==="

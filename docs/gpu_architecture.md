@@ -172,3 +172,73 @@ To evaluate performance on circuits that **do not rely solely on PTLs**—includ
    - Adding 393,216 mutual couplings (`K`) and 131,072 explicit capacitors (`C`) increases each partition's matrix size from `165` equations (`PTL-Tile-*`) to `296` equations (`RSFQ-ALU-Macros-*`, $nnz(L_p + U_p) \approx 1,350$), achieving **`20.93x` OpenMP speedup** and **`8.59x` GPU speedup** at 1.21M equations.
 3. **Purely Monolithic Single-Component Circuits ($P = 1$, `0 PTLs`) Confirm the Sandia Xyce / `CUSPICE` Roofline:**
    - When all nodes are galvanically/inductively coupled into a single component ($P = 1$) with zero PTLs, a single global triangular solve `klu_l_tsolve` must execute at every timestep. For $47\text{k}–65\text{k}$ equations in Phase mode, one serial timestep takes only `0.7–0.9 ms` inside CPU L3 cache, so thread synchronization or PCIe transfers exceed the device-evaluation savings. Once per-step device work grows via Voltage-mode mutual inductance sweeps (`Mono-RLK-49kK-Volt`, **`1.16x` OMP**) or $>100\text{k}$ equations (`Mono-2D-JJ-Grid`, **`1.06x` OMP**), parallel device evaluation reaches net speedup, while confirming why **partition-level parallelism ($P \ge 2$) or batched `.spread` execution (Tier 2)** is essential for order-of-magnitude speedups.
+
+---
+
+## 6. Tier 2 Implementation: Batched GPU (`-g`) & Multi-Core OpenMP (`-p`) Monte Carlo (`.spread`) Robustness Solver
+
+### 6.1 Architectural Design (`Simulation::trans_sim_mc`, `advance_mc_coalesced_kernel`)
+Superconducting IC design requires extensive Monte Carlo yield and critical-margin analysis (`.spread`), simulating a circuit across $B = 32\text{ to }4,096$ fabrication-variation trials where every inductor (`L`), Josephson junction (`B` area/$I_c$), resistor (`R`), and capacitor (`C`) is perturbed around its nominal value. Running JoSIM $B$ times sequentially from the CLI repeats netlist parsing, subcircuit flattening, CSR assembly, and symbolic factorization $B$ times, and leaves single-component or modest-partition circuits ($P = 1\text{–}66$) unable to saturate a multi-core CPU or GPU.
+
+Tier 2 (`Simulation::trans_sim_mc` in [`src/Simulation.cpp`](../src/Simulation.cpp) and `advance_mc_coalesced_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)) solves all $B$ Monte Carlo trials simultaneously in a single invocation:
+
+1. **CLI & Netlist Controls:**
+   - `-b <N>` / `--batch=<N>` CLI flag
+   - `.option mc=<N>` / `.option batch=<N>` / `.option runs=<N>`
+   - `.spread <global> [L=...] [B=...] [C=...] [R=...] [runs=<N>]`
+   - `.option mcall` (outputs all individual trial waveforms `<Trace>_MC0 .. <Trace>_MC{B-1}` alongside ensemble statistics)
+   - `JOSIM_SEED=<uint64>` environment variable or `.option seed=<uint64>` for deterministic reproducibility.
+2. **Parse-Once, Symbolic-Once Setup:**
+   - Each device stores its unperturbed nominal value (`nominalValue_`, `nominalArea_`, `nominalIc_`, `baseModel_`) and resolved spread fraction (`spread_`). We also fixed an upstream bug in [`src/JJ.cpp`](../src/JJ.cpp) where `AREA=` was parsed before `SPREAD=` and default `area=1.0` junctions ignored `.spread`.
+   - The base circuit topology and connected-component partitions ($P_{\text{base}} \ge 1$) are analyzed **once**. Each trial $b \in \{0, \dots, B-1\}$ receives a deterministic 64-bit splitmix seed $\text{seed}_b = \text{baseSeed} \oplus (b \cdot \text{0x9E3779B97F4A7C15})$ via thread-safe `Spread::spread_value_rng`.
+3. **Thread-Per-Trial Coalesced CUDA Kernel (`advance_mc_coalesced_kernel`):**
+   - **Why Coalesced Batch-Minor Layout (`[baseIdx * B + b]`) Beats Warp-Per-Partition:**
+     - Assigning 1 thread per `(trial b, base partition p)` and transposing all per-trial state vectors (`d_xLocal`, `d_bLocal`, `d_yLocal`), matrix values (`d_luVal`, `d_partNz`), and device arrays (`d_jjs`, `d_inds`, etc.) into **`[baseIdx * B + b]`** layout ensures that adjacent threads $t = 0 \dots 31$ in a warp execute the **exact same instruction** on consecutive memory addresses (`b = blockIdx.x * blockDim.x + tid`).
+     - This achieves **100% coalesced global memory reads/writes**, eliminates all warp-shuffle reductions (`__shfl_down_sync`), and allows all 32 lanes of a warp to execute forward/backward triangular solves (`L\b`, `U\y`) and `RTYPE=1` in-place LU refactorizations simultaneously in lockstep (achieving an **`11.4x` faster GPU kernel** than warp-per-partition on `ex_ksa4bit`).
+4. **Hardware-Adaptive Generalization Across All NVIDIA GPU Architectures:**
+   - **Why 32 is Fundamental (`warpSize` & Shared-Memory Banks) while Block Sizing is Dynamic:**
+     - Across every NVIDIA CUDA architecture ever shipped (Volta `sm_70`, Turing `sm_75`, Ampere `sm_80`/`sm_86`, Ada `sm_89`, Hopper `sm_90`, Blackwell `sm_100`), the hardware SIMT warp width (`warpSize`) and the number of shared-memory banks are both **32**. Striding shared-memory working vectors as `s_x[r * 32 + lane]` maps each lane to its own distinct bank (`0..31`), guaranteeing **zero shared-memory bank conflicts** on any NVIDIA GPU.
+   - **Runtime Device Introspection (`cudaDeviceGetAttribute`):**
+     - At initialization, `CudaPartitionSolver` queries `numSMs_` (`cudaDevAttrMultiProcessorCount`), `warpSize_` (`cudaDevAttrWarpSize`), `maxShmemBytes_` (`cudaDevAttrMaxSharedMemoryPerBlockOptin` / `cudaDevAttrMaxSharedMemoryPerBlock`), and `maxShmemPerSM_` (`cudaDevAttrMaxSharedMemoryPerMultiprocessor`).
+   - **Dynamic Multi-Warp Block Sizing (`warpsPerBlock` $\in \{1, 2, 4\}$) with Shared Symbolic CSR:**
+     - `step_window` automatically selects `warpsPerBlock` $\in \{1, 2, 4\}$ (`32, 64, or 128` threads/block) based on the active GPU's SM count, shared-memory capacity per block/SM, and total trial warps (`(B / 32) * P_base`).
+     - When `warpsPerBlock > 1`, all warps in the thread block solve trials for the same base partition $p = \text{blockIdx.y}$ and **share a single copy** of the symbolic CSR structure (`s_luRp`, `s_luDiag`, `s_P`, `s_Q`, `s_luCi`, `s_luSrcNz`) in shared memory while each warp indexes its own bank-conflict-free vector slice (`s_warpBase = s_mem_mc + warpInBlock * 32 * 3 * n`).
+   - **Multi-Architecture CMake Configuration:**
+     - [`CMakeLists.txt`](../CMakeLists.txt) automatically defaults `CMAKE_CUDA_ARCHITECTURES` to `"native"` on CMake $\ge 3.24$ (auto-detecting the installed V100, T4, A100, RTX A6000, L40S, H100, or B200 GPU) or `"70;75;80;86"` on older CMake when not overridden by the user.
+5. **Numerically Stable Welford Ensemble Statistics & Robustness Summary (`Output::write_output`):**
+   - Uses **Welford's online algorithm** across all $B$ trials at each output timestep to compute `<Trace>` (ensemble mean), `<Trace>_STD` (sample standard deviation), `<Trace>_MIN`, and `<Trace>_MAX` without catastrophic cancellation on constant $2\pi$ superconducting phase plateaus, plus a formatted **Monte Carlo Robustness Summary** table on stdout.
+
+### 6.2 Tier 2 Batched Monte Carlo Benchmark Results on BNL `exxact` (`Dual AMD EPYC 7413 + NVIDIA RTX A6000`)
+
+Verified via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.py) and [`scripts/run_mc_exxact.sh`](../scripts/run_mc_exxact.sh) across **16 benchmark configurations** spanning:
+- Real production MIT-LL standard cells & multi-gate RSFQ logic (`ex_jtl_basic`, `ex_mitll_xor_wr`, `ex_mitll_dff_wr`, and `ex_ksa4bit` 4-bit Kogge-Stone Adder with 695 JJs, $P=66$ partitions)
+- Purely monolithic 0-PTL circuits ($P=1$: `Mono-RSFQ-Cell-Macro` 128-JJ coupled logic macro and `Mono-RLK-SQUID-Macro` 96-JJ SQUID sensor array with 191 mutual inductances `K`)
+- PTL-coupled RSFQ ALU processor pipelines (`RSFQ-Pipeline-16B` $P=16$ and `RSFQ-Pipeline-64B` $P=64$, 2,048 JJs, 18,940 equations/trial $\times B=256$ = **`4,848,640` simultaneous MNA equations**)
+- Batch sizes $B \in \{64, 256, 1024\}$.
+
+| Design (`.spread` Yield Analysis) | Base $P$ | Batch $B$ | Est. $B \times$ Serial 1T | Batched OpenMP (`-p`) | Batched GPU (`-g`) | OpenMP Speedup | GPU Trans Speedup | GPU Wall Speedup | CPU vs GPU Rel Diff |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **`ex_jtl_basic` (Mono 0-PTL)** | **1** | 256 | 0.262 s | **0.058 s** | **0.230 s** | **4.52x** | **1.14x** | 0.33x | `1.26e-13` |
+| **`ex_jtl_basic` (Mono 0-PTL)** | **1** | 1024 | 1.046 s | **0.207 s** | **0.351 s** | **5.04x** | **2.98x** | **1.26x** | `1.25e-13` |
+| **`ex_mitll_xor_wr` (MIT-LL XOR)** | 2 | 256 | 2.012 s | **0.086 s** | **0.823 s** | **23.42x** | **2.44x** | **1.45x** | `1.07e-15` |
+| **`ex_mitll_xor_wr` (MIT-LL XOR)** | 2 | 1024 | 8.025 s | **0.303 s** | **1.229 s** | **26.48x** | **6.53x** | **4.30x** | `1.17e-14` |
+| **`ex_mitll_dff_wr` (MIT-LL DFF)** | 2 | 256 | 2.823 s | **0.105 s** | **1.058 s** | **26.86x** | **2.67x** | **1.74x** | `3.68e-15` |
+| **`ex_mitll_dff_wr` (MIT-LL DFF)** | 2 | 1024 | 11.301 s | **0.401 s** | **1.560 s** | **28.16x** | **7.24x** | **4.96x** | `6.67e-15` |
+| **`Mono-RSFQ-Cell-Macro` (128 JJs, 0-PTL)** | **1** | 256 | 4.092 s | **0.178 s** | 4.611 s | **22.93x** | 0.89x | 0.80x | `6.20e-13` |
+| **`Mono-RSFQ-Cell-Macro` (128 JJs, 0-PTL)** | **1** | 1024 | 16.374 s | **0.673 s** | **4.972 s** | **24.32x** | **3.29x** | **2.93x** | `2.44e-13` |
+| **`Mono-RLK-SQUID-Macro` (96 JJs, 191 K, 0-PTL)** | **1** | 256 | 4.842 s | **0.212 s** | 5.037 s | **22.79x** | 0.96x | 0.86x | `1.43e-13` |
+| **`Mono-RLK-SQUID-Macro` (96 JJs, 191 K, 0-PTL)** | **1** | 1024 | 19.364 s | **0.796 s** | **5.507 s** | **24.34x** | **3.52x** | **3.16x** | `1.67e-13` |
+| **`ex_ksa4bit` (4-bit KSA Adder, 695 JJs)** | 66 | 64 | 51.250 s | **2.044 s** | **4.309 s** | **25.07x** | **11.89x** | **10.13x** | `1.04e-15` |
+| **`ex_ksa4bit` (4-bit KSA Adder, 695 JJs)** | 66 | 256 | 204.237 s | **6.559 s** | **10.394 s** | **31.14x** | **19.65x** | **18.33x** | `1.04e-15` |
+| **`RSFQ-Pipeline-16B` (512 JJs, 16 Blocks)** | 16 | 64 | 3.036 s | **0.136 s** | **0.903 s** | **22.37x** | **3.36x** | **2.08x** | `1.19e-17` |
+| **`RSFQ-Pipeline-16B` (512 JJs, 16 Blocks)** | 16 | 256 | 12.165 s | **0.431 s** | **1.226 s** | **28.22x** | **9.92x** | **6.50x** | `1.19e-17` |
+| **`RSFQ-Pipeline-64B` (2,048 JJs, 64 Blocks)** | 64 | 64 | 12.178 s | **0.510 s** | **1.243 s** | **23.87x** | **9.80x** | **6.34x** | `1.45e-17` |
+| **`RSFQ-Pipeline-64B` (2,048 JJs, 64 Blocks)** | 64 | 256 | 48.566 s | **1.682 s** | **3.192 s** | **28.87x** | **15.21x** | **12.55x** | `1.45e-17` |
+
+### 6.3 Key Takeaways from Tier 2 Batched Monte Carlo
+1. **Unlocks GPU & Multi-Core Speedups Even on Single-Partition Monolithic Circuits ($P = 1$) and Small Standard Cells:**
+   - Whereas a single run ($B=1$) of a monolithic $P=1$ circuit or an MIT-LL standard cell (`ex_mitll_xor_wr`, `ex_mitll_dff_wr`) cannot saturate a GPU, batching $B = 1024$ Monte Carlo trials achieves **`24.3x–28.2x` OpenMP speedup** and **`3.3x–7.2x` CUDA GPU speedup** (`4.96x` total wall-clock GPU speedup on `ex_mitll_dff_wr`). Notice that on the GPU, increasing $B$ by $4\times$ (from `256` to `1024`) on `Mono-RSFQ-Cell-Macro` increases GPU transient time by only `7.8%` (`4.611s -> 4.972s`) as additional trial warps fill previously idle SMs!
+2. **Up to `31.14x` OpenMP Speedup & `19.65x` CUDA GPU Speedup (`18.33x` Wall-Clock Speedup) on Real Production RSFQ Circuits (`ex_ksa4bit`):**
+   - Simulating 256 Monte Carlo fabrication-yield trials of the 4-bit RSFQ Kogge-Stone Adder (695 JJs/trial) drops from **`204.24 s` sequentially** to **`6.56 s` (`31.14x` speedup) on OpenMP (`-p -b 256`)** and **`10.39 s` (`19.65x` transient speedup, `18.33x` end-to-end wall-clock speedup) on CUDA GPU (`-g -b 256`)**, with a relative difference of `1.04e-15`.
+3. **4.85 Million Simultaneous Equations in 3.19 Seconds on GPU (`RSFQ-Pipeline-64B`, $B=256$):**
+   - On the 64-partition RSFQ ALU pipeline across $B=256$ trials (`4,848,640` MNA equations), the coalesced GPU solver completes all timesteps in **`3.19 s` (`15.21x` GPU transient speedup, `12.55x` wall-clock speedup)** and **`1.68 s` (`28.87x` OpenMP speedup)** with `1.45e-17` relative error.

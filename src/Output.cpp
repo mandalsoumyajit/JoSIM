@@ -13,10 +13,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #ifdef _OPENMP
@@ -118,7 +120,280 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
     for (auto i : result_indices) { traces.back().data_.emplace_back(t.at(i)); }
     // Print only the indices of the relevant traces
     int64_t cc = 0;
-    if (mObj.relevantTraces.size() != 0) {
+    if (mObj.relevantTraces.size() != 0 && sObj.results.mcRuns > 1 && !sObj.results.mcTraceOut.empty()) {
+        const int64_t B          = sObj.results.mcRuns;
+        const int64_t nRows      = sObj.results.mcNumRows;
+        const int64_t nKept      = sObj.results.mcNumKeptSteps;
+        const int64_t nTraces    = static_cast<int64_t>(mObj.relevantTraces.size());
+        const size_t  nPrint     = result_indices.size();
+        const int64_t colsPerTr  = 4 + (iObj.argMcAll ? B : 0);
+
+        auto make_mc_label = [](const std::string& label, const std::string& suffix) -> std::string {
+            if (suffix.empty()) { return label; }
+            if (label.size() >= 2 && label.front() == '"' && label.back() == '"') {
+                return label.substr(0, label.size() - 1) + suffix + "\"";
+            }
+            return label + suffix;
+        };
+
+        for (int64_t idx = 0; idx < nTraces; ++idx) {
+            const auto&       i     = mObj.relevantTraces[idx];
+            const std::string label = i.deviceLabel.value();
+            char              tChar = 'I';
+            if (i.storageType == StorageType::Voltage) {
+                tChar = 'V';
+            } else if (i.storageType == StorageType::Phase) {
+                tChar = 'P';
+            }
+            const char* suffixes[4] = {"", "_STD", "_MIN", "_MAX"};
+            for (int s = 0; s < 4; ++s) {
+                traces.emplace_back(make_mc_label(label, suffixes[s]));
+                traces.back().fileIndex = i.fIndex;
+                traces.back().type_     = tChar;
+                traces.back().data_.resize(nPrint, 0.0);
+            }
+            if (iObj.argMcAll) {
+                for (int64_t b = 0; b < B; ++b) {
+                    traces.emplace_back(make_mc_label(label, "_MC" + std::to_string(b)));
+                    traces.back().fileIndex = i.fIndex;
+                    traces.back().type_     = tChar;
+                    traces.back().data_.resize(nPrint, 0.0);
+                }
+            }
+        }
+
+        struct McStat {
+            double peakMean = 0.0;
+            double peakStd  = 0.0;
+            double peakMin  = 0.0;
+            double peakMax  = 0.0;
+        };
+        std::vector<McStat> stats(nTraces);
+
+        auto process_mc_trace = [&](int64_t idx) {
+            const auto&   i        = mObj.relevantTraces[idx];
+            const auto&   st       = i.storageType;
+            const int64_t baseSlot = 1 + idx * colsPerTr;
+            auto&         trMean   = traces[baseSlot + 0].data_;
+            auto&         trStd    = traces[baseSlot + 1].data_;
+            auto&         trMin    = traces[baseSlot + 2].data_;
+            auto&         trMax    = traces[baseSlot + 3].data_;
+
+            const int64_t i1   = i.index1.has_value() ? i.index1.value() : -1;
+            const int64_t i2   = i.index2.has_value() ? i.index2.value() : -1;
+            const int64_t vi   = i.variableIndex.has_value() ? i.variableIndex.value() : -1;
+            const int32_t s1   = (i1 >= 0 && i1 < static_cast<int64_t>(sObj.results.mcRowToSlot.size()))
+                                         ? sObj.results.mcRowToSlot[i1]
+                                         : -1;
+            const int32_t s2   = (i2 >= 0 && i2 < static_cast<int64_t>(sObj.results.mcRowToSlot.size()))
+                                         ? sObj.results.mcRowToSlot[i2]
+                                         : -1;
+            const int32_t sv   = (vi >= 0 && vi < static_cast<int64_t>(sObj.results.mcRowToSlot.size()))
+                                         ? sObj.results.mcRowToSlot[vi]
+                                         : -1;
+            const size_t xsize = std::min<size_t>(t.size(), static_cast<size_t>(nKept));
+
+            std::vector<double> meanVec(nPrint, 0.0);
+            std::vector<double> m2Vec(nPrint, 0.0);
+            std::vector<double> vMin(nPrint, 1e300);
+            std::vector<double> vMax(nPrint, -1e300);
+            std::vector<double> trialWave(nPrint, 0.0);
+            std::vector<double> vectphase;
+            if (st == StorageType::Phase && iObj.argAnal == AnalysisType::Voltage
+                && !(i.deviceLabel.value().at(3) == 'B' && sv >= 0)) {
+                vectphase.resize(xsize, 0.0);
+            }
+
+            Function localSrc;
+            bool     isISrc = (st == StorageType::Current && i.deviceLabel.value().at(3) == 'I');
+            if (isISrc) { localSrc = mObj.sourcegen.at(i.sourceIndex.value()); }
+
+            for (int64_t b = 0; b < B; ++b) {
+                const double* p1 = (s1 >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + s1) * nKept) : nullptr;
+                const double* p2 = (s2 >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + s2) * nKept) : nullptr;
+                const double* pv = (sv >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + sv) * nKept) : nullptr;
+
+                if (st == StorageType::Voltage) {
+                    for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
+                        const int64_t j   = result_indices[pIdx];
+                        double        acc = 0.0;
+                        for (int64_t k = 0; k < firsize; ++k) {
+                            int64_t jk = j + halffirsize - k;
+                            if (jk < 0) {
+                                jk = 0;
+                            } else if (static_cast<size_t>(jk) >= xsize) {
+                                jk = static_cast<int64_t>(xsize) - 1;
+                            }
+                            const double valin1 = p1 ? p1[jk] : 0.0;
+                            const double valin2 = p2 ? p2[jk] : 0.0;
+                            double       value  = 0.0;
+                            if (iObj.argAnal == AnalysisType::Voltage) {
+                                value = valin1 - valin2;
+                            } else if (i.deviceLabel.value().at(3) == 'B' && pv) {
+                                value = pv[jk];
+                            } else {
+                                double valin1n1, valin1n2, valin2n1, valin2n2;
+                                if (jk >= 2) {
+                                    valin1n2 = p1 ? p1[jk - 2] : 0.0;
+                                    valin1n1 = p1 ? p1[jk - 1] : 0.0;
+                                    valin2n2 = p2 ? p2[jk - 2] : 0.0;
+                                    valin2n1 = p2 ? p2[jk - 1] : 0.0;
+                                } else if (jk == 1) {
+                                    valin1n2 = valin1n1 = p1 ? p1[jk - 1] : 0.0;
+                                    valin2n2 = valin2n1 = p2 ? p2[jk - 1] : 0.0;
+                                } else {
+                                    valin1n2 = valin1n1 = valin1;
+                                    valin2n2 = valin2n1 = valin2;
+                                }
+                                value = ((3.0 * Constants::SIGMA) / (2.0 * iObj.transSim.tstep()))
+                                        * ((valin1 - valin2) - (4.0 / 3.0) * (valin1n1 - valin2n1)
+                                           + (1.0 / 3.0) * (valin1n2 - valin2n2));
+                            }
+                            acc += firwindow[k] * value;
+                        }
+                        trialWave[pIdx] = acc;
+                    }
+                } else if (st == StorageType::Phase) {
+                    if (iObj.argAnal == AnalysisType::Phase) {
+                        for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
+                            const int64_t j   = result_indices[pIdx];
+                            double        acc = 0.0;
+                            for (int64_t k = 0; k < firsize; ++k) {
+                                int64_t jk = j + halffirsize - k;
+                                if (jk < 0) {
+                                    jk = 0;
+                                } else if (static_cast<size_t>(jk) >= xsize) {
+                                    jk = static_cast<int64_t>(xsize) - 1;
+                                }
+                                acc += firwindow[k] * ((p1 ? p1[jk] : 0.0) - (p2 ? p2[jk] : 0.0));
+                            }
+                            trialWave[pIdx] = acc;
+                        }
+                    } else if (i.deviceLabel.value().at(3) == 'B' && pv) {
+                        for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
+                            const int64_t j   = result_indices[pIdx];
+                            double        acc = 0.0;
+                            for (int64_t k = 0; k < firsize; ++k) {
+                                int64_t jk = j + halffirsize - k;
+                                if (jk < 0) {
+                                    jk = 0;
+                                } else if (static_cast<size_t>(jk) >= xsize) {
+                                    jk = static_cast<int64_t>(xsize) - 1;
+                                }
+                                acc += firwindow[k] * pv[jk];
+                            }
+                            trialWave[pIdx] = acc;
+                        }
+                    } else {
+                        double phaseN1 = 0.0, phaseN2 = 0.0;
+                        for (size_t j = 0; j < xsize; ++j) {
+                            const double valin1 = p1 ? p1[j] : 0.0;
+                            const double valin2 = p2 ? p2[j] : 0.0;
+                            const double value
+                                    = ((2.0 * iObj.transSim.tstep()) / (3.0 * Constants::SIGMA)) * (valin1 - valin2)
+                                      + (4.0 / 3.0) * phaseN1 - (1.0 / 3.0) * phaseN2;
+                            phaseN2      = phaseN1;
+                            phaseN1      = value;
+                            vectphase[j] = value;
+                        }
+                        for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
+                            const int64_t j   = result_indices[pIdx];
+                            double        acc = 0.0;
+                            for (int64_t k = 0; k < firsize; ++k) {
+                                int64_t jk = j + halffirsize - k;
+                                if (jk < 0) {
+                                    jk = 0;
+                                } else if (static_cast<size_t>(jk) >= xsize) {
+                                    jk = static_cast<int64_t>(xsize) - 1;
+                                }
+                                acc += firwindow[k] * vectphase[jk];
+                            }
+                            trialWave[pIdx] = acc;
+                        }
+                    }
+                } else {
+                    for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
+                        const int64_t j   = result_indices[pIdx];
+                        double        acc = 0.0;
+                        for (int64_t k = 0; k < firsize; ++k) {
+                            int64_t jk = j + halffirsize - k;
+                            if (jk < 0) {
+                                jk = 0;
+                            } else if (static_cast<size_t>(jk) >= xsize) {
+                                jk = static_cast<int64_t>(xsize) - 1;
+                            }
+                            const double value = (!isISrc) ? (p1 ? p1[jk] : 0.0) : localSrc.value(t[jk]);
+                            acc += firwindow[k] * value;
+                        }
+                        trialWave[pIdx] = acc;
+                    }
+                }
+
+                if (iObj.argMcAll) { traces[baseSlot + 4 + b].data_ = trialWave; }
+                const double invCount = 1.0 / static_cast<double>(b + 1);
+                for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
+                    const double v      = trialWave[pIdx];
+                    const double delta  = v - meanVec[pIdx];
+                    meanVec[pIdx]      += delta * invCount;
+                    const double delta2 = v - meanVec[pIdx];
+                    m2Vec[pIdx]        += delta * delta2;
+                    if (v < vMin[pIdx]) { vMin[pIdx] = v; }
+                    if (v > vMax[pIdx]) { vMax[pIdx] = v; }
+                }
+            }
+
+            const double invB = 1.0 / static_cast<double>(B);
+            size_t       pk   = 0;
+            for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
+                const double mean = meanVec[pIdx];
+                const double var  = std::max(0.0, m2Vec[pIdx] * invB);
+                trMean[pIdx]      = mean;
+                trStd[pIdx]       = std::sqrt(var);
+                trMin[pIdx]       = vMin[pIdx];
+                trMax[pIdx]       = vMax[pIdx];
+                if (std::abs(mean) > std::abs(trMean[pk])) { pk = pIdx; }
+            }
+            if (nPrint > 0) {
+                stats[idx].peakMean = trMean[pk];
+                stats[idx].peakStd  = trStd[pk];
+                stats[idx].peakMin  = trMin[pk];
+                stats[idx].peakMax  = trMax[pk];
+            }
+        };
+
+#ifdef _OPENMP
+        if ((iObj.argPar || iObj.argGpu) && nTraces >= 2) {
+            const int nThreads = std::min<int>(omp_get_max_threads(), static_cast<int>(nTraces));
+#pragma omp parallel for schedule(dynamic) num_threads(nThreads)
+            for (int64_t idx = 0; idx < nTraces; ++idx) { process_mc_trace(idx); }
+        } else
+#endif
+        {
+            for (int64_t idx = 0; idx < nTraces; ++idx) { process_mc_trace(idx); }
+        }
+
+        if (!iObj.argMin && nTraces > 0) {
+            std::cout << "\nJoSIM Monte Carlo Robustness Summary (" << B << " trials):\n";
+            std::cout << "  " << std::left << std::setw(22) << "Trace" << std::right << std::setw(14) << "Peak Mean"
+                      << std::setw(14) << "Peak 1-Sigma" << std::setw(14) << "Peak Min" << std::setw(14) << "Peak Max"
+                      << std::setw(12) << "CV (%)" << "\n";
+            const int64_t maxShow = std::min<int64_t>(nTraces, 16);
+            for (int64_t idx = 0; idx < maxShow; ++idx) {
+                const auto&  st = stats[idx];
+                const double cv = (std::abs(st.peakMean) > 1e-18)
+                                          ? (100.0 * st.peakStd / std::abs(st.peakMean))
+                                          : 0.0;
+                std::cout << "  " << std::left << std::setw(22) << mObj.relevantTraces[idx].deviceLabel.value()
+                          << std::right << std::scientific << std::setprecision(4) << std::setw(14) << st.peakMean
+                          << std::setw(14) << st.peakStd << std::setw(14) << st.peakMin << std::setw(14) << st.peakMax
+                          << std::fixed << std::setprecision(2) << std::setw(11) << cv << "%\n";
+            }
+            if (nTraces > maxShow) {
+                std::cout << "  ... (" << (nTraces - maxShow) << " additional traces written to output)\n";
+            }
+            std::cout << "\n";
+        }
+    } else if (mObj.relevantTraces.size() != 0) {
         // Create progress bar
         ProgressBar bar;
         if (!iObj.argMin) {

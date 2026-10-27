@@ -16,7 +16,14 @@ void Spread::get_spreads(Input& iObj) {
     for (auto& i : iObj.controls) {
         if (i.front() == "SPREAD") {
             for (auto& j : tokens_t(i.begin() + 1, i.end())) {
-                if (j.at(0) == 'R') {
+                if (j.rfind("RUNS=", 0) == 0 || j.rfind("MC=", 0) == 0 || j.rfind("N=", 0) == 0
+                    || j.rfind("BATCH=", 0) == 0) {
+                    auto t = Misc::tokenize(j, "=");
+                    if (t.size() == 2) {
+                        iObj.argMcRuns = std::max<int64_t>(
+                                iObj.argMcRuns, static_cast<int64_t>(parse_param(t.back(), iObj.parameters)));
+                    }
+                } else if (j.at(0) == 'R') {
                     auto t = Misc::tokenize(j, "=");
                     if (t.size() == 2) { rspread_ = parse_param(t.back(), iObj.parameters); }
                 } else if (j.at(0) == 'L') {
@@ -54,4 +61,23 @@ double Spread::spread_value(double value, int64_t type, double spread) const {
         return Rng::normal_spread(value, sigma);
     }
     return value;
+}
+
+double Spread::spread_value_rng(
+        double value, int64_t type, double spread, std::mt19937_64& rng, double defaultSpread) const {
+    if (spread == 1.0) {
+        switch (type) {
+            case GLB: spread = gspread_; break;
+            case RES: spread = rspread_; break;
+            case CAP: spread = cspread_; break;
+            case IND: spread = lspread_; break;
+            case JJ: spread = bspread_; break;
+        }
+    }
+    if (spread == 1.0 && gspread_ != 1.0) { spread = gspread_; }
+    if (spread == 1.0 && !has_any_spread() && defaultSpread > 0.0) { spread = defaultSpread; }
+    if (spread == 1.0 || spread <= 0.0) { return value; }
+    const double                       sigma = (std::abs(value) * spread) / 3.0;
+    std::normal_distribution<double>   dist(value, sigma);
+    return dist(rng);
 }

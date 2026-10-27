@@ -57,8 +57,11 @@ class JJ : public BasicComponent {
     int64_t                 variableIndex_ = 0;
     int64_t                 nzBackIndex_   = 0;
     double                  area_          = 1.0;
-    std::optional<double>   Ic_, temp_, neb_, spAmp_;
+    double                  nominalArea_   = 1.0;
+    double                  spread_        = 1.0;
+    std::optional<double>   Ic_, nominalIc_, temp_, neb_, spAmp_;
     Model                   model_;
+    Model                   baseModel_;
     double                  phaseConst_ = 0.0;
     double                  lowerB_ = 0.0, upperB_ = 0.0, gLarge_ = 0.0;
     double                  negInvSubgap_ = 0.0, negInvTrans_ = 0.0, negInvNormal_ = 0.0;

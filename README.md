@@ -40,7 +40,7 @@ or via \
 This enhanced fork of JoSIM delivers significant single-core, multi-threaded (`-p`), numerical integration, and binary I/O improvements (see [`ENHANCEMENT_PLAN.md`](ENHANCEMENT_PLAN.md) for architectural details):
 
 ### 1. Speed, Multi-Core OpenMP (`-p`) & CUDA GPU (`-g`) Parallelism
-- **Up to `27.15x` OpenMP CPU speedup (`-p`) and `21.47x` CUDA GPU speedup (`-g`)** on large PTL-interconnected superconducting circuits via the **Multi-Step Windowed PTL Block-Parallel Solver** ("Exact Waveform Relaxation"; see [`docs/gpu_architecture.md`](docs/gpu_architecture.md)).
+- **Up to `31.11x` OpenMP CPU speedup (`-p -b 256`) and `19.54x` CUDA GPU speedup (`-g -b 256`)** on batched Monte Carlo (`.spread`) robustness studies (`Simulation::trans_sim_mc`, `advance_mc_coalesced_kernel`), and **up to `27.15x` OpenMP speedup (`-p`) and `21.47x` CUDA GPU speedup (`-g`)** on single-run PTL-interconnected superconducting circuits via the **Multi-Step Windowed PTL Block-Parallel Solver** ("Exact Waveform Relaxation"; see [`docs/gpu_architecture.md`](docs/gpu_architecture.md)).
 - **2.84x faster on the 23-test CTest suite** (`20.20 s -> 7.11 s` in WSL with 100% bit-identical outputs).
 - **2.2x–3.2x faster end-to-end simulation + output** on medium/large extracted superconducting IC netlists when combining the solver optimizations with binary output (`.bin` / `.npy`).
 - **$O(1)$ hash-map lookups** (`deviceMap`, `csMap`) for mutual inductances (`K`) and `.print`/`.save` traces, eliminating $O(N^2)$ setup bottlenecks on extracted layouts with thousands of mutual couplings.
@@ -90,7 +90,9 @@ arr = load_josim_npy("output.npy")       # Zero-copy memory-mapped structured ar
   .option kcutoff=1e-3
   ```
 - **CUDA GPU & Multi-Step Windowed PTL Solver (`-g` / `--gpu`, `.option gpu`, `-p` / `--parallel`)**:
-  Build with `-DUSING_CUDA=ON -DUSING_OPENMP=ON -DCMAKE_CUDA_ARCHITECTURES=86` to enable CUDA GPU acceleration (`-g` or `.option gpu`) alongside multi-core OpenMP windowed PTL acceleration (`-p`).
+  Build with `-DUSING_CUDA=ON -DUSING_OPENMP=ON` (`CMAKE_CUDA_ARCHITECTURES` automatically defaults to `"native"` on CMake $\ge 3.24$ across Volta, Turing, Ampere, Ada, Hopper, and Blackwell GPUs) to enable CUDA GPU acceleration (`-g` or `.option gpu`) alongside multi-core OpenMP windowed PTL acceleration (`-p`).
+- **Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>` / `--batch=<N>`, `.option mc=<N>`, `.spread ... runs=<N>`, `.option mcall`)**:
+  Executes `N` independent fabrication-variation trials simultaneously in a single run (parse-once, symbolic-once) across OpenMP CPU threads (`-p -b <N>`) or in a coalesced thread-per-trial CUDA GPU kernel (`-g -b <N>`), outputting Welford ensemble `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, and `<Trace>_MAX` statistics (plus `<Trace>_MC0..MC{N-1}` with `.option mcall`) and a stdout **Monte Carlo Robustness Summary** table.
 
 ### 4. Benchmark Results (Medium, Large & Very-Large Designs)
 
@@ -121,7 +123,23 @@ Reproducible via [`scripts/benchmark_non_ptl_exxact.py`](scripts/benchmark_non_p
 | **RSFQ-ALU-Macros-1024** | 1024 RSFQ ALU Macros, 98k `K`, 32k `C` ($P=1024$) | 303,100 | 10,000 | `72.81 s` | **`3.54 s`** | **`11.39 s`** | **20.54x** | **6.39x** | `1.03e-16` |
 | **RSFQ-ALU-Macros-4096** | 4096 RSFQ ALU Macros, 393k `K`, 131k `C` ($P=4096$) | 1,212,412 | 5,000 | `157.08 s` | **`7.50 s`** | **`18.29 s`** | **20.93x** | **8.59x** | `6.96e-17` |
 
-#### C. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
+#### C. Tier 2 Batched Monte Carlo (`.spread`) Robustness Benchmarks (`Dual AMD EPYC 7413 48C/96T + NVIDIA RTX A6000`)
+
+Reproducible via [`scripts/benchmark_mc_exxact.py`](scripts/benchmark_mc_exxact.py) and [`scripts/run_mc_exxact.sh`](scripts/run_mc_exxact.sh) across MIT-LL standard cells (`ex_jtl_basic`, `ex_mitll_xor_wr`, `ex_mitll_dff_wr`), real production RSFQ logic (`ex_ksa4bit`), 0-PTL single-partition monolithic circuits ($P=1$), and PTL-coupled RSFQ processor pipelines up to **`4,848,640` simultaneous MNA equations** ($B \in \{64, 256, 1024\}$ trials):
+
+| Design (`.spread` Yield Analysis) | Base $P$ | Batch $B$ | Est. $B \times$ Serial 1T | Batched OpenMP (`-p`) | Batched GPU (`-g`) | OpenMP Speedup | GPU Trans Speedup | GPU Wall Speedup | CPU vs GPU Rel Diff |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **`ex_mitll_xor_wr` (MIT-LL XOR)** | 2 | 1024 | `8.025 s` | **`0.303 s`** | **`1.229 s`** | **26.48x** | **6.53x** | **4.30x** | `1.17e-14` |
+| **`ex_mitll_dff_wr` (MIT-LL DFF)** | 2 | 1024 | `11.301 s` | **`0.401 s`** | **`1.560 s`** | **28.16x** | **7.24x** | **4.96x** | `6.67e-15` |
+| **`Mono-RSFQ-Cell-Macro` (128 JJs, 0-PTL)** | **1** | 1024 | `16.374 s` | **`0.673 s`** | **`4.972 s`** | **24.32x** | **3.29x** | **2.93x** | `2.44e-13` |
+| **`Mono-RLK-SQUID-Macro` (96 JJs, 191 K, 0-PTL)** | **1** | 1024 | `19.364 s` | **`0.796 s`** | **`5.507 s`** | **24.34x** | **3.52x** | **3.16x** | `1.67e-13` |
+| **`ex_ksa4bit` (4-bit KSA Adder, 695 JJs)** | 66 | 64 | `51.250 s` | **`2.044 s`** | **`4.309 s`** | **25.07x** | **11.89x** | **10.13x** | `1.04e-15` |
+| **`ex_ksa4bit` (4-bit KSA Adder, 695 JJs)** | 66 | 256 | `204.237 s` | **`6.559 s`** | **`10.394 s`** | **31.14x** | **19.65x** | **18.33x** | `1.04e-15` |
+| **`RSFQ-Pipeline-16B` (512 JJs, 16 Blocks)** | 16 | 256 | `12.165 s` | **`0.431 s`** | **`1.226 s`** | **28.22x** | **9.92x** | **6.50x** | `1.19e-17` |
+| **`RSFQ-Pipeline-64B` (2,048 JJs, 64 Blocks)** | 64 | 64 | `12.178 s` | **`0.510 s`** | **`1.243 s`** | **23.87x** | **9.80x** | **6.34x** | `1.45e-17` |
+| **`RSFQ-Pipeline-64B` (2,048 JJs, 64 Blocks)** | 64 | 256 | `48.566 s` | **`1.682 s`** | **`3.192 s`** | **28.87x** | **15.21x** | **12.55x** | `1.45e-17` |
+
+#### D. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
 
 Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh) in WSL (`-O3` Release build with Ninja, comparing upstream `v2.7` / `02a34ee` against this enhanced version):
 
@@ -156,11 +174,14 @@ Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_med
 - [`scripts/test_phase3_wsl.sh`](scripts/test_phase3_wsl.sh): Tests and benchmarks `.bin`/`.npy`/`.rawb` binary outputs, fractional TX delay interpolation, `.savestate`/`.loadstate` checkpointing, `-f` fixed-step control, and `-c` JJ predictor-corrector iteration.
 - [`scripts/test_phase4_wsl.sh`](scripts/test_phase4_wsl.sh): Tests transmission-line circular ring buffers, mid-flight PTL `.savestate`/`.loadstate` checkpointing, in-loop `PRSTART`/`PRSTEP` decimation, `.option kcutoff`, and OpenMP block-partitioned KLU solving across PTL boundaries.
 - [`scripts/build_exxact_gpu.sh`](scripts/build_exxact_gpu.sh) & [`scripts/benchmark_gpu_exxact.py`](scripts/benchmark_gpu_exxact.py): Builds JoSIM with CUDA (`-DUSING_CUDA=ON`) and OpenMP (`-DUSING_OPENMP=ON`), verifies numerical equivalence across Phase and Voltage modes, and benchmarks scaling across PTL-coupled circuits up to 131k JJs (`675k` MNA equations).
+- [`scripts/benchmark_non_ptl_exxact.py`](scripts/benchmark_non_ptl_exxact.py) & [`scripts/run_non_ptl_exxact.sh`](scripts/run_non_ptl_exxact.sh): Benchmarks non-PTL monolithic circuits ($P=1$), multi-channel 0-PTL SQUID arrays ($P \ge 2$), and rich RLK/capacitor RSFQ ALU macros up to 1.21M MNA equations.
+- [`scripts/benchmark_mc_exxact.py`](scripts/benchmark_mc_exxact.py) & [`scripts/run_mc_exxact.sh`](scripts/run_mc_exxact.sh): Benchmarks Tier 2 Batched Monte Carlo (`.spread`) across 16 circuit/batch configurations up to 2.72M simultaneous MNA equations.
 
 ---
 
 ## Changelog
 ### v2.8
+- Implemented **Tier 2 Batched GPU (`-g`) & Multi-Core OpenMP (`-p`) Monte Carlo (`.spread`) Robustness Solver** (`-b <N>` / `--batch=<N>`, `.option mc=<N>`, `.spread ... runs=<N>`, `.option mcall`, `JOSIM_SEED`), with hardware-adaptive CUDA block sizing across all NVIDIA GPU architectures (`advance_mc_coalesced_kernel`) and Welford online ensemble statistics (`<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`), achieving up to **31.11x OpenMP speedup** and **19.54x CUDA GPU speedup**.
 - Implemented **Tier 1 Multi-Step Windowed PTL Block-Parallel Solver** ("Exact Waveform Relaxation") for both **CUDA GPU (`-g` / `--gpu`, `.option gpu`, `-DUSING_CUDA=ON`)** and **Multi-Core OpenMP CPU (`-p` / `--parallel`, `-DUSING_OPENMP=ON`)**, achieving up to **27.15x OpenMP speedup** and **21.47x CUDA GPU speedup** on 131k-JJ PTL-interconnected circuits.
 - Added high-speed binary output formats: `.bin` (column-major `JOSIMBIN` float64), `.npy` (NumPy structured array), and `.rawb` (SPICE3 binary raw), along with Python loader [`scripts/josim_io.py`](scripts/josim_io.py).
 - Implemented $O(1)$ hash-map lookups for mutual inductance (`K`) and `.print`/`.save` trace resolution.

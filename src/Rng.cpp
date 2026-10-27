@@ -6,6 +6,7 @@
 #include "JoSIM/Constants.hpp"
 
 #include <chrono>
+#include <cstdlib>
 
 namespace JoSIM {
 
@@ -34,6 +35,14 @@ void Rng::start_run(uint64_t seed) {
 }
 
 void Rng::start_run_auto() {
+    if (const char* envSeed = std::getenv("JOSIM_SEED")) {
+        char*              endPtr = nullptr;
+        unsigned long long val    = std::strtoull(envSeed, &endPtr, 10);
+        if (endPtr != envSeed) {
+            start_run(static_cast<uint64_t>(val));
+            return;
+        }
+    }
     std::random_device rd;
     uint64_t           s  = (uint64_t(rd()) << 32) ^ uint64_t(rd());
     s                    ^= uint64_t(std::chrono::high_resolution_clock::now().time_since_epoch().count());

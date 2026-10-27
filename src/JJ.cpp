@@ -59,12 +59,18 @@ JJ::JJ(const std::pair<tokens_t, string_o>& s,
         } else if (ti.rfind("NEB=", 0) == 0) {
             neb_ = parse_param(ti.substr(4), iObj.parameters, s.second);
         } else if (ti.rfind("AREA=", 0) == 0) {
-            area_ = spread.spread_value(parse_param(ti.substr(5), iObj.parameters, s.second), Spread::JJ, spr);
+            nominalArea_ = parse_param(ti.substr(5), iObj.parameters, s.second);
         } else if (ti.rfind("IC=", 0) == 0) {
-            Ic_ = spread.spread_value(parse_param(ti.substr(3), iObj.parameters, s.second), Spread::JJ, spr);
+            nominalIc_ = parse_param(ti.substr(3), iObj.parameters, s.second);
         } else {
             t.emplace_back(ti);
         }
+    }
+    spread_ = spr;
+    if (nominalIc_) {
+        Ic_ = spread.spread_value(nominalIc_.value(), Spread::JJ, spread_);
+    } else {
+        area_ = spread.spread_value(nominalArea_, Spread::JJ, spread_);
     }
     if (!temp_ && iObj.globalTemp) { temp_ = iObj.globalTemp; }
     if (!neb_ && iObj.neB) { neb_ = iObj.neB; }
@@ -201,6 +207,7 @@ void JJ::set_model(const tokens_t& t, const vector_pair_t<Model, string_o>& mode
         // Complain about it
         Errors::invalid_component_errors(ComponentErrors::MODEL_NOT_DEFINED, Misc::vector_to_string(t));
     }
+    baseModel_ = model_;
     // Change the area if ic was defined
     if (Ic_) { area_ = Ic_.value() / model_.ic(); }
     // Set the model critical current for this JJ instance

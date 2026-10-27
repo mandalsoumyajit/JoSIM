@@ -48,7 +48,8 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
             // Remove all '-' chars, indicating a switch.
             tempT.at(0).erase(std::remove(tempT.at(0).begin(), tempT.at(0).end(), '-'), tempT.at(0).end());
             // Store the switch identifying char 'a' for "analysis"
-            ap.emplace_back(std::make_pair(tempT.at(0).at(0), std::nullopt));
+            string_o val = (tempT.size() > 1) ? string_o(tempT.at(1)) : std::nullopt;
+            ap.emplace_back(std::make_pair(tempT.at(0).at(0), val));
         } else {
             // Argument to the switch in first token
             if (tempT.size() > 1) { ap.back().second = tempT.at(1); }
@@ -112,6 +113,14 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                         out.analysis_type = AnalysisType::Phase;
                     } else {
                         Errors::cli_errors(CLIErrors::INVALID_ANALYSIS);
+                    }
+                    break;
+                    // Batched Monte Carlo / .spread trials
+                case 'b':
+                    try {
+                        out.batchRuns = std::max<int64_t>(1, std::stoll(i.second.value_or("1")));
+                    } catch (const std::invalid_argument&) {
+                        out.batchRuns = 1;
                     }
                     break;
                     // Enable predictor-corrector iterations for JJs

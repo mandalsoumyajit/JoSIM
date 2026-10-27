@@ -134,6 +134,8 @@ class CudaPartitionSolver {
     CudaPartitionSolver() = default;
     ~CudaPartitionSolver();
 
+    static void warmup_device();
+
     CudaPartitionSolver(const CudaPartitionSolver&)            = delete;
     CudaPartitionSolver& operator=(const CudaPartitionSolver&) = delete;
 
@@ -170,7 +172,8 @@ class CudaPartitionSolver {
                     const std::vector<GpuTxLine>&      txLines,
                     const std::vector<GpuTxHistEntry>& txHist,
                     const std::vector<GpuRelTrace>&    relTraces,
-                    const std::vector<int32_t>&        keptSlot);
+                    const std::vector<int32_t>&        keptSlot,
+                    int32_t                            mcRuns = 1);
 
     // Execute window [i0, i1) on GPU; returns false if any JJ triggered step halving (needsTR)
     bool step_window(int64_t i0, int64_t i1, const double* h_srcWindow);
@@ -200,6 +203,11 @@ class CudaPartitionSolver {
 
   private:
     bool    initialized_  = false;
+    int32_t mcRuns_       = 1;
+    int32_t nBaseParts_   = 0;
+    int32_t nBaseRows_    = 0;
+    int32_t nBaseTraces_  = 0;
+    int32_t nBaseTxLines_ = 0;
     int32_t nParts_       = 0;
     int32_t totalRows_    = 0;
     int32_t numSources_   = 0;
@@ -211,9 +219,13 @@ class CudaPartitionSolver {
     int32_t numRess_      = 0;
     int32_t numCaps_      = 0;
     int32_t numInds_      = 0;
-    int32_t maxPartN_     = 0;
-    int32_t maxPartLuNnz_ = 0;
-    int64_t simSize_      = 0;
+    int32_t maxPartN_       = 0;
+    int32_t maxPartLuNnz_   = 0;
+    int32_t numSMs_         = 1;
+    int32_t warpSize_       = 32;
+    size_t  maxShmemBytes_  = 48 * 1024;
+    size_t  maxShmemPerSM_  = 48 * 1024;
+    int64_t simSize_        = 0;
     double  stepSize_     = 0.0;
     int32_t analysisType_ = 1; // 0 = Voltage, 1 = Phase
 

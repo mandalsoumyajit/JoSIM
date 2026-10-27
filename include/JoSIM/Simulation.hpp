@@ -3,9 +3,7 @@
 #ifndef JOSIM_SIMULATION_HPP
 #define JOSIM_SIMULATION_HPP
 
-#ifdef JOSIM_CUDA
 #include "JoSIM/CudaSolver.hpp"
-#endif
 #include "JoSIM/Errors.hpp"
 #include "JoSIM/LUSolve.hpp"
 #include "JoSIM/Matrix.hpp"
@@ -28,6 +26,11 @@ class Results {
     std::vector<std::optional<std::vector<double>>> xVector;
     std::vector<double>                             timeAxis;
     std::vector<int64_t>                            printIndices;
+    int64_t                                         mcRuns        = 1;
+    int64_t                                         mcNumRows     = 0;
+    int64_t                                         mcNumKeptSteps = 0;
+    std::vector<int32_t>                            mcRowToSlot;
+    std::vector<double>                             mcTraceOut;
 };
 
 struct KluPartition {
@@ -69,6 +72,7 @@ class Simulation {
     bool                fixedStep_               = false;
     bool                warnStep_                = false;
     int64_t             verb_                    = 0;
+    int64_t             mcRuns_                  = 1;
     int64_t             correctorIter_           = 0;
     double              correctorTol_            = 1e-3;
     int64_t             stepHalvings_            = 0;
@@ -110,6 +114,13 @@ class Simulation {
     std::vector<KluPartition>            partitions_;
     std::vector<int64_t>                 jjPartIdx_;
     std::vector<int64_t>                 jjPartNzIdx_;
+    std::vector<int64_t>                 resPartIdx_;
+    std::vector<int64_t>                 resPartNzIdx_;
+    std::vector<int64_t>                 capPartIdx_;
+    std::vector<int64_t>                 capPartNzIdx_;
+    std::vector<int64_t>                 indPartIdx_;
+    std::vector<int64_t>                 indPartNzIdx_;
+    std::vector<std::vector<int64_t>>    indMutPartNzIdx_;
 #ifdef JOSIM_CUDA
     std::unique_ptr<CudaPartitionSolver> cudaSolver_;
 #endif
@@ -124,6 +135,7 @@ class Simulation {
     void solve_lu(Matrix& mObj);
     void free_lu();
     void trans_sim(Matrix& mObj);
+    void trans_sim_mc(Matrix& mObj);
     void trans_sim_omp_windowed(Matrix& mObj);
     void trans_sim_gpu_windowed(Matrix& mObj);
     void trans_sim_gpu_monolithic(Matrix& mObj);

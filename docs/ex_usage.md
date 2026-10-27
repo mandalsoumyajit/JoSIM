@@ -133,3 +133,17 @@ df = load_josim("./ex_jtl_basic.bin", as_dataframe=True)
 arr = np.load("./ex_jtl_basic.npy", mmap_mode="r")
 print(arr.dtype.names)  # ('time', 'V(VIN)', 'I(ROUT)', 'P(B01)', 'P(B02)')
 ```
+
+## Multi-Core OpenMP (`-p`) & CUDA GPU (`-g`) Acceleration
+
+When JoSIM is compiled with `-DUSING_OPENMP=ON` and `-DUSING_CUDA=ON`, large multi-tile PTL-connected chips and multi-channel non-PTL circuits (such as SQUID/detector readout arrays and parallel bit-slices) can be accelerated using `-p` (`--parallel`) or `-g` (`--gpu`, or `.option gpu` inside the netlist):
+
+```bash
+# Run with multi-core OpenMP windowed block-parallel solver
+OMP_NUM_THREADS=24 josim-cli -p -o ./output.bin ./large_design.cir
+
+# Run with NVIDIA CUDA GPU solver
+josim-cli -g -o ./output.bin ./large_design.cir
+```
+
+See [GPU Acceleration Architecture & Benchmarks](gpu_architecture.md) for detailed scaling benchmarks across both PTL-coupled processor tiles (**up to `27.15x` OpenMP speedup and `21.47x` GPU speedup** on 131k JJs) and non-PTL / 3D-extracted RLK circuits (**up to `24.98x` OpenMP speedup and `10.30x` GPU speedup** on 1.21M MNA equations with 393k mutual inductances and 131k capacitors).

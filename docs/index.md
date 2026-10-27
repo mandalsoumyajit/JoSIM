@@ -111,12 +111,12 @@ git clone https://github.com/JoeyDelp/JoSIM.git
 cd JoSIM
 ```
 
-Navigate to the newly cloned/extracted JoSIM directory then run the following commands (adding `-DPARALLEL=ON` to enable OpenMP parallelization with the `-p` flag):
+Navigate to the newly cloned/extracted JoSIM directory then run the following commands (adding `-DUSING_OPENMP=ON` to enable OpenMP parallelization with `-p`, and optionally `-DUSING_CUDA=ON` to enable NVIDIA CUDA GPU acceleration with `-g`):
 
 ```bash
 mkdir build
 cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DPARALLEL=ON
+cmake .. -DCMAKE_BUILD_TYPE=Release -DUSING_OPENMP=ON -DUSING_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build . --config Release
 ```
 
@@ -125,6 +125,8 @@ On WSL / Ubuntu Linux, you can also run the provided helper script directly from
 ```bash
 bash scripts/build_wsl.sh
 ```
+
+For full architectural details and benchmark results of the Multi-Step Windowed Block-Parallel OpenMP (`-p`) and CUDA GPU (`-g`) solvers across PTL-coupled and Non-PTL superconducting circuits up to 1.21M equations, see [GPU Acceleration Architecture & Benchmarks](gpu_architecture.md).
 
 This will generate a JoSIM executable in the **build** directory.
 

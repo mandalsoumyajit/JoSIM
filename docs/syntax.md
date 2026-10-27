@@ -371,6 +371,7 @@ Simulator options can be configured in the netlist using the `.option` (or `.opt
 | **CORRECTOR** | `.option corrector=<N>` | Enables up to `N` implicit predictor-corrector (Picard/BDF2) iterations per timestep on active Josephson junctions (default `0`; `-c` on the CLI defaults to `2`). |
 | **CORRECTORTOL** | `.option correctortol=<val>` | Sets the phase convergence threshold (in radians, default `1e-3`) that triggers predictor-corrector iteration when `CORRECTOR` > 0. |
 | **KCUTOFF** / **KMIN** | `.option kcutoff=<val>` | Ignores mutual inductance entries (`K` lines) with $|k| < \text{val}$ during MNA matrix construction, preventing dense LU fill-in from weak parasitic couplings in 3D field-extracted netlists. |
+| **GPU** / **CUDA** | `.option gpu` | Enables NVIDIA CUDA GPU acceleration (`CudaPartitionSolver`) when compiled with `-DUSING_CUDA=ON`. Equivalent to the `-g` (`--gpu`) CLI switch. |
 
 Examples:
 ```cir
@@ -378,6 +379,7 @@ Examples:
 .option txinterp warnstep
 .option corrector=2 correctortol=1e-4
 .option kcutoff=1e-3
+.option gpu
 ```
 
 ### State Checkpointing (`.savestate` / `.loadstate`)

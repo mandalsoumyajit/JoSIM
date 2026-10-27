@@ -105,7 +105,23 @@ Reproducible via [`scripts/build_exxact_gpu.sh`](scripts/build_exxact_gpu.sh) an
 | **PTL-Tile-1024** | 32,768 | 168,960 | 20,000 | `104.90 s` | `15.54 s` | **`4.20 s`** | `6.95 s` | **24.95x** | **15.10x** |
 | **PTL-Tile-4096** | 131,072 | 675,840 | 10,000 | `232.89 s` | `33.55 s` | **`8.58 s`** | `10.85 s` | **27.15x** | **21.47x** |
 
-#### B. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
+#### B. Non-PTL & Diverse Superconducting Circuit Topologies (`Dual AMD EPYC 7413 48C/96T + NVIDIA RTX A6000`)
+
+Reproducible via [`scripts/benchmark_non_ptl_exxact.py`](scripts/benchmark_non_ptl_exxact.py) and [`scripts/run_non_ptl_exxact.sh`](scripts/run_non_ptl_exxact.sh) across **0-PTL monolithic circuits ($P=1$)**, **0-PTL multi-channel SQUID/detector arrays ($P \ge 2$)**, and **3D-extracted RLK/capacitor RSFQ ALU macros** up to **`1,212,412` MNA equations** (all matching serial output to **`1.90e-18`–`2.46e-16`**):
+
+| Design | Topology (`K`, `C`, PTLs) | MNA Eqns | Steps | Serial (1T) | OpenMP (`-p`) | GPU (`-g`) | OpenMP Speedup | GPU Speedup | Max Diff |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **Mono-2D-JJ-Grid** | $128\times128$ 2D JJ Grid (**0 PTL**, $P=1$) | 106,242 | 2,000 | `11.47 s` | `10.79 s` | `11.94 s` | **1.06x** | 0.96x | `9.08e-17` |
+| **Mono-RLK-49kK-Volt** | 3D-Extracted 49k `K` + 8k `C` (**0 PTL**, $P=1$, `-a 0`) | 65,540 | 2,000 | `2.35 s` | `2.02 s` | `3.32 s` | **1.16x** | 0.71x | `2.38e-18` |
+| **NoPTL-SQUID-256** | 256-Ch SQUID Array, 24k `K`, 8k `C` (**0 PTL**, $P=256$) | 74,752 | 20,000 | `28.06 s` | **`1.76 s`** | **`9.21 s`** | **15.90x** | **3.05x** | `2.46e-16` |
+| **NoPTL-SQUID-256-Volt** | 256-Ch SQUID Array, 24k `K`, 8k `C` (**0 PTL**, `-a 0`) | 74,752 | 20,000 | `29.49 s` | **`1.72 s`** | **`9.21 s`** | **17.15x** | **3.20x** | `1.90e-18` |
+| **NoPTL-SQUID-1024** | 1024-Ch SQUID Array, 98k `K`, 32k `C` (**0 PTL**, $P=1024$) | 299,008 | 10,000 | `75.82 s` | **`3.52 s`** | **`11.20 s`** | **21.55x** | **6.77x** | `7.46e-17` |
+| **NoPTL-SQUID-4096** | 4096-Ch SQUID Array, 393k `K`, 131k `C` (**0 PTL**, $P=4096$) | 1,196,032 | 5,000 | `185.79 s` | **`7.44 s`** | **`18.04 s`** | **24.98x** | **10.30x** | `5.24e-17` |
+| **RSFQ-ALU-Macros-256** | 256 RSFQ ALU Macros, 24k `K`, 8k `C` ($P=256$) | 75,772 | 20,000 | `27.99 s` | **`1.77 s`** | **`9.33 s`** | **15.80x** | **3.00x** | `2.12e-16` |
+| **RSFQ-ALU-Macros-1024** | 1024 RSFQ ALU Macros, 98k `K`, 32k `C` ($P=1024$) | 303,100 | 10,000 | `72.81 s` | **`3.54 s`** | **`11.39 s`** | **20.54x** | **6.39x** | `1.03e-16` |
+| **RSFQ-ALU-Macros-4096** | 4096 RSFQ ALU Macros, 393k `K`, 131k `C` ($P=4096$) | 1,212,412 | 5,000 | `157.08 s` | **`7.50 s`** | **`18.29 s`** | **20.93x** | **8.59x** | `6.96e-17` |
+
+#### C. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
 
 Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh) in WSL (`-O3` Release build with Ninja, comparing upstream `v2.7` / `02a34ee` against this enhanced version):
 

@@ -175,6 +175,24 @@ class CudaPartitionSolver {
     // Execute window [i0, i1) on GPU; returns false if any JJ triggered step halving (needsTR)
     bool step_window(int64_t i0, int64_t i1, const double* h_srcWindow);
 
+    // Initialize multi-block monolithic GPU device evaluator (when circuit is a single connected component P=1)
+    bool initialize_monolithic(int32_t                    totalRows,
+                               int64_t                    simSize,
+                               double                     stepSize,
+                               int32_t                    analysisType,
+                               const std::vector<double>& xInit,
+                               const std::vector<GpuJJ>&  jjs,
+                               const std::vector<GpuRes>& ress,
+                               const std::vector<GpuInd>& inds,
+                               const std::vector<GpuMut>& muts,
+                               const std::vector<GpuCap>& caps);
+
+    // Evaluate all monolithic circuit devices (JJ, Res, Ind+Mut, Cap) in parallel across all GPU SMs for step i
+    bool step_monolithic_devices(int64_t                                 i,
+                                 const double*                           h_x,
+                                 double*                                 h_b,
+                                 std::vector<std::pair<int32_t, double>>& changedNz);
+
     // Download completed trace table (numRelTraces * numKeptSteps) and final xLocal to host
     void download_results(std::vector<double>& h_traceOut, std::vector<double>& h_xFinal);
 
@@ -189,6 +207,9 @@ class CudaPartitionSolver {
     int32_t numRelTraces_ = 0;
     int32_t numKeptSteps_ = 0;
     int32_t numTxLines_   = 0;
+    int32_t numJJs_       = 0;
+    int32_t numRess_      = 0;
+    int32_t numCaps_      = 0;
     int32_t numInds_      = 0;
     int32_t maxPartN_     = 0;
     int32_t maxPartLuNnz_ = 0;
@@ -196,19 +217,25 @@ class CudaPartitionSolver {
     double  stepSize_     = 0.0;
     int32_t analysisType_ = 1; // 0 = Voltage, 1 = Phase
 
-    GpuPartDesc*    d_parts_     = nullptr;
-    int32_t*        d_P_         = nullptr;
-    int32_t*        d_Q_         = nullptr;
-    int32_t*        d_luRp_      = nullptr;
-    int32_t*        d_luDiag_    = nullptr;
-    int32_t*        d_luCi_      = nullptr;
-    int32_t*        d_luSrcNz_   = nullptr;
-    double*         d_luVal_     = nullptr;
-    double*         d_partNz_    = nullptr;
-    double*         d_xLocal_    = nullptr;
-    double*         d_bLocal_    = nullptr;
-    double*         d_yLocal_    = nullptr;
-    double*         d_indIn2Old_ = nullptr;
+    GpuPartDesc*    d_parts_       = nullptr;
+    int32_t*        d_P_           = nullptr;
+    int32_t*        d_Q_           = nullptr;
+    int32_t*        d_luRp_        = nullptr;
+    int32_t*        d_luDiag_      = nullptr;
+    int32_t*        d_luCi_        = nullptr;
+    int32_t*        d_luSrcNz_     = nullptr;
+    double*         d_luVal_       = nullptr;
+    double*         d_partNz_      = nullptr;
+    double*         d_xLocal_      = nullptr;
+    double*         d_bLocal_      = nullptr;
+    double*         d_yLocal_      = nullptr;
+    double*         d_indIn2Old_   = nullptr;
+    double*         d_indIn2New_   = nullptr;
+    int32_t*        d_changedNzIdx_= nullptr;
+    double*         d_changedNzVal_= nullptr;
+    int32_t*        d_numChangedNz_= nullptr;
+    double*         h_xPinned_     = nullptr;
+    double*         h_bPinned_     = nullptr;
 
     GpuJJ*          d_jjs_       = nullptr;
     GpuRes*         d_ress_      = nullptr;

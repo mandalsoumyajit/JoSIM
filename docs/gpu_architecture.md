@@ -115,3 +115,60 @@ Benchmarked on PTL-coupled SFQ processor tile arrays ($W = 100$ step PTL lookahe
 2. **Workstation GA102 (`sm_86`) vs. Data-Center GA100/GH100 (`sm_80`/`sm_90`) FP64 Throughput:**
    - The NVIDIA RTX A6000 uses the workstation **GA102** die, which has a **1:64 FP64-to-FP32 ratio** (only **2 FP64 cores per SM × 84 SMs = 168 FP64 cores**, ~0.61 TFLOPS peak FP64, and microcoded ~60-cycle double-precision divisions during backward substitution).
    - Data-center GPUs (**NVIDIA A100 / H100 / B200**) feature full **1:2 FP64 Tensor/FP64 pipelines** (16x–55x higher FP64 throughput per SM than GA102), where the exact same shared-memory `advance_partitions_window_kernel` will scale proportionately higher on $10^5–10^6$ JJ netlists.
+
+---
+
+## 5. Benchmarks on Non-PTL & Diverse Superconducting Circuit Topologies
+
+To evaluate performance on circuits that **do not rely solely on PTLs**—including circuits with **zero transmission lines (`0 PTLs`)**, dense 3D field-extracted mutual inductance meshes (`K`), explicit shunt/parasitic capacitors (`C`), and both Phase (`-a 1`) and Voltage (`-a 0`) simulation modes—[`scripts/benchmark_non_ptl_exxact.py`](../scripts/benchmark_non_ptl_exxact.py) benchmarks 11 representative circuits across three topological categories on BNL `exxact`:
+
+1. **Category 1 — Purely Monolithic Tightly-Coupled Non-PTL Circuits (`0 PTLs`, $P = 1$):**
+   - `Mono-2D-JJ-Grid`: $128 \times 128$ 2D Josephson junction array (`16,384` JJs, `32,512` inductors, `8,192` capacitors, `106,242` MNA equations, $P = 1$).
+   - `Mono-RSFQ-Logic`: Monolithic RSFQ splitter/merger/DRO pipeline wired purely with inductors and mutual couplings (`8,192` JJs, `8,192` mutual couplings `K`, `4,096` capacitors `C`, `47,108` MNA equations, $P = 1$).
+   - `Mono-RLK-49kK-Phase` & `Mono-RLK-49kK-Volt`: Monolithic 3D-extracted RLK mesh with `8,192` JJs, `16,384` inductors, **`49,152` mutual inductance entries**, and `8,192` capacitors (`65,540` MNA equations, $P = 1$) in both Phase mode and Voltage mode.
+   - For $P = 1$ circuits, JoSIM uses a **fused single-region OpenMP `setup_b`** (`#pragma omp parallel` across `b_` zeroing, JJs, resistors, capacitors, and two-pass inductors + mutual inductances) and a **multi-block CUDA device evaluator (`monolithic_eval_devices_kernel`)** paired with KLU sparse solves.
+2. **Category 2 — Multi-Channel Non-PTL Superconducting Circuits (`0 PTLs`, $P \ge 2$):**
+   - Multi-channel SQUID / detector readout arrays and parallel bit-slices (`NoPTL-SQUID-256`, `NoPTL-SQUID-256-Volt`, `NoPTL-SQUID-1024`, `NoPTL-SQUID-4096`) containing **zero PTLs (`0 PTLs`)**, up to **`131,072` JJs**, **`393,216` mutual inductance terms `K`**, **`131,072` capacitors `C`**, and **`1,196,032` MNA equations**.
+   - Because parallel readout channels or independent bit-slices only share the ground reference node (`0`, which is not an MNA row), JoSIM's connected-component partitioner (`setup_partitions`) automatically decomposes them into $P$ independent KLU partitions with a multi-step lookahead window of **$W = 1,024$ steps** even when **zero transmission lines** are present.
+3. **Category 3 — Rich Multi-Gate RSFQ ALU Macros (`JJ + L + Mutual K + Cap C + R + PTL`):**
+   - Multi-gate RSFQ ALU/logic macros (`RSFQ-ALU-Macros-256`, `RSFQ-ALU-Macros-1024`, `RSFQ-ALU-Macros-4096`) combining `32` JJs, `64` inductors, `96` mutual inductance couplings `K`, `32` capacitors `C`, and `66` resistors `R` per macro (`296` MNA equations/macro, up to **`1,212,412` MNA equations**).
+
+### 5.1 Transient Solver Runtime (`Simulation::trans_sim`) & Numerical Equivalence
+
+| Design | Category | MNA Eqns | Steps | Serial (1T) | OpenMP (`-p`) | GPU (`-g`) | OpenMP Speedup | GPU Speedup | Max Diff vs Serial |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **Mono-2D-JJ-Grid (16k JJs, 0 PTL)** | Monolithic ($P=1$, 0 PTL) | 106,242 | 2,000 | 11.47 s | 10.79 s | 11.94 s | **1.06x** | 0.96x | `9.08e-17` |
+| **Mono-RSFQ-Logic (8k JJs, 0 PTL)** | Monolithic ($P=1$, 0 PTL) | 47,108 | 2,000 | 1.42 s | 1.76 s | 3.30 s | 0.80x | 0.43x | `1.47e-16` |
+| **Mono-RLK-49kK-Phase (0 PTL)** | Monolithic ($P=1$, 0 PTL) | 65,540 | 2,000 | 1.84 s | 2.17 s | 3.29 s | 0.85x | 0.56x | `1.10e-16` |
+| **Mono-RLK-49kK-Volt (0 PTL)** | Monolithic ($P=1$, 0 PTL, `-a 0`) | 65,540 | 2,000 | 2.35 s | 2.02 s | 3.32 s | **1.16x** | 0.71x | `2.38e-18` |
+| **NoPTL-SQUID-256 (8k JJs, 24k K)** | Multi-Channel (**0 PTL**, $P=256$) | 74,752 | 20,000 | 28.06 s | **1.76 s** | **9.21 s** | **15.90x** | **3.05x** | `2.46e-16` |
+| **NoPTL-SQUID-256-Volt (24k K)** | Multi-Channel (**0 PTL**, $P=256$, `-a 0`) | 74,752 | 20,000 | 29.49 s | **1.72 s** | **9.21 s** | **17.15x** | **3.20x** | `1.90e-18` |
+| **NoPTL-SQUID-1024 (32k JJs, 98k K)** | Multi-Channel (**0 PTL**, $P=1024$) | 299,008 | 10,000 | 75.82 s | **3.52 s** | **11.20 s** | **21.55x** | **6.77x** | `7.46e-17` |
+| **NoPTL-SQUID-4096 (131k JJs, 393k K)** | Multi-Channel (**0 PTL**, $P=4096$) | 1,196,032 | 5,000 | 185.79 s | **7.44 s** | **18.04 s** | **24.98x** | **10.30x** | `5.24e-17` |
+| **RSFQ-ALU-Macros-256 (24k K, 8k C)** | Rich RSFQ Macros ($P=256$) | 75,772 | 20,000 | 27.99 s | **1.77 s** | **9.33 s** | **15.80x** | **3.00x** | `2.12e-16` |
+| **RSFQ-ALU-Macros-1024 (98k K, 32k C)** | Rich RSFQ Macros ($P=1024$) | 303,100 | 10,000 | 72.81 s | **3.54 s** | **11.39 s** | **20.54x** | **6.39x** | `1.03e-16` |
+| **RSFQ-ALU-Macros-4096 (393k K, 131k C)** | Rich RSFQ Macros ($P=4096$) | 1,212,412 | 5,000 | 157.08 s | **7.50 s** | **18.29 s** | **20.93x** | **8.59x** | `6.96e-17` |
+
+### 5.2 Total End-to-End Wall-Clock Time (Parse + Matrix + Factorize + Sim + Binary Output)
+
+| Design | MNA Eqns | Steps | Serial (1T) | OpenMP (`-p`) | GPU (`-g`) | OpenMP Speedup | GPU Speedup |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Mono-2D-JJ-Grid (16k JJs, 0 PTL)** | 106,242 | 2,000 | 12.16 s | 11.65 s | 13.22 s | **1.04x** | 0.92x |
+| **Mono-RSFQ-Logic (8k JJs, 0 PTL)** | 47,108 | 2,000 | 1.61 s | 1.99 s | 4.05 s | 0.81x | 0.40x |
+| **Mono-RLK-49kK-Phase (0 PTL)** | 65,540 | 2,000 | 2.17 s | 2.54 s | 4.17 s | 0.85x | 0.52x |
+| **Mono-RLK-49kK-Volt (0 PTL)** | 65,540 | 2,000 | 2.69 s | 2.39 s | 4.23 s | **1.12x** | 0.64x |
+| **NoPTL-SQUID-256 (8k JJs, 24k K)** | 74,752 | 20,000 | 28.44 s | **2.17 s** | **10.16 s** | **13.12x** | **2.80x** |
+| **NoPTL-SQUID-256-Volt (24k K)** | 74,752 | 20,000 | 29.87 s | **2.12 s** | **10.19 s** | **14.11x** | **2.93x** |
+| **NoPTL-SQUID-1024 (32k JJs, 98k K)** | 299,008 | 10,000 | 77.42 s | **5.22 s** | **13.48 s** | **14.84x** | **5.74x** |
+| **NoPTL-SQUID-4096 (131k JJs, 393k K)** | 1,196,032 | 5,000 | 193.79 s | **14.61 s** | **25.97 s** | **13.27x** | **7.46x** |
+| **RSFQ-ALU-Macros-256 (24k K, 8k C)** | 75,772 | 20,000 | 28.37 s | **2.16 s** | **10.29 s** | **13.13x** | **2.76x** |
+| **RSFQ-ALU-Macros-1024 (98k K, 32k C)** | 303,100 | 10,000 | 74.43 s | **5.24 s** | **13.71 s** | **14.21x** | **5.43x** |
+| **RSFQ-ALU-Macros-4096 (393k K, 131k C)** | 1,212,412 | 5,000 | 164.04 s | **14.80 s** | **26.33 s** | **11.08x** | **6.23x** |
+
+### 5.3 Architectural Conclusions Across Topologies
+1. **Multi-Channel Non-PTL Circuits (`0 PTLs`, $P \ge 2$) Achieve `15.9x–25.0x` OpenMP Speedup and `3.1x–10.3x` GPU Speedup:**
+   - A circuit does **not** need PTLs to benefit from JoSIM's multi-step windowed solver: any multi-channel detector array, SQUID array, or parallel bit-slice netlist whose channels only share ground (`0`) is decomposed into $P$ independent KLU partitions with a `1,024`-step lookahead window, accelerating a **1.20-million-equation, 393k-mutual-inductance, 0-PTL circuit** from **185.79 s to 7.44 s (`24.98x`) on OpenMP** and **18.04 s (`10.30x`) on GPU** with `5.24e-17` numerical error.
+2. **Rich Component Mixes (`JJ + L + Mutual K + Cap C + R`) Scale Up to 1.21M Equations:**
+   - Adding 393,216 mutual couplings (`K`) and 131,072 explicit capacitors (`C`) increases each partition's matrix size from `165` equations (`PTL-Tile-*`) to `296` equations (`RSFQ-ALU-Macros-*`, $nnz(L_p + U_p) \approx 1,350$), achieving **`20.93x` OpenMP speedup** and **`8.59x` GPU speedup** at 1.21M equations.
+3. **Purely Monolithic Single-Component Circuits ($P = 1$, `0 PTLs`) Confirm the Sandia Xyce / `CUSPICE` Roofline:**
+   - When all nodes are galvanically/inductively coupled into a single component ($P = 1$) with zero PTLs, a single global triangular solve `klu_l_tsolve` must execute at every timestep. For $47\text{k}–65\text{k}$ equations in Phase mode, one serial timestep takes only `0.7–0.9 ms` inside CPU L3 cache, so thread synchronization or PCIe transfers exceed the device-evaluation savings. Once per-step device work grows via Voltage-mode mutual inductance sweeps (`Mono-RLK-49kK-Volt`, **`1.16x` OMP**) or $>100\text{k}$ equations (`Mono-2D-JJ-Grid`, **`1.06x` OMP**), parallel device evaluation reaches net speedup, while confirming why **partition-level parallelism ($P \ge 2$) or batched `.spread` execution (Tier 2)** is essential for order-of-magnitude speedups.

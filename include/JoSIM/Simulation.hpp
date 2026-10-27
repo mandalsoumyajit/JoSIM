@@ -118,6 +118,7 @@ class Simulation {
     void setup(Input& iObj, Matrix& mObj);
     void setup_partitions(Matrix& mObj);
     bool setup_gpu_solver(Matrix& mObj);
+    bool setup_gpu_monolithic(Matrix& mObj);
     void factorize_lu(Matrix& mObj);
     void refactor_lu(Matrix& mObj);
     void solve_lu(Matrix& mObj);
@@ -125,6 +126,7 @@ class Simulation {
     void trans_sim(Matrix& mObj);
     void trans_sim_omp_windowed(Matrix& mObj);
     void trans_sim_gpu_windowed(Matrix& mObj);
+    void trans_sim_gpu_monolithic(Matrix& mObj);
     void setup_b(Matrix& mObj, int64_t i, double step, double factor = 1);
     void reduce_step(Input& iObj, Matrix& mObj);
     void corrector_jj(Matrix& mObj);

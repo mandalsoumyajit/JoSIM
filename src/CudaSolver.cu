@@ -618,8 +618,6 @@ __global__ void advance_partitions_window_kernel(int32_t             nParts,
             __syncwarp();
             for (int32_t lIdx = part.indStart + lane; lIdx < part.indStart + part.indCount; lIdx += 32) {
                 GpuInd& ind = d_inds[lIdx];
-                ind.In4     = ind.In3;
-                ind.In3     = ind.In2;
                 ind.In2     = xPtr[ind.curIdx];
             }
         }
@@ -878,6 +876,193 @@ __global__ void advance_partitions_window_kernel(int32_t             nParts,
     }
 }
 
+// Multi-block monolithic kernel: evaluates all JJs, Resistors, Capacitors, and Inductors (+ Mutual L)
+// across all GPU SMs when the circuit is a single connected component (P = 1)
+__global__ void monolithic_eval_devices_kernel(int32_t       numJJs,
+                                               int32_t       numRess,
+                                               int32_t       numCaps,
+                                               int32_t       numInds,
+                                               int64_t       i,
+                                               int64_t       simSize,
+                                               double        stepSize,
+                                               int32_t       analysisType,
+                                               const double* __restrict__ d_x,
+                                               double*       __restrict__ d_b,
+                                               GpuJJ*        d_jjs,
+                                               GpuRes*       d_ress,
+                                               GpuInd*       d_inds,
+                                               const GpuMut* __restrict__ d_muts,
+                                               GpuCap*       d_caps,
+                                               const double* __restrict__ d_indIn2Old,
+                                               double*       __restrict__ d_indIn2New,
+                                               int32_t*      d_changedNzIdx,
+                                               double*       d_changedNzVal,
+                                               int32_t*      d_numChangedNz,
+                                               int32_t*      d_needsTR) {
+    const int32_t tid        = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool    checkPhase = (static_cast<double>(i) / static_cast<double>(simSize) > 0.01);
+
+    // 1. Evaluate Josephson Junction tid
+    if (tid < numJJs) {
+        GpuJJ& jj = d_jjs[tid];
+        if (jj.posIdx >= 0 && jj.negIdx < 0) {
+            jj.pn1 = d_x[jj.posIdx];
+        } else if (jj.posIdx < 0 && jj.negIdx >= 0) {
+            jj.pn1 = -d_x[jj.negIdx];
+        } else if (jj.posIdx >= 0 && jj.negIdx >= 0) {
+            jj.pn1 = d_x[jj.posIdx] - d_x[jj.negIdx];
+        } else {
+            jj.pn1 = 0.0;
+        }
+        if (i > 0) {
+            if (analysisType == 0) {
+                jj.vn1 = jj.pn1;
+                jj.pn1 = d_x[jj.varIdx];
+            } else {
+                jj.vn1 = d_x[jj.varIdx];
+            }
+        }
+        const double v0 = (5.0 / 2.0) * jj.vn1 - 2.0 * jj.vn2 + (1.0 / 2.0) * jj.vn3;
+        jj.phi0         = (4.0 / 3.0) * jj.pn1 - (1.0 / 3.0) * jj.pn2
+                  + ((1.0 / Constants::SIGMA) * ((2.0 * stepSize) / 3.0)) * v0;
+        if (checkPhase && fabs(jj.phi0 - jj.pn1) > (0.20 * 2.0 * Constants::PI)) {
+            atomicExch(d_needsTR, 1);
+            return;
+        }
+        if (analysisType == 0) {
+            d_b[jj.varIdx] = Constants::SIGMA
+                             * (-(2.0 / stepSize) * jj.pn1 + (1.0 / (2.0 * stepSize)) * jj.pn2);
+        } else {
+            d_b[jj.varIdx] = (4.0 / 3.0) * jj.pn1 - (1.0 / 3.0) * jj.pn2;
+        }
+        jj.pn4 = jj.pn3;
+        jj.pn3 = jj.pn2;
+        jj.pn2 = jj.pn1;
+        jj.vn6 = jj.vn5;
+        jj.vn5 = jj.vn4;
+        jj.vn4 = jj.vn3;
+        jj.vn3 = jj.vn2;
+
+        if (jj.rtype == 1) {
+            bool   updated = false;
+            double absV    = fabs(v0);
+            if (absV < jj.lowerB) {
+                jj.it = 0.0;
+                if (jj.curNzVal != jj.negInvSubgap) {
+                    jj.curNzVal = jj.negInvSubgap;
+                    updated     = true;
+                }
+            } else if (absV < jj.upperB) {
+                jj.it = jj.lowerB * ((1.0 / jj.r0) - jj.gLarge);
+                if (v0 < 0.0) { jj.it = -jj.it; }
+                if (jj.curNzVal != jj.negInvTrans) {
+                    jj.curNzVal = jj.negInvTrans;
+                    updated     = true;
+                }
+            } else {
+                jj.it = 0.0;
+                if (jj.curNzVal != jj.negInvNormal) {
+                    jj.curNzVal = jj.negInvNormal;
+                    updated     = true;
+                }
+            }
+            if (updated) {
+                const int32_t slot   = atomicAdd(d_numChangedNz, 1);
+                d_changedNzIdx[slot] = jj.nzIdx;
+                d_changedNzVal[slot] = jj.curNzVal;
+            }
+        }
+
+        double ic_sin_phi = 0.0;
+        if (jj.cprLen == 1) {
+            ic_sin_phi += jj.ic * (jj.cpr[0] * sin(1.0 * (jj.phi0 - jj.phiOff)));
+        } else {
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                ic_sin_phi += jj.ic * (jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff)));
+            }
+        }
+        jj.cTerm = -(((2.0 * jj.c) / stepSize) * jj.vn1) + ((jj.c / (2.0 * stepSize)) * jj.vn2);
+        if (!jj.tDep) {
+            d_b[jj.curIdx] = jj.curNzVal
+                             * (ic_sin_phi - (((2.0 * jj.c) / stepSize) * jj.vn1)
+                                + ((jj.c / (2.0 * stepSize)) * jj.vn2) + jj.it);
+        } else {
+            double sin2_half_phi = 0.0;
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                sin2_half_phi += jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff) / 2.0);
+            }
+            sin2_half_phi  = sin2_half_phi * sin2_half_phi;
+            double sin_phi = 0.0;
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                sin_phi += jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff));
+            }
+            double sqrt_part = sqrt(1.0 - jj.d * sin2_half_phi);
+            d_b[jj.curIdx]   = jj.curNzVal
+                             * ((((Constants::PI * jj.del) / (2.0 * Constants::EV * jj.rn))
+                                 * (sin_phi / sqrt_part)
+                                 * tanh(jj.del / (2.0 * Constants::BOLTZMANN * jj.t) * sqrt_part))
+                                - (((2.0 * jj.c) / stepSize) * jj.vn1)
+                                + ((jj.c / (2.0 * stepSize)) * jj.vn2) + jj.it);
+        }
+        jj.vn2 = jj.vn1;
+    }
+
+    // 2. Evaluate Resistor tid (Phase mode only)
+    if (analysisType == 1 && tid < numRess) {
+        GpuRes& res = d_ress[tid];
+        if (res.posIdx >= 0 && res.negIdx < 0) {
+            res.pn1 = d_x[res.posIdx];
+        } else if (res.posIdx < 0 && res.negIdx >= 0) {
+            res.pn1 = -d_x[res.negIdx];
+        } else if (res.posIdx >= 0 && res.negIdx >= 0) {
+            res.pn1 = d_x[res.posIdx] - d_x[res.negIdx];
+        } else {
+            res.pn1 = 0.0;
+        }
+        d_b[res.curIdx] = (4.0 / 3.0) * res.pn1 - (1.0 / 3.0) * res.pn2;
+        res.pn2         = res.pn1;
+    }
+
+    // 3. Evaluate Capacitor tid
+    if (tid < numCaps) {
+        GpuCap& cap = d_caps[tid];
+        if (cap.posIdx >= 0 && cap.negIdx < 0) {
+            cap.pn1 = d_x[cap.posIdx];
+        } else if (cap.posIdx < 0 && cap.negIdx >= 0) {
+            cap.pn1 = -d_x[cap.negIdx];
+        } else if (cap.posIdx >= 0 && cap.negIdx >= 0) {
+            cap.pn1 = d_x[cap.posIdx] - d_x[cap.negIdx];
+        } else {
+            cap.pn1 = 0.0;
+        }
+        if (analysisType == 0) {
+            d_b[cap.curIdx] = (4.0 / 3.0) * cap.pn1 - (1.0 / 3.0) * cap.pn2;
+        } else {
+            d_b[cap.curIdx] = (8.0 / 3.0) * cap.pn1 - (22.0 / 9.0) * cap.pn2
+                              + (8.0 / 9.0) * cap.pn3 - (1.0 / 9.0) * cap.pn4;
+            cap.pn4 = cap.pn3;
+            cap.pn3 = cap.pn2;
+        }
+        cap.pn2 = cap.pn1;
+    }
+
+    // 4. Evaluate Inductor tid + Mutual Inductances (Voltage mode only)
+    if (analysisType == 0 && tid < numInds) {
+        const GpuInd ind  = d_inds[tid];
+        const double h    = stepSize;
+        const double curI = d_x[ind.curIdx];
+        double       bVal = -(2.0 * ind.L / h) * curI + ((ind.L / (2.0 * h)) * d_indIn2Old[tid]);
+        for (int32_t mIdx = ind.mutStart; mIdx < ind.mutStart + ind.mutCount; ++mIdx) {
+            const GpuMut mut  = d_muts[mIdx];
+            const double mIn2 = (mut.targetIndIdx < tid) ? d_x[mut.targetCurIdx]
+                                                         : d_indIn2Old[mut.targetIndIdx];
+            bVal += (-((2.0 * mut.M) / h) * d_x[mut.targetCurIdx] + (mut.M / (2.0 * h)) * mIn2);
+        }
+        d_b[ind.curIdx]  = bVal;
+        d_indIn2New[tid] = curI;
+    }
+}
+
 } // namespace
 
 CudaPartitionSolver::~CudaPartitionSolver() { free_device(); }
@@ -1086,6 +1271,122 @@ bool CudaPartitionSolver::step_window(int64_t i0, int64_t i1, const double* h_sr
     return (h_needsTR == 0);
 }
 
+bool CudaPartitionSolver::initialize_monolithic(int32_t                    totalRows,
+                                                int64_t                    simSize,
+                                                double                     stepSize,
+                                                int32_t                    analysisType,
+                                                const std::vector<double>& xInit,
+                                                const std::vector<GpuJJ>&  jjs,
+                                                const std::vector<GpuRes>& ress,
+                                                const std::vector<GpuInd>& inds,
+                                                const std::vector<GpuMut>& muts,
+                                                const std::vector<GpuCap>& caps) {
+    free_device();
+
+    int deviceCount = 0;
+    if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount <= 0) { return false; }
+
+    nParts_       = 1;
+    totalRows_    = totalRows;
+    numJJs_       = static_cast<int32_t>(jjs.size());
+    numRess_      = static_cast<int32_t>(ress.size());
+    numInds_      = static_cast<int32_t>(inds.size());
+    numCaps_      = static_cast<int32_t>(caps.size());
+    simSize_      = simSize;
+    stepSize_     = stepSize;
+    analysisType_ = analysisType;
+
+    if (!alloc_and_upload(&d_xLocal_, xInit)) { return false; }
+    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_bLocal_), totalRows_ * sizeof(double)));
+
+    if (!alloc_and_upload(&d_jjs_, jjs)) { return false; }
+    if (!alloc_and_upload(&d_ress_, ress)) { return false; }
+    if (!alloc_and_upload(&d_inds_, inds)) { return false; }
+    if (!alloc_and_upload(&d_muts_, muts)) { return false; }
+    if (!alloc_and_upload(&d_caps_, caps)) { return false; }
+
+    if (numInds_ > 0) {
+        std::vector<double> indIn2(numInds_, 0.0);
+        for (int32_t idx = 0; idx < numInds_; ++idx) { indIn2[idx] = inds[idx].In2; }
+        if (!alloc_and_upload(&d_indIn2Old_, indIn2)) { return false; }
+        JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_indIn2New_), numInds_ * sizeof(double)));
+    }
+    if (numJJs_ > 0) {
+        JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_changedNzIdx_), numJJs_ * sizeof(int32_t)));
+        JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_changedNzVal_), numJJs_ * sizeof(double)));
+    }
+    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_numChangedNz_), sizeof(int32_t)));
+    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_needsTR_), sizeof(int32_t)));
+    JOSIM_CUDA_CHECK(cudaMemset(d_needsTR_, 0, sizeof(int32_t)));
+
+    initialized_ = true;
+    return true;
+}
+
+bool CudaPartitionSolver::step_monolithic_devices(
+        int64_t                                 i,
+        const double*                           h_x,
+        double*                                 h_b,
+        std::vector<std::pair<int32_t, double>>& changedNz) {
+    changedNz.clear();
+    if (i > 0) {
+        JOSIM_CUDA_CHECK(
+                cudaMemcpy(d_xLocal_, h_x, totalRows_ * sizeof(double), cudaMemcpyHostToDevice));
+    }
+    JOSIM_CUDA_CHECK(cudaMemset(d_bLocal_, 0, totalRows_ * sizeof(double)));
+    JOSIM_CUDA_CHECK(cudaMemset(d_numChangedNz_, 0, sizeof(int32_t)));
+
+    const int32_t nResWork = (analysisType_ == 1) ? numRess_ : 0;
+    const int32_t nIndWork = (analysisType_ == 0) ? numInds_ : 0;
+    const int32_t maxItems = std::max(std::max(numJJs_, nResWork), std::max(numCaps_, nIndWork));
+    if (maxItems > 0) {
+        const int32_t block  = 256;
+        const int32_t blocks = (maxItems + block - 1) / block;
+        monolithic_eval_devices_kernel<<<blocks, block>>>(numJJs_,
+                                                          numRess_,
+                                                          numCaps_,
+                                                          numInds_,
+                                                          i,
+                                                          simSize_,
+                                                          stepSize_,
+                                                          analysisType_,
+                                                          d_xLocal_,
+                                                          d_bLocal_,
+                                                          d_jjs_,
+                                                          d_ress_,
+                                                          d_inds_,
+                                                          d_muts_,
+                                                          d_caps_,
+                                                          d_indIn2Old_,
+                                                          d_indIn2New_,
+                                                          d_changedNzIdx_,
+                                                          d_changedNzVal_,
+                                                          d_numChangedNz_,
+                                                          d_needsTR_);
+        if (analysisType_ == 0 && numInds_ > 0) { std::swap(d_indIn2Old_, d_indIn2New_); }
+    }
+
+    int32_t h_needsTR = 0;
+    JOSIM_CUDA_CHECK(cudaMemcpy(&h_needsTR, d_needsTR_, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    if (h_needsTR != 0) { return false; }
+
+    int32_t h_numChanged = 0;
+    JOSIM_CUDA_CHECK(cudaMemcpy(&h_numChanged, d_numChangedNz_, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    if (h_numChanged > 0) {
+        std::vector<int32_t> h_idx(h_numChanged);
+        std::vector<double>  h_val(h_numChanged);
+        JOSIM_CUDA_CHECK(cudaMemcpy(
+                h_idx.data(), d_changedNzIdx_, h_numChanged * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        JOSIM_CUDA_CHECK(cudaMemcpy(
+                h_val.data(), d_changedNzVal_, h_numChanged * sizeof(double), cudaMemcpyDeviceToHost));
+        changedNz.reserve(h_numChanged);
+        for (int32_t k = 0; k < h_numChanged; ++k) { changedNz.emplace_back(h_idx[k], h_val[k]); }
+    }
+
+    JOSIM_CUDA_CHECK(cudaMemcpy(h_b, d_bLocal_, totalRows_ * sizeof(double), cudaMemcpyDeviceToHost));
+    return true;
+}
+
 void CudaPartitionSolver::download_results(std::vector<double>& h_traceOut,
                                            std::vector<double>& h_xFinal) {
     if (!initialized_) { return; }
@@ -1114,6 +1415,10 @@ void CudaPartitionSolver::free_device() {
     safe_cuda_free(d_bLocal_);
     safe_cuda_free(d_yLocal_);
     safe_cuda_free(d_indIn2Old_);
+    safe_cuda_free(d_indIn2New_);
+    safe_cuda_free(d_changedNzIdx_);
+    safe_cuda_free(d_changedNzVal_);
+    safe_cuda_free(d_numChangedNz_);
     safe_cuda_free(d_jjs_);
     safe_cuda_free(d_ress_);
     safe_cuda_free(d_inds_);
@@ -1134,6 +1439,14 @@ void CudaPartitionSolver::free_device() {
     safe_cuda_free(d_keptSlot_);
     safe_cuda_free(d_traceOut_);
     safe_cuda_free(d_needsTR_);
+    if (h_xPinned_ != nullptr) {
+        cudaFreeHost(h_xPinned_);
+        h_xPinned_ = nullptr;
+    }
+    if (h_bPinned_ != nullptr) {
+        cudaFreeHost(h_bPinned_);
+        h_bPinned_ = nullptr;
+    }
     initialized_ = false;
 }
 

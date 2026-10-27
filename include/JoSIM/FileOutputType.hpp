@@ -10,7 +10,7 @@
 
 namespace JoSIM {
 
-enum class FileOutputType { Csv = 0, Dat = 1, Raw = 2 };
+enum class FileOutputType { Csv = 0, Dat = 1, Raw = 2, Bin = 3, Npy = 4, RawBin = 5 };
 
 class OutputFile {
   private:
@@ -42,6 +42,12 @@ class OutputFile {
             type_ = FileOutputType::Dat;
         } else if (ext == ".RAW") {
             type_ = FileOutputType::Raw;
+        } else if (ext == ".BIN") {
+            type_ = FileOutputType::Bin;
+        } else if (ext == ".NPY") {
+            type_ = FileOutputType::Npy;
+        } else if (ext == ".RAWB") {
+            type_ = FileOutputType::RawBin;
         } else {
             Errors::cli_errors(CLIErrors::UNKNOWN_OUTPUT_TYPE, ext);
             type_ = FileOutputType::Csv;

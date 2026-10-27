@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -29,22 +30,38 @@ Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
     write_output(iObj, mObj, sObj);
     // Format the output into the relevant type
     if (iObj.cli_output_file) {
-        if (iObj.cli_output_file.value().type() == FileOutputType::Csv) {
-            format_csv_or_dat(iObj.cli_output_file.value().name(), ',', iObj.argMin);
-        } else if (iObj.cli_output_file.value().type() == FileOutputType::Dat) {
-            format_csv_or_dat(iObj.cli_output_file.value().name(), ' ', iObj.argMin);
-        } else if (iObj.cli_output_file.value().type() == FileOutputType::Raw) {
-            format_raw(iObj.cli_output_file.value().name(), iObj.argMin);
+        const auto outType = iObj.cli_output_file.value().type();
+        const auto outName = iObj.cli_output_file.value().name();
+        if (outType == FileOutputType::Csv) {
+            format_csv_or_dat(outName, ',', iObj.argMin);
+        } else if (outType == FileOutputType::Dat) {
+            format_csv_or_dat(outName, ' ', iObj.argMin);
+        } else if (outType == FileOutputType::Raw) {
+            format_raw(outName, iObj.argMin);
+        } else if (outType == FileOutputType::Bin) {
+            format_bin(outName, iObj.argMin);
+        } else if (outType == FileOutputType::Npy) {
+            format_npy(outName, iObj.argMin);
+        } else if (outType == FileOutputType::RawBin) {
+            format_raw_bin(outName, iObj.argMin);
         }
     }
     if (!iObj.output_files.empty()) {
         for (auto i = 0; i < iObj.output_files.size(); ++i) {
-            if (iObj.output_files.at(i).type() == FileOutputType::Csv) {
-                format_csv_or_dat(iObj.output_files.at(i).name(), ',', iObj.argMin, i);
-            } else if (iObj.output_files.at(i).type() == FileOutputType::Dat) {
-                format_csv_or_dat(iObj.output_files.at(i).name(), ' ', iObj.argMin, i);
-            } else if (iObj.output_files.at(i).type() == FileOutputType::Raw) {
-                format_raw(iObj.output_files.at(i).name(), iObj.argMin, i);
+            const auto outType = iObj.output_files.at(i).type();
+            const auto outName = iObj.output_files.at(i).name();
+            if (outType == FileOutputType::Csv) {
+                format_csv_or_dat(outName, ',', iObj.argMin, i);
+            } else if (outType == FileOutputType::Dat) {
+                format_csv_or_dat(outName, ' ', iObj.argMin, i);
+            } else if (outType == FileOutputType::Raw) {
+                format_raw(outName, iObj.argMin, i);
+            } else if (outType == FileOutputType::Bin) {
+                format_bin(outName, iObj.argMin, i);
+            } else if (outType == FileOutputType::Npy) {
+                format_npy(outName, iObj.argMin, i);
+            } else if (outType == FileOutputType::RawBin) {
+                format_raw_bin(outName, iObj.argMin, i);
             }
         }
     }
@@ -321,9 +338,9 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
             bar.set_status_text("Formatting Output");
             bar.set_total((float) mObj.nm.size());
         }
-        int64_t cc = 0;
+        std::vector<int64_t> nodeIndices;
+        nodeIndices.reserve(mObj.nm.size());
         for (const auto& i : mObj.nm) {
-            if (!iObj.argMin) { bar.update(static_cast<float>(cc)); }
             if (iObj.argAnal == AnalysisType::Voltage) {
                 traces.emplace_back("V(" + i.first + ")");
                 traces.back().type_ = 'V';
@@ -331,23 +348,39 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                 traces.emplace_back("P(" + i.first + ")");
                 traces.back().type_ = 'P';
             }
-            // FIR filter, then push into trace
-            auto xsize = x.at(i.second).value().size();
+            traces.back().data_.reserve(result_indices.size());
+            nodeIndices.push_back(i.second);
+        }
+        const int64_t nNodes      = static_cast<int64_t>(nodeIndices.size());
+        auto          process_node = [&](int64_t idx) {
+            if (!iObj.argMin && idx % 64 == 0) { bar.update(static_cast<float>(idx)); }
+            auto&                      outTrace = traces[idx + 1];
+            const std::vector<double>& xv       = *x[nodeIndices[idx]];
+            const size_t               xsize    = xv.size();
+            const double*              xvPtr    = xv.data();
             for (auto j : result_indices) {
                 double accumulator = 0.;
                 for (int64_t k = 0; k < firsize; k++) {
                     int64_t jk = j + halffirsize - k;
-                    // Sample only valid indices
                     if (jk < 0) {
                         jk = 0;
                     } else if (static_cast<size_t>(jk) >= xsize) {
                         jk = xsize - 1;
                     }
-                    accumulator += firwindow.at(k) * x.at(i.second).value().at(jk);
+                    accumulator += firwindow[k] * xvPtr[jk];
                 }
-                traces.back().data_.emplace_back(accumulator);
+                outTrace.data_.emplace_back(accumulator);
             }
-            ++cc;
+        };
+#ifdef _OPENMP
+        if (iObj.argPar && nNodes >= 2) {
+            const int nThreads = std::min<int>(omp_get_max_threads(), static_cast<int>(nNodes));
+#pragma omp parallel for schedule(static) num_threads(nThreads)
+            for (int64_t idx = 0; idx < nNodes; ++idx) { process_node(idx); }
+        } else
+#endif
+        {
+            for (int64_t idx = 0; idx < nNodes; ++idx) { process_node(idx); }
         }
         if (!iObj.argMin) {
             bar.update(100);
@@ -381,12 +414,14 @@ void Output::format_csv_or_dat(const std::string& filename, const char& delimite
             bar.set_total((float) numRows);
         }
         outfile << std::scientific << std::setprecision(6);
+        std::vector<const double*> colPtrs(numCols);
+        for (size_t i = 0; i < numCols; ++i) { colPtrs[i] = traces[tIndices[i]].data_.data(); }
         for (size_t j = 0; j < numRows; ++j) {
             if (!argmin) { bar.update(static_cast<float>(j)); }
             for (size_t i = 0; i < numCols - 1; ++i) {
-                outfile << traces[tIndices[i]].data_[j] << delimiter;
+                outfile << colPtrs[i][j] << delimiter;
             }
-            outfile << traces[tIndices[numCols - 1]].data_[j] << "\n";
+            outfile << colPtrs[numCols - 1][j] << "\n";
         }
         if (!argmin) {
             bar.complete();
@@ -394,6 +429,195 @@ void Output::format_csv_or_dat(const std::string& filename, const char& delimite
         }
     } else {
         Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
+    }
+}
+
+void Output::format_bin(const std::string& filename, bool argmin, int64_t fIndex) {
+    std::vector<int64_t> tIndices = {0};
+    for (size_t i = 1; i < traces.size(); ++i) {
+        if (traces[i].fileIndex == fIndex || fIndex == -1) { tIndices.emplace_back(i); }
+    }
+    std::ofstream outfile(filename, std::ios::out | std::ios::binary);
+    if (!outfile.is_open()) {
+        Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
+        return;
+    }
+    if (traces.empty()) {
+        Errors::output_errors(OutputErrors::NOTHING_SPECIFIED);
+        return;
+    }
+    const uint64_t numCols   = static_cast<uint64_t>(tIndices.size());
+    const uint64_t numRows   = static_cast<uint64_t>(traces[0].data_.size());
+    const uint32_t version   = 1;
+    const uint32_t flags     = 0;
+    const char     magic[8]  = {'J', 'O', 'S', 'I', 'M', 'B', 'I', 'N'};
+
+    outfile.write(magic, 8);
+    outfile.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
+    outfile.write(reinterpret_cast<const char*>(&flags), sizeof(uint32_t));
+    outfile.write(reinterpret_cast<const char*>(&numCols), sizeof(uint64_t));
+    outfile.write(reinterpret_cast<const char*>(&numRows), sizeof(uint64_t));
+
+    for (size_t c = 0; c < numCols; ++c) {
+        const auto&    tr      = traces[tIndices[c]];
+        const uint32_t nameLen = static_cast<uint32_t>(tr.name_.size());
+        outfile.write(reinterpret_cast<const char*>(&nameLen), sizeof(uint32_t));
+        outfile.write(tr.name_.data(), nameLen);
+        outfile.write(&tr.type_, 1);
+    }
+
+    ProgressBar bar;
+    if (!argmin) {
+        bar.create_thread();
+        bar.set_bar_width(30);
+        bar.fill_bar_progress_with("O");
+        bar.fill_bar_remainder_with(" ");
+        bar.set_status_text("Writing Binary Output");
+        bar.set_total(static_cast<float>(numCols));
+    }
+    const std::streamsize colBytes = static_cast<std::streamsize>(numRows * sizeof(double));
+    for (size_t c = 0; c < numCols; ++c) {
+        if (!argmin) { bar.update(static_cast<float>(c)); }
+        outfile.write(reinterpret_cast<const char*>(traces[tIndices[c]].data_.data()), colBytes);
+    }
+    if (!argmin) {
+        bar.complete();
+        std::cout << "\n\n";
+    }
+}
+
+void Output::format_npy(const std::string& filename, bool argmin, int64_t fIndex) {
+    std::vector<int64_t> tIndices = {0};
+    for (size_t i = 1; i < traces.size(); ++i) {
+        if (traces[i].fileIndex == fIndex || fIndex == -1) { tIndices.emplace_back(i); }
+    }
+    std::ofstream outfile(filename, std::ios::out | std::ios::binary);
+    if (!outfile.is_open()) {
+        Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
+        return;
+    }
+    if (traces.empty()) {
+        Errors::output_errors(OutputErrors::NOTHING_SPECIFIED);
+        return;
+    }
+    const size_t numCols = tIndices.size();
+    const size_t numRows = traces[0].data_.size();
+
+    std::string dict = "{'descr': [";
+    for (size_t c = 0; c < numCols; ++c) {
+        std::string name = traces[tIndices[c]].name_;
+        if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+            name = name.substr(1, name.size() - 2);
+        }
+        std::string escaped;
+        escaped.reserve(name.size());
+        for (char ch : name) {
+            if (ch == '\'' || ch == '\\') { escaped.push_back('\\'); }
+            escaped.push_back(ch);
+        }
+        dict += "('" + escaped + "', '<f8')";
+        if (c + 1 < numCols) { dict += ", "; }
+    }
+    dict += "], 'fortran_order': False, 'shape': (" + std::to_string(numRows) + ",), }";
+
+    const bool   useV2     = (10 + dict.size() + 1 > 65535);
+    const size_t prefixLen = useV2 ? 12 : 10;
+    const size_t rem       = (prefixLen + dict.size() + 1) % 64;
+    const size_t padLen    = (rem == 0) ? 0 : (64 - rem);
+    dict.append(padLen, ' ');
+    dict.push_back('\n');
+
+    const char magic[6] = {'\x93', 'N', 'U', 'M', 'P', 'Y'};
+    outfile.write(magic, 6);
+    if (!useV2) {
+        const char     ver[2]  = {'\x01', '\x00'};
+        const uint16_t hdrSize = static_cast<uint16_t>(dict.size());
+        outfile.write(ver, 2);
+        outfile.write(reinterpret_cast<const char*>(&hdrSize), sizeof(uint16_t));
+    } else {
+        const char     ver[2]  = {'\x02', '\x00'};
+        const uint32_t hdrSize = static_cast<uint32_t>(dict.size());
+        outfile.write(ver, 2);
+        outfile.write(reinterpret_cast<const char*>(&hdrSize), sizeof(uint32_t));
+    }
+    outfile.write(dict.data(), static_cast<std::streamsize>(dict.size()));
+
+    std::vector<const double*> colPtrs(numCols);
+    for (size_t c = 0; c < numCols; ++c) { colPtrs[c] = traces[tIndices[c]].data_.data(); }
+
+    const size_t        rowsPerChunk = std::max<size_t>(1, 32768 / std::max<size_t>(1, numCols));
+    std::vector<double> chunkBuf(rowsPerChunk * numCols);
+    for (size_t rowStart = 0; rowStart < numRows; rowStart += rowsPerChunk) {
+        const size_t rowEnd = std::min(numRows, rowStart + rowsPerChunk);
+        const size_t count  = rowEnd - rowStart;
+        for (size_t r = 0; r < count; ++r) {
+            double*       dst = &chunkBuf[r * numCols];
+            const size_t  j   = rowStart + r;
+            for (size_t c = 0; c < numCols; ++c) { dst[c] = colPtrs[c][j]; }
+        }
+        outfile.write(reinterpret_cast<const char*>(chunkBuf.data()),
+                      static_cast<std::streamsize>(count * numCols * sizeof(double)));
+    }
+}
+
+void Output::format_raw_bin(const std::string& filename, bool argmin, int64_t fIndex) {
+    std::vector<int64_t> tIndices = {0};
+    for (size_t i = 1; i < traces.size(); ++i) {
+        if (traces[i].fileIndex == fIndex || fIndex == -1) { tIndices.emplace_back(i); }
+    }
+    std::ofstream outfile(filename, std::ios::out | std::ios::binary);
+    if (!outfile.is_open()) {
+        Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
+        return;
+    }
+    if (traces.empty()) {
+        Errors::output_errors(OutputErrors::NOTHING_SPECIFIED);
+        return;
+    }
+    const size_t numCols = tIndices.size();
+    const size_t numRows = traces[0].data_.size();
+
+    outfile << "Title: " << std::filesystem::path(filename).stem().string() << "\n";
+    std::time_t result = std::time(nullptr);
+    outfile << "Date: " << std::asctime(std::localtime(&result));
+    outfile << "Plotname: Transient Analysis\n";
+    outfile << "Flags: real\n";
+    outfile << "No. Variables: " << numCols << "\n";
+    outfile << "No. Points: " << numRows << "\n";
+    outfile << "Command: JoSIM v" << VERSION << "\n";
+    outfile << "Variables:\n";
+    outfile << " 0 time Seconds\n";
+    for (size_t i = 1; i < numCols; ++i) {
+        std::string name = traces[tIndices[i]].name_;
+        name.erase(std::remove(name.begin(), name.end(), '\"'), name.end());
+        const char t = traces[tIndices[i]].type_;
+        if (t == 'V') {
+            outfile << " " << i << " " << name << " Voltage\n";
+        } else if (t == 'P') {
+            outfile << " " << i << " " << name << " Phase\n";
+        } else if (t == 'I') {
+            std::replace(name.begin(), name.end(), '|', '.');
+            if (name.size() > 3) { name = name.substr(2, name.size() - 3); }
+            outfile << " " << i << " " << name << "#branch Current\n";
+        }
+    }
+    outfile << "Binary:\n";
+
+    std::vector<const double*> colPtrs(numCols);
+    for (size_t c = 0; c < numCols; ++c) { colPtrs[c] = traces[tIndices[c]].data_.data(); }
+
+    const size_t        rowsPerChunk = std::max<size_t>(1, 32768 / std::max<size_t>(1, numCols));
+    std::vector<double> chunkBuf(rowsPerChunk * numCols);
+    for (size_t rowStart = 0; rowStart < numRows; rowStart += rowsPerChunk) {
+        const size_t rowEnd = std::min(numRows, rowStart + rowsPerChunk);
+        const size_t count  = rowEnd - rowStart;
+        for (size_t r = 0; r < count; ++r) {
+            double*       dst = &chunkBuf[r * numCols];
+            const size_t  j   = rowStart + r;
+            for (size_t c = 0; c < numCols; ++c) { dst[c] = colPtrs[c][j]; }
+        }
+        outfile.write(reinterpret_cast<const char*>(chunkBuf.data()),
+                      static_cast<std::streamsize>(count * numCols * sizeof(double)));
     }
 }
 

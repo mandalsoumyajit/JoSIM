@@ -59,7 +59,8 @@ TransmissionLine::TransmissionLine(const std::pair<tokens_t, string_o>& s,
                                    const param_map&                     pm,
                                    const AnalysisType&                  at,
                                    const double&                        h,
-                                   int64_t&                             bi) {
+                                   int64_t&                             bi,
+                                   bool                                 txInterp) {
     at_ = at;
     // Check if the label has already been defined
     if (lm.count(s.first.at(0)) != 0) {
@@ -69,6 +70,9 @@ TransmissionLine::TransmissionLine(const std::pair<tokens_t, string_o>& s,
     netlistInfo.label_ = s.first.at(0);
     // Add the label to the known labels list
     lm.emplace(s.first.at(0));
+    bool   useInterp = txInterp;
+    double rawTd     = 0.0;
+    bool   hasTd     = false;
     // Find the parts that contain the impedance and time delay
     for (auto i = 5; i < s.first.size(); ++i) {
         // Impedance
@@ -89,7 +93,28 @@ TransmissionLine::TransmissionLine(const std::pair<tokens_t, string_o>& s,
                 Errors::invalid_component_errors(ComponentErrors::INVALID_TX_DEFINED, Misc::vector_to_string(s.first));
             }
             // Set the time delay (TD), this should be a value
-            timestepDelay_ = static_cast<int64_t>(std::round(parse_param(s.first.at(i).substr(3), pm, s.second) / h));
+            rawTd = parse_param(s.first.at(i).substr(3), pm, s.second);
+            hasTd = true;
+        }
+        if (s.first.at(i) == "INTERP=1" || s.first.at(i) == "INTERP=TRUE") {
+            useInterp = true;
+        } else if (s.first.at(i) == "INTERP=0" || s.first.at(i) == "INTERP=FALSE") {
+            useInterp = false;
+        }
+    }
+    if (hasTd) {
+        if (useInterp) {
+            const double exactSteps = rawTd / h;
+            timestepDelay_          = static_cast<int64_t>(std::floor(exactSteps + 1e-12));
+            fracDelay_              = exactSteps - static_cast<double>(timestepDelay_);
+            if (fracDelay_ < 1e-12) { fracDelay_ = 0.0; }
+            if (1.0 - fracDelay_ < 1e-12) {
+                timestepDelay_ += 1;
+                fracDelay_      = 0.0;
+            }
+        } else {
+            timestepDelay_ = static_cast<int64_t>(std::round(rawTd / h));
+            fracDelay_     = 0.0;
         }
     }
     // Set the node configuration type

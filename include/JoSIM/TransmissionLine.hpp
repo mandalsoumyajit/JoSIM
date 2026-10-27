@@ -61,6 +61,7 @@ class TransmissionLine : public BasicComponent {
     double     n1_1_ = 0.0, n1_2_ = 0.0, n2_1_ = 0.0, n2_2_ = 0.0;
     double     nk_1_ = 0.0, nk_2_ = 0.0, nk1_1_ = 0.0, nk1_2_ = 0.0, nk2_1_ = 0.0, nk2_2_ = 0.0;
     int64_t    timestepDelay_ = 0;
+    double     fracDelay_     = 0.0;
 
     TransmissionLine(const std::pair<tokens_t, string_o>& s,
                      const NodeConfig&                    ncon,
@@ -71,7 +72,8 @@ class TransmissionLine : public BasicComponent {
                      const param_map&                     pm,
                      const AnalysisType&                  at,
                      const double&                        h,
-                     int64_t&                             bi);
+                     int64_t&                             bi,
+                     bool                                 txInterp = false);
 
     void set_secondary_node_indices(const tokens_t& t, const nodemap& nm, nodeconnections& nc);
     void set_secondary_matrix_info();

@@ -32,10 +32,17 @@ class Input {
     std::optional<OutputFile>                    cli_output_file;
     std::vector<OutputFile>                      output_files;
     std::optional<std::string>                   fileParentPath;
-    AnalysisType                                 argAnal;
-    int64_t                                      argVerb;
-    bool                                         argMin;
-    bool                                         argPar = false;
+    AnalysisType                                                 argAnal;
+    int64_t                                                      argVerb;
+    bool                                                         argMin;
+    bool                                                         argPar          = false;
+    bool                                                         argFixedStep    = false;
+    bool                                                         argWarnStep     = false;
+    bool                                                         argTxInterp     = false;
+    int64_t                                                      argCorrector    = 0;
+    double                                                       argCorrectorTol = 1e-3;
+    std::optional<std::pair<std::string, std::optional<double>>> saveStateFile;
+    std::optional<std::string>                                   loadStateFile;
 
     Input(AnalysisType at = AnalysisType::Phase, int64_t verb = 0, bool min = false, bool par = false)
         : argAnal(at), argVerb(verb), argMin(min), argPar(par) {};
@@ -45,6 +52,8 @@ class Input {
         argVerb                    = cli_options.verbose;
         argMin                     = cli_options.minimal;
         argPar                     = cli_options.parallel;
+        argFixedStep               = cli_options.fixedStep;
+        argCorrector               = cli_options.corrector;
         cli_output_file            = cli_options.output_file;
         netlist.sanityCheck        = cli_options.sanityCheck;
         netlist.sanityCheckSubckts = cli_options.sanityCheckSubckts;
@@ -53,6 +62,7 @@ class Input {
     std::vector<tokens_t> read_input(LineInput& input, string_o fileName = std::nullopt);
     void                  parse_input(string_o fileName = std::nullopt);
     void                  syntax_check_controls(std::vector<tokens_t>& controls);
+    void                  parse_options_and_state_controls();
 
   private:
     std::optional<uint64_t> find_seed_option() const;

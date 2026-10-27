@@ -85,6 +85,17 @@ std::vector<tokens_t> Input::read_input(LineInput& input, string_o fileName) {
                     output_files.emplace_back(OutputFile(path.string()));
                 }
                 fileLines.emplace_back(tokens);
+                // Preserve file path case for state checkpoint commands
+            } else if (tokens.at(0) == ".SAVESTATE" || tokens.at(0) == "SAVESTATE" || tokens.at(0) == ".SAVEBIAS"
+                       || tokens.at(0) == "SAVEBIAS" || tokens.at(0) == ".LOADSTATE" || tokens.at(0) == "LOADSTATE"
+                       || tokens.at(0) == ".LOADBIAS" || tokens.at(0) == "LOADBIAS") {
+                if (tokens.size() > 2) {
+                    std::transform(tokens.begin() + 2, tokens.end(), tokens.begin() + 2, [](std::string& c) -> std::string {
+                        std::transform(c.begin(), c.end(), c.begin(), toupper);
+                        return c;
+                    });
+                }
+                fileLines.emplace_back(tokens);
                 // If the line contains a "END" statement
             } else if (tokens.at(0) == ".END" || tokens.at(0) == "END") {
                 break;
@@ -249,6 +260,7 @@ void Input::parse_input(string_o fileName) {
     }
     // Sanity check all conrols for syntax and functionality
     syntax_check_controls(controls);
+    parse_options_and_state_controls();
     // Seed deterministic RNG streams (noise + spread) once per parsed run.
     if (auto seed = find_seed_option(); seed.has_value()) {
         Rng::start_run(*seed);
@@ -267,11 +279,67 @@ void Input::parse_input(string_o fileName) {
 
 void Input::syntax_check_controls(std::vector<tokens_t>& controls) {
     // This will simply check controls, complaining if any are not allowed
-    std::vector<std::string> v
-            = {"PRINT", "TRAN", "SAVE", "PLOT", "END", "TEMP", "NEB", "SPREAD", "FILE", "IV", "OPTION"};
+    std::vector<std::string> v = {"PRINT",
+                                  "TRAN",
+                                  "SAVE",
+                                  "PLOT",
+                                  "END",
+                                  "TEMP",
+                                  "NEB",
+                                  "SPREAD",
+                                  "FILE",
+                                  "IV",
+                                  "OPTION",
+                                  "SAVESTATE",
+                                  "LOADSTATE",
+                                  "SAVEBIAS",
+                                  "LOADBIAS"};
     for (auto i : controls) {
         if (std::find(v.begin(), v.end(), i.at(0)) == v.end()) {
             Errors::input_errors(InputErrors::UNKNOWN_CONTROL, i.at(0));
+        }
+    }
+}
+
+void Input::parse_options_and_state_controls() {
+    auto resolve_path = [&](const std::string& raw) -> std::string {
+        auto p = std::filesystem::path(raw);
+        if (!p.has_parent_path() && fileParentPath) {
+            p = std::filesystem::path(fileParentPath.value()).append(raw);
+        }
+        return p.string();
+    };
+    for (const auto& c : controls) {
+        if (c.empty()) { continue; }
+        if (c.front() == "SAVESTATE" || c.front() == "SAVEBIAS") {
+            if (c.size() >= 2) {
+                std::optional<double> saveTime = std::nullopt;
+                if (c.size() >= 3) { saveTime = parse_param(c.at(2), parameters); }
+                saveStateFile = std::make_pair(resolve_path(c.at(1)), saveTime);
+            }
+        } else if (c.front() == "LOADSTATE" || c.front() == "LOADBIAS") {
+            if (c.size() >= 2) { loadStateFile = resolve_path(c.at(1)); }
+        } else if (c.front() == "OPTION") {
+            for (size_t k = 1; k < c.size(); ++k) {
+                const std::string& tok = c.at(k);
+                if (tok == "FIXEDSTEP" || tok == "FIXEDSTEP=1" || tok == "FIXEDSTEP=TRUE") {
+                    argFixedStep = true;
+                } else if (tok == "FIXEDSTEP=0" || tok == "FIXEDSTEP=FALSE") {
+                    argFixedStep = false;
+                } else if (tok == "WARNSTEP" || tok == "WARNSTEP=1" || tok == "WARNSTEP=TRUE") {
+                    argWarnStep = true;
+                } else if (tok == "TXINTERP" || tok == "TXINTERP=1" || tok == "FRACTX" || tok == "FRACTX=1") {
+                    argTxInterp = true;
+                } else if (tok == "TXINTERP=0" || tok == "FRACTX=0") {
+                    argTxInterp = false;
+                } else if (tok == "CORRECTOR") {
+                    argCorrector = 1;
+                } else if (tok.rfind("CORRECTOR=", 0) == 0) {
+                    argCorrector = static_cast<int64_t>(parse_param(tok.substr(10), parameters));
+                } else if (tok.rfind("CORRECTORTOL=", 0) == 0) {
+                    argCorrectorTol = parse_param(tok.substr(13), parameters);
+                }
+            }
         }
     }
 }

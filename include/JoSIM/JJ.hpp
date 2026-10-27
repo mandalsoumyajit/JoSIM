@@ -65,7 +65,8 @@ class JJ : public BasicComponent {
     double                  del0_ = 0.0, del_ = 0.0;
     double                  pn1_ = 0.0, pn2_ = pn1_, pn3_ = pn2_, pn4_ = pn3_, phi0_ = 0.0;
     double                  vn1_ = 0.0, vn2_ = vn1_, vn3_ = vn2_, vn4_ = vn3_, vn5_ = vn4_, vn6_ = vn5_;
-    double                  it_ = 0.0;
+    double                  it_    = 0.0;
+    double                  cTerm_ = 0.0;
     JoSIM::AnalysisType     at_;
     std::optional<Function> thermalNoise;
 

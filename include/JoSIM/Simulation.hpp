@@ -33,6 +33,15 @@ class Simulation {
     JoSIM::AnalysisType atyp_;
     bool                minOut_;
     bool                parallel_                = false;
+    bool                fixedStep_               = false;
+    bool                warnStep_                = false;
+    int64_t             verb_                    = 0;
+    int64_t             correctorIter_           = 0;
+    double              correctorTol_            = 1e-3;
+    int64_t             stepHalvings_            = 0;
+    std::string         offendingJJ_;
+    std::optional<std::pair<std::string, std::optional<double>>> saveStateFile_;
+    std::optional<std::string>                                   loadStateFile_;
     bool                hasJJThermalNoise_       = false;
     bool                hasResistorThermalNoise_ = false;
     bool                needsLU_;
@@ -63,6 +72,9 @@ class Simulation {
     void trans_sim(Matrix& mObj);
     void setup_b(Matrix& mObj, int64_t i, double step, double factor = 1);
     void reduce_step(Input& iObj, Matrix& mObj);
+    void corrector_jj(Matrix& mObj);
+    void save_state(const std::string& filename, const Matrix& mObj) const;
+    void load_state(const std::string& filename, Matrix& mObj);
 
     void handle_cs(Matrix& mObj, double& step, const int64_t& i);
     void handle_resistors(Matrix& mObj, double& step);

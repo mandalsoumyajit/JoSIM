@@ -109,6 +109,18 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                         Errors::cli_errors(CLIErrors::INVALID_ANALYSIS);
                     }
                     break;
+                    // Enable predictor-corrector iterations for JJs
+                case 'c':
+                    try {
+                        out.corrector = std::stoll(i.second.value_or("1"));
+                    } catch (const std::invalid_argument&) {
+                        out.corrector = 1;
+                    }
+                    break;
+                    // Disable automatic step halving (fixed step)
+                case 'f':
+                    out.fixedStep = (i.second.value_or("1") != "0");
+                    break;
                     // Show help menu
                 case 'h':
                     display_help();

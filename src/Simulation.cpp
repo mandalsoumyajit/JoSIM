@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <unordered_map>
 #ifdef _OPENMP
@@ -61,6 +63,14 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     atyp_                    = iObj.argAnal;
     minOut_                  = iObj.argMin;
     parallel_                = iObj.argPar;
+    fixedStep_               = iObj.argFixedStep;
+    warnStep_                = iObj.argWarnStep;
+    verb_                    = iObj.argVerb;
+    correctorIter_           = iObj.argCorrector;
+    correctorTol_            = iObj.argCorrectorTol;
+    saveStateFile_           = iObj.saveStateFile;
+    loadStateFile_           = iObj.loadStateFile;
+    offendingJJ_.clear();
     hasJJThermalNoise_       = false;
     hasResistorThermalNoise_ = false;
     needsLU_                 = false;
@@ -165,7 +175,9 @@ void Simulation::trans_sim(Matrix& mObj) {
     }
     // Ensure the b vector is sized once
     b_.assign(mObj.rp.size(), 0.0);
-    if (startup_) {
+    if (loadStateFile_.has_value()) {
+        load_state(loadStateFile_.value(), mObj);
+    } else if (startup_) {
         // Stabilize the simulation before starting at t=0
         int64_t startup = static_cast<int64_t>(2 * pow(10, (abs(log10(stepSize_)) - 12) * 2 + 1));
         if (startup > 1000) { startup = 1000; }
@@ -183,9 +195,11 @@ void Simulation::trans_sim(Matrix& mObj) {
             // If anything is a amiss, complain about it
             if (!simOK_) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
 #endif
+            if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
         }
     }
     const bool hasRelevantTraces = !mObj.relevantTraces.empty();
+    bool       stateSaved        = false;
     // Start the simulation loop
     for (int64_t i = 0; i < simSize_; ++i) {
         double step = i * stepSize_;
@@ -204,6 +218,7 @@ void Simulation::trans_sim(Matrix& mObj) {
         // If anything is a amiss, complain about it
         if (!simOK_) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
 #endif
+        if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
         // Store results (only requested, to prevent massive memory usage)
         if (hasRelevantTraces) {
             for (const auto& j : mObj.relevantIndices) { results.xVector[j]->emplace_back(x_[j]); }
@@ -214,6 +229,15 @@ void Simulation::trans_sim(Matrix& mObj) {
         }
         // Store the time step
         results.timeAxis.emplace_back(step);
+        if (!stateSaved && saveStateFile_.has_value() && saveStateFile_->second.has_value()
+            && step >= saveStateFile_->second.value()) {
+            save_state(saveStateFile_->first, mObj);
+            stateSaved = true;
+        }
+    }
+    if (!stateSaved && saveStateFile_.has_value()) {
+        save_state(saveStateFile_->first, mObj);
+        stateSaved = true;
     }
 
     // Sync device states back to mObj.components.devices for callers that reuse mObj (e.g. IV)
@@ -255,7 +279,19 @@ void Simulation::trans_sim(Matrix& mObj) {
 }
 
 void Simulation::reduce_step(Input& iObj, Matrix& mObj) {
-    iObj.transSim.tstep(iObj.transSim.tstep() / 2);
+    if (fixedStep_) {
+        Errors::simulation_errors(SimulationErrors::PHASEGUESS_TOO_LARGE,
+                                  offendingJJ_.empty() ? "unknown" : offendingJJ_);
+    }
+    const double oldStep = iObj.transSim.tstep();
+    const double newStep = oldStep / 2.0;
+    ++stepHalvings_;
+    if (verb_ >= 1 || warnStep_) {
+        std::cout << "JoSIM: Step halving #" << stepHalvings_ << " triggered by "
+                  << (offendingJJ_.empty() ? "JJ" : offendingJJ_) << " (tstep " << oldStep << " -> " << newStep
+                  << ")\n";
+    }
+    iObj.transSim.tstep(newStep);
     Rng::rewind();
     bool tempMinOut = iObj.argMin;
     if (!iObj.argMin) { iObj.argMin = true; }
@@ -557,6 +593,8 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
                     ic_sin_phi += ic * (cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff)));
                 }
             }
+            temp.cTerm_ = -(((2 * model.c()) / (stepSize_)) * temp.vn1_)
+                          + ((model.c() / (2.0 * (stepSize_))) * temp.vn2_);
             if (!model.tDep()) {
                 b_[temp.indexInfo.currentIndex_.value()]
                         = (temp.matrixInfo.nonZeros_.back())
@@ -628,7 +666,8 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
         // Ensure timestep is not too large
         if (checkPhase) {
             if (abs(temp.phi0_ - temp.pn1_) > (0.20 * 2 * Constants::PI)) {
-                needsTR_ = true;
+                offendingJJ_ = temp.netlistInfo.label_;
+                needsTR_     = true;
                 return;
                 /*Errors::simulation_errors(
                   SimulationErrors::PHASEGUESS_TOO_LARGE, temp.netlistInfo.label_);*/
@@ -669,6 +708,8 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
                 ic_sin_phi += ic * (cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff)));
             }
         }
+        temp.cTerm_ = -(((2 * model.c()) / (stepSize_)) * temp.vn1_)
+                      + ((model.c() / (2.0 * (stepSize_))) * temp.vn2_);
         if (!model.tDep()) {
             // -(hR / h + 2RC) * (Ic sin (φ0) - 2C / h Vp1 + C/2h Vp2 + It)
             b_[temp.indexInfo.currentIndex_.value()]
@@ -704,6 +745,87 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
                        + temp.it_);
         }
         temp.vn2_ = temp.vn1_;
+    }
+}
+
+void Simulation::corrector_jj(Matrix& mObj) {
+    const int64_t nJJ = static_cast<int64_t>(jjs_.size());
+    for (int64_t iter = 0; iter < correctorIter_; ++iter) {
+        double maxDiff     = 0.0;
+        bool   corrNeedsLU = false;
+        for (int64_t idx = 0; idx < nJJ; ++idx) {
+            auto&  temp    = jjs_[idx];
+            double nodeVal = 0.0;
+            if (temp.indexInfo.posIndex_ && !temp.indexInfo.negIndex_) {
+                nodeVal = x_[temp.indexInfo.posIndex_.value()];
+            } else if (!temp.indexInfo.posIndex_ && temp.indexInfo.negIndex_) {
+                nodeVal = -x_[temp.indexInfo.negIndex_.value()];
+            } else if (temp.indexInfo.posIndex_ && temp.indexInfo.negIndex_) {
+                nodeVal = x_[temp.indexInfo.posIndex_.value()] - x_[temp.indexInfo.negIndex_.value()];
+            }
+            const double phiNew = (atyp_ == AnalysisType::Phase) ? nodeVal : x_[temp.variableIndex_];
+            const double vNew   = (atyp_ == AnalysisType::Phase) ? x_[temp.variableIndex_] : nodeVal;
+            const double diff   = std::abs(phiNew - temp.phi0_);
+            if (diff > maxDiff) { maxDiff = diff; }
+            temp.phi0_        = 0.5 * (temp.phi0_ + phiNew);
+            const auto& model = temp.model_;
+            if (model.rtype() == 1) {
+                if (temp.update_value(vNew)) {
+                    mObj.nz[temp.nzBackIndex_] = temp.matrixInfo.nonZeros_.back();
+                    corrNeedsLU                = true;
+                }
+            }
+            const auto&  cpr        = model.cpr();
+            const double phiOff     = model.phiOff();
+            const double ic         = model.ic();
+            double       ic_sin_phi = 0.0;
+            if (cpr.size() == 1) {
+                ic_sin_phi += ic * (cpr[0] * sin(1 * (temp.phi0_ - phiOff)));
+            } else {
+                for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
+                    ic_sin_phi += ic * (cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff)));
+                }
+            }
+            if (!model.tDep()) {
+                b_[temp.indexInfo.currentIndex_.value()]
+                        = (temp.matrixInfo.nonZeros_.back()) * (ic_sin_phi + temp.cTerm_ + temp.it_);
+            } else {
+                double sin2_half_phi = 0.0;
+                for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
+                    sin2_half_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff) / 2);
+                }
+                sin2_half_phi  = sin2_half_phi * sin2_half_phi;
+                double sin_phi = 0.0;
+                for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
+                    sin_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff));
+                }
+                double sqrt_part = sqrt(1 - model.d() * sin2_half_phi);
+                b_[temp.indexInfo.currentIndex_.value()]
+                        = (temp.matrixInfo.nonZeros_.back())
+                          * ((((Constants::PI * temp.del_) / (2 * Constants::EV * model.rn())) * (sin_phi / sqrt_part)
+                              * tanh(temp.del_ / (2 * Constants::BOLTZMANN * model.t()) * sqrt_part))
+                             + temp.cTerm_ + temp.it_);
+            }
+        }
+        if (maxDiff <= correctorTol_ && !corrNeedsLU) { break; }
+        if (corrNeedsLU) {
+#ifdef SLU
+            lu.factorize(true);
+#else
+            simOK_ = klu_l_refactor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, Numeric_, &Common_);
+            if (!simOK_) {
+                klu_l_free_numeric(&Numeric_, &Common_);
+                Numeric_ = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
+            }
+#endif
+        }
+        std::copy(b_.begin(), b_.end(), x_.begin());
+#ifdef SLU
+        lu.solve(x_);
+#else
+        simOK_ = klu_l_tsolve(Symbolic_, Numeric_, mObj.rp.size() - 1, 1, &x_.front(), &Common_);
+        if (!simOK_) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+#endif
     }
 }
 
@@ -802,6 +924,15 @@ void Simulation::handle_vccs(Matrix& mObj) {
 }
 
 void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double factor) {
+    auto sample_port = [&](JoSIM::NodeConfig nc, const int_o& pInd, const int_o& nInd, int64_t idx) -> double {
+        if (idx < 0) { return 0.0; }
+        if (nc == NodeConfig::POSGND) { return (*results.xVector[pInd.value()])[idx]; }
+        if (nc == NodeConfig::GNDNEG) { return -(*results.xVector[nInd.value()])[idx]; }
+        if (nc == NodeConfig::POSNEG) {
+            return (*results.xVector[pInd.value()])[idx] - (*results.xVector[nInd.value()])[idx];
+        }
+        return 0.0;
+    };
     for (auto& temp : txlines_) {
         // Z0
         double&            Z    = temp.netlistInfo.value_;
@@ -812,6 +943,75 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
         int_o &posInd = temp.indexInfo.posIndex_, &negInd = temp.indexInfo.negIndex_, &posInd2 = temp.posIndex2_,
               &negInd2  = temp.negIndex2_;
         int64_t &curInd = temp.indexInfo.currentIndex_.value(), &curInd2 = temp.currentIndex2_;
+        if (temp.fracDelay_ > 0.0) {
+            const double alpha = temp.fracDelay_;
+            const double oma   = 1.0 - alpha;
+            auto         interp_port
+                    = [&](JoSIM::NodeConfig cfg, const int_o& pI, const int_o& nI, int64_t m) -> double {
+                if (m < 0) { return 0.0; }
+                return oma * sample_port(cfg, pI, nI, m) + alpha * sample_port(cfg, pI, nI, m - 1);
+            };
+            auto interp_cur = [&](int64_t cIdx, int64_t m) -> double {
+                if (m < 0) { return 0.0; }
+                const auto& vec = *results.xVector[cIdx];
+                return oma * vec[m] + (m >= 1 ? alpha * vec[m - 1] : 0.0);
+            };
+            if (atyp_ == AnalysisType::Voltage) {
+                if (i >= k) {
+                    const int64_t m    = i - k;
+                    temp.nk_1_         = interp_port(nc, posInd, negInd, m);
+                    temp.nk_2_         = interp_port(nc2, posInd2, negInd2, m);
+                    const double  I1nk = interp_cur(curInd, m);
+                    const double  I2nk = interp_cur(curInd2, m);
+                    b_[curInd]         = Z * I2nk + temp.nk_2_;
+                    b_[curInd2]        = Z * I1nk + temp.nk_1_;
+                }
+            } else if (atyp_ == AnalysisType::Phase) {
+                if (i > 0) {
+                    temp.n2_1_ = temp.n1_1_;
+                    temp.n2_2_ = temp.n1_2_;
+                    if (nc == NodeConfig::POSGND) {
+                        temp.n1_1_ = x_[posInd.value()];
+                    } else if (nc == NodeConfig::GNDNEG) {
+                        temp.n1_1_ = -x_[negInd.value()];
+                    } else if (nc == NodeConfig::POSNEG) {
+                        temp.n1_1_ = x_[posInd.value()] - x_[negInd.value()];
+                    } else {
+                        temp.n1_1_ = 0.0;
+                    }
+                    if (nc2 == NodeConfig::POSGND) {
+                        temp.n1_2_ = x_[posInd2.value()];
+                    } else if (nc2 == NodeConfig::GNDNEG) {
+                        temp.n1_2_ = -x_[negInd2.value()];
+                    } else if (nc2 == NodeConfig::POSNEG) {
+                        temp.n1_2_ = x_[posInd2.value()] - x_[negInd2.value()];
+                    } else {
+                        temp.n1_2_ = 0.0;
+                    }
+                }
+                if (i >= k) {
+                    const int64_t m    = i - k;
+                    temp.nk_1_         = interp_port(nc, posInd, negInd, m);
+                    temp.nk_2_         = interp_port(nc2, posInd2, negInd2, m);
+                    temp.nk1_1_        = interp_port(nc, posInd, negInd, m - 1);
+                    temp.nk1_2_        = interp_port(nc2, posInd2, negInd2, m - 1);
+                    temp.nk2_1_        = interp_port(nc, posInd, negInd, m - 2);
+                    temp.nk2_2_        = interp_port(nc2, posInd2, negInd2, m - 2);
+                    const double  I1nk = interp_cur(curInd, m);
+                    const double  I2nk = interp_cur(curInd2, m);
+                    b_[curInd]         = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
+                                 + (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_ + temp.nk_2_
+                                 - (4.0 / 3.0) * temp.nk1_2_ + (1.0 / 3.0) * temp.nk2_2_;
+                    b_[curInd2] = (Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
+                                  + (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_ + temp.nk_1_
+                                  - (4.0 / 3.0) * temp.nk1_1_ + (1.0 / 3.0) * temp.nk2_1_;
+                } else {
+                    b_[curInd]  = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_;
+                    b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_;
+                }
+            }
+            continue;
+        }
         if (atyp_ == AnalysisType::Voltage) {
             if (i >= k) {
                 // φ1n-k
@@ -998,5 +1198,255 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
                 b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_;
             }
         }
+    }
+}
+
+void Simulation::save_state(const std::string& filename, const Matrix& mObj) const {
+    std::ofstream out(filename, std::ios::out | std::ios::binary);
+    if (!out.is_open()) {
+        Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
+        return;
+    }
+    const char     magic[8] = {'J', 'O', 'S', 'I', 'M', 'S', 'T', 'A'};
+    const uint32_t version  = 1;
+    out.write(magic, 8);
+    out.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
+    auto write_u64 = [&](uint64_t v) { out.write(reinterpret_cast<const char*>(&v), sizeof(uint64_t)); };
+    auto write_f64 = [&](double v) { out.write(reinterpret_cast<const char*>(&v), sizeof(double)); };
+
+    write_u64(static_cast<uint64_t>(x_.size()));
+    out.write(reinterpret_cast<const char*>(x_.data()), static_cast<std::streamsize>(x_.size() * sizeof(double)));
+
+    write_u64(static_cast<uint64_t>(jjs_.size()));
+    for (const auto& jj : jjs_) {
+        const double vals[13] = {jj.pn1_,
+                                 jj.pn2_,
+                                 jj.pn3_,
+                                 jj.pn4_,
+                                 jj.vn1_,
+                                 jj.vn2_,
+                                 jj.vn3_,
+                                 jj.vn4_,
+                                 jj.vn5_,
+                                 jj.vn6_,
+                                 jj.phi0_,
+                                 jj.it_,
+                                 jj.matrixInfo.nonZeros_.back()};
+        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+
+    write_u64(static_cast<uint64_t>(inductors_.size()));
+    for (const auto& ind : inductors_) {
+        const double vals[3] = {ind.In2_, ind.In3_, ind.In4_};
+        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+
+    write_u64(static_cast<uint64_t>(resistors_.size()));
+    for (const auto& res : resistors_) {
+        const double vals[4] = {res.pn1_, res.pn2_, res.pn3_, res.pn4_};
+        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+
+    write_u64(static_cast<uint64_t>(capacitors_.size()));
+    for (const auto& cap : capacitors_) {
+        const double vals[7] = {cap.pn1_, cap.pn2_, cap.pn3_, cap.pn4_, cap.pn5_, cap.pn6_, cap.pn7_};
+        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+
+    write_u64(static_cast<uint64_t>(vsources_.size()));
+    for (const auto& vs : vsources_) {
+        const double vals[4] = {vs.pn1_, vs.pn2_, vs.pn3_, vs.pn4_};
+        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+
+    write_u64(static_cast<uint64_t>(ccvss_.size()));
+    for (const auto& ccvs : ccvss_) {
+        const double vals[4] = {ccvs.pn1_, ccvs.pn2_, ccvs.pn3_, ccvs.pn4_};
+        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+
+    write_u64(static_cast<uint64_t>(vccss_.size()));
+    for (const auto& vccs : vccss_) {
+        const double vals[4] = {vccs.pn1_, vccs.pn2_, vccs.pn3_, vccs.pn4_};
+        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+
+    write_u64(static_cast<uint64_t>(txlines_.size()));
+    for (const auto& tx : txlines_) {
+        const double vals[10] = {tx.n1_1_,
+                                 tx.n1_2_,
+                                 tx.n2_1_,
+                                 tx.n2_2_,
+                                 tx.nk_1_,
+                                 tx.nk_2_,
+                                 tx.nk1_1_,
+                                 tx.nk1_2_,
+                                 tx.nk2_1_,
+                                 tx.nk2_2_};
+        out.write(reinterpret_cast<const char*>(vals), sizeof(vals));
+    }
+    (void) write_f64;
+    (void) mObj;
+}
+
+void Simulation::load_state(const std::string& filename, Matrix& mObj) {
+    std::ifstream in(filename, std::ios::in | std::ios::binary);
+    if (!in.is_open()) {
+        Errors::input_errors(InputErrors::CANNOT_OPEN_FILE, filename);
+        return;
+    }
+    char     magic[8] = {};
+    uint32_t version  = 0;
+    in.read(magic, 8);
+    in.read(reinterpret_cast<char*>(&version), sizeof(uint32_t));
+    if (std::string(magic, 8) != "JOSIMSTA" || version != 1) {
+        Errors::input_errors(InputErrors::CANNOT_OPEN_FILE, filename);
+        return;
+    }
+    auto read_u64 = [&]() -> uint64_t {
+        uint64_t v = 0;
+        in.read(reinterpret_cast<char*>(&v), sizeof(uint64_t));
+        return v;
+    };
+
+    const uint64_t xLen = read_u64();
+    if (xLen == x_.size()) {
+        in.read(reinterpret_cast<char*>(x_.data()), static_cast<std::streamsize>(xLen * sizeof(double)));
+    } else {
+        std::vector<double> tmp(xLen);
+        in.read(reinterpret_cast<char*>(tmp.data()), static_cast<std::streamsize>(xLen * sizeof(double)));
+        const size_t copyLen = std::min<size_t>(x_.size(), tmp.size());
+        std::copy(tmp.begin(), tmp.begin() + copyLen, x_.begin());
+    }
+
+    const uint64_t nJJ      = read_u64();
+    bool           nzChange = false;
+    for (uint64_t i = 0; i < nJJ; ++i) {
+        double vals[13] = {};
+        in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        if (i < jjs_.size()) {
+            auto& jj = jjs_[i];
+            jj.pn1_  = vals[0];
+            jj.pn2_  = vals[1];
+            jj.pn3_  = vals[2];
+            jj.pn4_  = vals[3];
+            jj.vn1_  = vals[4];
+            jj.vn2_  = vals[5];
+            jj.vn3_  = vals[6];
+            jj.vn4_  = vals[7];
+            jj.vn5_  = vals[8];
+            jj.vn6_  = vals[9];
+            jj.phi0_ = vals[10];
+            jj.it_   = vals[11];
+            if (jj.matrixInfo.nonZeros_.back() != vals[12]) {
+                jj.matrixInfo.nonZeros_.back() = vals[12];
+                mObj.nz[jj.nzBackIndex_]       = vals[12];
+                nzChange                       = true;
+            }
+        }
+    }
+
+    const uint64_t nInd = read_u64();
+    for (uint64_t i = 0; i < nInd; ++i) {
+        double vals[3] = {};
+        in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        if (i < inductors_.size()) {
+            inductors_[i].In2_ = vals[0];
+            inductors_[i].In3_ = vals[1];
+            inductors_[i].In4_ = vals[2];
+        }
+    }
+
+    const uint64_t nRes = read_u64();
+    for (uint64_t i = 0; i < nRes; ++i) {
+        double vals[4] = {};
+        in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        if (i < resistors_.size()) {
+            resistors_[i].pn1_ = vals[0];
+            resistors_[i].pn2_ = vals[1];
+            resistors_[i].pn3_ = vals[2];
+            resistors_[i].pn4_ = vals[3];
+        }
+    }
+
+    const uint64_t nCap = read_u64();
+    for (uint64_t i = 0; i < nCap; ++i) {
+        double vals[7] = {};
+        in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        if (i < capacitors_.size()) {
+            capacitors_[i].pn1_ = vals[0];
+            capacitors_[i].pn2_ = vals[1];
+            capacitors_[i].pn3_ = vals[2];
+            capacitors_[i].pn4_ = vals[3];
+            capacitors_[i].pn5_ = vals[4];
+            capacitors_[i].pn6_ = vals[5];
+            capacitors_[i].pn7_ = vals[6];
+        }
+    }
+
+    const uint64_t nVS = read_u64();
+    for (uint64_t i = 0; i < nVS; ++i) {
+        double vals[4] = {};
+        in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        if (i < vsources_.size()) {
+            vsources_[i].pn1_ = vals[0];
+            vsources_[i].pn2_ = vals[1];
+            vsources_[i].pn3_ = vals[2];
+            vsources_[i].pn4_ = vals[3];
+        }
+    }
+
+    const uint64_t nCCVS = read_u64();
+    for (uint64_t i = 0; i < nCCVS; ++i) {
+        double vals[4] = {};
+        in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        if (i < ccvss_.size()) {
+            ccvss_[i].pn1_ = vals[0];
+            ccvss_[i].pn2_ = vals[1];
+            ccvss_[i].pn3_ = vals[2];
+            ccvss_[i].pn4_ = vals[3];
+        }
+    }
+
+    const uint64_t nVCCS = read_u64();
+    for (uint64_t i = 0; i < nVCCS; ++i) {
+        double vals[4] = {};
+        in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        if (i < vccss_.size()) {
+            vccss_[i].pn1_ = vals[0];
+            vccss_[i].pn2_ = vals[1];
+            vccss_[i].pn3_ = vals[2];
+            vccss_[i].pn4_ = vals[3];
+        }
+    }
+
+    const uint64_t nTX = read_u64();
+    for (uint64_t i = 0; i < nTX; ++i) {
+        double vals[10] = {};
+        in.read(reinterpret_cast<char*>(vals), sizeof(vals));
+        if (i < txlines_.size()) {
+            txlines_[i].n1_1_  = vals[0];
+            txlines_[i].n1_2_  = vals[1];
+            txlines_[i].n2_1_  = vals[2];
+            txlines_[i].n2_2_  = vals[3];
+            txlines_[i].nk_1_  = vals[4];
+            txlines_[i].nk_2_  = vals[5];
+            txlines_[i].nk1_1_ = vals[6];
+            txlines_[i].nk1_2_ = vals[7];
+            txlines_[i].nk2_1_ = vals[8];
+            txlines_[i].nk2_2_ = vals[9];
+        }
+    }
+
+    if (nzChange) {
+#ifdef SLU
+        lu.factorize(true);
+#else
+        simOK_ = klu_l_refactor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, Numeric_, &Common_);
+        if (!simOK_) {
+            klu_l_free_numeric(&Numeric_, &Common_);
+            Numeric_ = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
+        }
+#endif
     }
 }

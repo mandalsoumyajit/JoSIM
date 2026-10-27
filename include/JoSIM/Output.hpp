@@ -33,6 +33,12 @@ class Output {
 
     void format_raw(const std::string& filename, bool argmin = true, int64_t fIndex = -1);
 
+    void format_bin(const std::string& filename, bool argmin = true, int64_t fIndex = -1);
+
+    void format_npy(const std::string& filename, bool argmin = true, int64_t fIndex = -1);
+
+    void format_raw_bin(const std::string& filename, bool argmin = true, int64_t fIndex = -1);
+
     void format_cout(const bool& argMin);
 };
 } // namespace JoSIM

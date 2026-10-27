@@ -67,14 +67,19 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
             }
         }
     }
-    // Sanity check
-    if (ap.size() == 1) {
-        // If there is only one pair with both switch and value populated
-        if (ap.at(0).first && ap.at(0).second) {
-            // We are most likely misinterpreting the input file as the value
-            ap.emplace_back(std::make_pair(std::nullopt, ap.at(0).second));
-            // Split the pair into 2, one the switch and one the input
-            ap.at(0).second = std::nullopt;
+    // Sanity check: if no positional input file was found and the last switch swallowed the input filename
+    bool hasInput = false;
+    for (const auto& kv : ap) {
+        if (!kv.first || kv.first.value() == 'i') {
+            hasInput = true;
+            break;
+        }
+    }
+    if (!hasInput && !ap.empty() && ap.back().first && ap.back().second) {
+        const char sw = ap.back().first.value();
+        if (sw == 'p' || sw == 'g' || sw == 'f' || sw == 'w' || sw == 'm' || ap.size() == 1) {
+            ap.emplace_back(std::make_pair(std::nullopt, ap.back().second));
+            ap.at(ap.size() - 2).second = std::nullopt;
         }
     }
     return ap;
@@ -120,6 +125,11 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                     // Disable automatic step halving (fixed step)
                 case 'f':
                     out.fixedStep = (i.second.value_or("1") != "0");
+                    break;
+                    // Enable GPU acceleration (and parallel partitioned mode)
+                case 'g':
+                    out.gpu      = (i.second.value_or("1") != "0");
+                    out.parallel = true;
                     break;
                     // Show help menu
                 case 'h':

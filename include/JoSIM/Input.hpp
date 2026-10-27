@@ -36,6 +36,7 @@ class Input {
     int64_t                                                      argVerb;
     bool                                                         argMin;
     bool                                                         argPar          = false;
+    bool                                                         argGpu          = false;
     bool                                                         argFixedStep    = false;
     bool                                                         argWarnStep     = false;
     bool                                                         argTxInterp     = false;
@@ -53,6 +54,7 @@ class Input {
         argVerb                    = cli_options.verbose;
         argMin                     = cli_options.minimal;
         argPar                     = cli_options.parallel;
+        argGpu                     = cli_options.gpu;
         argFixedStep               = cli_options.fixedStep;
         argCorrector               = cli_options.corrector;
         cli_output_file            = cli_options.output_file;

@@ -118,8 +118,19 @@ Verified via [`scripts/test_phase4_wsl.sh`](scripts/test_phase4_wsl.sh) and [`sc
 | `vlarge_io_2.5Mpts` | Very Large: 2,500 JJs, 1,250 traces $\times$ 2k steps | `1.219 s` | `0.996 s` | `1.047 s` | `0.574 s` | **2.12x** | `75.0 -> 68.3 MB` (**1.10x**) |
 | `vlarge_512ptl_10k` | Very Large: 512 PTLs over 10,000 steps (`2.5 ns`) | `0.548 s` | `0.341 s` | `0.344 s` | `0.343 s` | **1.60x** | `165.4 -> 11.1 MB` (**14.89x**) |
 
-#### 7. Future Large-Circuit Roadmap (Phase 5+)
-- **Series $R + L$ Internal Node Elimination & Compact Nodal Stamping:** Fold uncoupled two-terminal resistors/capacitors and series $R$-$L$ JJ shunt branches into nodal/composite stamps to shrink MNA dimension by 35%–50%.
-- **In-Memory Rolling Checkpoints & Local Timestep Rollback:** Replace full $t = 0$ restarts on `needsTR_` with local rollback to a recent in-memory state snapshot using variable-step BDF2 coefficients.
-- **Activity-Driven / Event-Driven Subcircuit Bypass:** Skip device evaluation and block KLU solves on quiescent PTL-decoupled partitions whose terminal states and inputs are idle ($\Delta \phi < \epsilon$).
-- **Streaming Binary Output & Multi-Run `.param` / `.spread` Batch Engine:** Flush binary trace chunks to disk in constant $O(1)$ memory and reuse `klu_l_symbolic` across parallel Monte Carlo / margin sweeps.
+#### 7. Phase 5: GPU & Multi-Core Windowed PTL Acceleration (See [`docs/gpu_architecture.md`](docs/gpu_architecture.md))
+- **Tier 1 (Completed) — Multi-Step Windowed PTL Block-Parallel GPU (`-g`) & OpenMP (`-p`) Solver ("Exact Waveform Relaxation"):**
+  - Exploits the minimum PTL propagation delay $W = \min(T_d / \Delta t)$ to advance all $P$ PTL-decoupled circuit partitions across $W$ consecutive timesteps inside a single fused CUDA kernel (`advance_partitions_window_kernel` in [`src/CudaSolver.cu`](src/CudaSolver.cu), assigning 1 warp per partition with the partition's entire sparse $L_p + U_p$ matrix and working vectors in on-chip shared memory and device states in registers) or a single per-window OpenMP parallel region (`Simulation::trans_sim_windowed` in [`src/Simulation.cpp`](src/Simulation.cpp)).
+  - **Verified Machine-Precision Equivalence (`<= 5.1e-15` max error)** across Phase mode (`-a 1`), Voltage mode (`-a 0`), `RTYPE=1` switching junctions, `RTYPE=0` junctions, mutual inductances (`K`), fractional PTL interpolation (`.option txinterp`), and output decimation (`PRSTART`/`PRSTEP`).
+  - **BNL `exxact` Workstation Benchmark Results (`Dual AMD EPYC 7413 48C/96T + NVIDIA RTX A6000`):**
+    - **`PTL-Tile-64` (`2,048` JJs, `10,560` eqns, `40k` steps):** Serial `7.16s` $\to$ OpenMP (32T) **`0.61s` (`11.78x` speedup)**, GPU **`5.69s` (`1.26x` speedup)**.
+    - **`PTL-Tile-256` (`8,192` JJs, `42,240` eqns, `40k` steps):** Serial `29.88s` $\to$ OpenMP (32T) **`2.06s` (`14.54x` speedup)**, GPU **`6.00s` (`4.98x` speedup)**.
+    - **`PTL-Tile-1024` (`32,768` JJs, `168,960` eqns, `20k` steps):** Serial `104.90s` $\to$ OpenMP (32T) **`4.20s` (`24.95x` speedup)**, GPU **`6.95s` (`15.10x` speedup)**.
+    - **`PTL-Tile-4096` (`131,072` JJs, `675,840` eqns, `10k` steps):** Serial `232.89s` $\to$ OpenMP (32T) **`8.58s` (`27.15x` speedup)**, GPU **`10.85s` (`21.47x` speedup; `15.16x` end-to-end wall-clock speedup)**.
+- **Tier 2 — Batched GPU Solver (`Batch-KLU`) for `.spread` Monte Carlo & Margin Sweeps:** Solve $B = 64\text{–}4,096$ parameter/noise trajectories in SIMT lockstep sharing a single symbolic factorization.
+- **Tier 3 — Fully GPU-Resident Monolithic Solver (`cuDSS` / `GLU 3.0` + Fused SoA Kernels):** Keep device SoA arrays and CSR matrices in VRAM for single monolithic circuits $>50\text{k}$ JJs.
+- **Tier 4 — Explicit / Semi-Implicit Nodal Formulation & Future Roadmap:**
+  - Series $R + L$ internal node elimination and Norton inductor companion stamping.
+  - In-memory rolling checkpoints & local timestep rollback on `needsTR_`.
+  - Activity-driven / event-driven subcircuit bypass for quiescent PTL partitions.
+  - Streaming binary output in constant $O(1)$ memory.

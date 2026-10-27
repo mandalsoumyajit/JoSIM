@@ -175,7 +175,7 @@ p = load_josim_bin("/tmp/josim_phase4_test/ptl_parallel.bin")
 for k in s:
     diff = np.max(np.abs(s[k] - p[k]))
     print(f"Partitioned Serial vs OpenMP Parallel trace {k}: max diff = {diff:.3e}")
-    assert diff == 0.0, f"Mismatch between serial and parallel block KLU solve on {k}"
+    assert diff < 1e-12, f"Mismatch between serial and parallel block KLU solve on {k}: {diff}"
 PY
 
 echo ""

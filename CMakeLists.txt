@@ -22,9 +22,18 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# See if OpenMP was specified
+# See if OpenMP or CUDA was specified
 option(USING_OPENMP "Allow parallel processing in JoSIM" OFF)
+option(USING_CUDA "Enable CUDA GPU acceleration in JoSIM" OFF)
 option(MAKING_STATIC_BUILD "Build josim to be as static as possible" OFF)
+
+if(USING_CUDA)
+  enable_language(CUDA)
+  if(NOT DEFINED CMAKE_CUDA_STANDARD)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  endif()
+endif()
 
 if(MAKING_STATIC_BUILD)
   set(CMAKE_BUILD_SHARED OFF)
@@ -96,6 +105,14 @@ target_add_warnings(josim)
 if(USING_OPENMP)
   find_package(OpenMP REQUIRED)
   target_link_libraries(josim PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+# CUDA usage
+if(USING_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  target_sources(josim PRIVATE src/CudaSolver.cu)
+  target_compile_definitions(josim PUBLIC JOSIM_CUDA)
+  target_link_libraries(josim PUBLIC CUDA::cudart)
 endif()
 
 # JoSIM command line interface

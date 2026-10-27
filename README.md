@@ -39,12 +39,13 @@ or via \
 
 This enhanced fork of JoSIM delivers significant single-core, multi-threaded (`-p`), numerical integration, and binary I/O improvements (see [`ENHANCEMENT_PLAN.md`](ENHANCEMENT_PLAN.md) for architectural details):
 
-### 1. Speed & OpenMP Parallelism (`-p` / `--parallel`)
+### 1. Speed, Multi-Core OpenMP (`-p`) & CUDA GPU (`-g`) Parallelism
+- **Up to `27.15x` OpenMP CPU speedup (`-p`) and `21.47x` CUDA GPU speedup (`-g`)** on large PTL-interconnected superconducting circuits via the **Multi-Step Windowed PTL Block-Parallel Solver** ("Exact Waveform Relaxation"; see [`docs/gpu_architecture.md`](docs/gpu_architecture.md)).
 - **2.84x faster on the 23-test CTest suite** (`20.20 s -> 7.11 s` in WSL with 100% bit-identical outputs).
-- **2.2x–3.2x faster end-to-end simulation + output** on large extracted superconducting IC netlists when combining the solver optimizations with binary output (`.bin` / `.npy`).
+- **2.2x–3.2x faster end-to-end simulation + output** on medium/large extracted superconducting IC netlists when combining the solver optimizations with binary output (`.bin` / `.npy`).
 - **$O(1)$ hash-map lookups** (`deviceMap`, `csMap`) for mutual inductances (`K`) and `.print`/`.save` traces, eliminating $O(N^2)$ setup bottlenecks on extracted layouts with thousands of mutual couplings.
 - **In-place CSR updates & `klu_l_refactor`** whenever `RTYPE=1` Josephson junctions cross their gap voltage threshold ($V_g \pm \frac{1}{2}\Delta V$), avoiding per-transition matrix rebuilds and heap allocations.
-- **Block-Partitioned KLU Solver across PTLs**: Automatically detects connected components of the MNA matrix separated by lossless transmission lines (`T` elements), creating independent `klu_l_symbolic`/`klu_l_numeric` sub-matrices (`KluPartition`). Only blocks containing a transitioning junction are refactored (`klu_l_refactor`), and with `-p` (`--parallel`), blocks are refactored and solved in parallel across OpenMP threads.
+- **Multi-Step Windowed PTL Block-Parallel Solver (`-p` OpenMP & `-g` CUDA GPU)**: Automatically partitions the MNA matrix and all circuit devices into $P$ connected components separated by lossless transmission lines (`T` elements) and computes the exact causal lookahead window $W = \min(T_d / \Delta t)$ steps. Because PTLs couple ports strictly via delayed history ($k \ge W$ steps), all $P$ partitions advance across $W$ consecutive timesteps completely independently before synchronizing PTL ring buffers—either in L1/L2 cache across OpenMP CPU threads (`-p`) or inside a single fused shared-memory/register-cached CUDA kernel (`-g`, 1 warp per partition with full $L_p + U_p$ factors in shared memory).
 - **Self-Contained Transmission-Line Ring Buffers & Mid-Flight Checkpointing**: Each transmission line maintains a compact circular ring buffer (`hist_`) of length $k + 4$ instead of forcing all 6 of its port/current variables into `results.xVector` for the entire simulation length ($N_{\text{steps}}$), reducing transmission-line memory by **100x–1,000x** and supporting exact `.savestate`/`.loadstate` resumption even while SFQ pulses are mid-flight inside PTLs.
 - **In-Loop Print Windowing & Decimation (`PRSTART` / `PRSTEP`)**: When `.tran` specifies `PRSTART > 0` or `PRSTEP > TSTEP` (without FIR windowing), `Simulation::trans_sim` stores only the required output steps (plus 2-step BDF2 lookback points when phase-to-voltage differentiation is requested), slashing RAM usage on long transient runs.
 - **Homogeneous device arrays & zero-allocation hot loop**, cached `PWL`/`PWS` time segments, pre-computed `CUS` cubic splines, fast pre-reserved subcircuit flattening, and functional OpenMP multi-threading (`-p`) across device evaluation, block KLU solves, and output formatting.
@@ -88,8 +89,23 @@ arr = load_josim_npy("output.npy")       # Zero-copy memory-mapped structured ar
   ```spice
   .option kcutoff=1e-3
   ```
+- **CUDA GPU & Multi-Step Windowed PTL Solver (`-g` / `--gpu`, `.option gpu`, `-p` / `--parallel`)**:
+  Build with `-DUSING_CUDA=ON -DUSING_OPENMP=ON -DCMAKE_CUDA_ARCHITECTURES=86` to enable CUDA GPU acceleration (`-g` or `.option gpu`) alongside multi-core OpenMP windowed PTL acceleration (`-p`).
 
 ### 4. Benchmark Results (Medium, Large & Very-Large Designs)
+
+#### A. Tier 1 Windowed PTL Block-Parallel Solver Scaling (`Dual AMD EPYC 7413 48C/96T + NVIDIA RTX A6000`)
+
+Reproducible via [`scripts/build_exxact_gpu.sh`](scripts/build_exxact_gpu.sh) and [`scripts/benchmark_gpu_exxact.py`](scripts/benchmark_gpu_exxact.py) (see [`docs/gpu_architecture.md`](docs/gpu_architecture.md) for full details and numerical equivalence verification to $\le 5.1 \times 10^{-15}$):
+
+| Design | JJs | MNA Eqns | Steps | Serial (1T) | OpenMP (8T) | OpenMP (32T) | GPU (RTX A6000) | OpenMP Speedup | GPU Speedup |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **PTL-Tile-64** | 2,048 | 10,560 | 40,000 | `7.16 s` | `2.10 s` | **`0.61 s`** | `5.69 s` | **11.78x** | **1.26x** |
+| **PTL-Tile-256** | 8,192 | 42,240 | 40,000 | `29.88 s` | `7.89 s` | **`2.06 s`** | `6.00 s` | **14.54x** | **4.98x** |
+| **PTL-Tile-1024** | 32,768 | 168,960 | 20,000 | `104.90 s` | `15.54 s` | **`4.20 s`** | `6.95 s` | **24.95x** | **15.10x** |
+| **PTL-Tile-4096** | 131,072 | 675,840 | 10,000 | `232.89 s` | `33.55 s` | **`8.58 s`** | `10.85 s` | **27.15x** | **21.47x** |
+
+#### B. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
 
 Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh) in WSL (`-O3` Release build with Ninja, comparing upstream `v2.7` / `02a34ee` against this enhanced version):
 
@@ -123,11 +139,13 @@ Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_med
 - [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh): Benchmarks wall-clock runtime and peak memory (RSS) across 9 medium-, large-, and very-large-scale superconducting IC designs.
 - [`scripts/test_phase3_wsl.sh`](scripts/test_phase3_wsl.sh): Tests and benchmarks `.bin`/`.npy`/`.rawb` binary outputs, fractional TX delay interpolation, `.savestate`/`.loadstate` checkpointing, `-f` fixed-step control, and `-c` JJ predictor-corrector iteration.
 - [`scripts/test_phase4_wsl.sh`](scripts/test_phase4_wsl.sh): Tests transmission-line circular ring buffers, mid-flight PTL `.savestate`/`.loadstate` checkpointing, in-loop `PRSTART`/`PRSTEP` decimation, `.option kcutoff`, and OpenMP block-partitioned KLU solving across PTL boundaries.
+- [`scripts/build_exxact_gpu.sh`](scripts/build_exxact_gpu.sh) & [`scripts/benchmark_gpu_exxact.py`](scripts/benchmark_gpu_exxact.py): Builds JoSIM with CUDA (`-DUSING_CUDA=ON`) and OpenMP (`-DUSING_OPENMP=ON`), verifies numerical equivalence across Phase and Voltage modes, and benchmarks scaling across PTL-coupled circuits up to 131k JJs (`675k` MNA equations).
 
 ---
 
 ## Changelog
 ### v2.8
+- Implemented **Tier 1 Multi-Step Windowed PTL Block-Parallel Solver** ("Exact Waveform Relaxation") for both **CUDA GPU (`-g` / `--gpu`, `.option gpu`, `-DUSING_CUDA=ON`)** and **Multi-Core OpenMP CPU (`-p` / `--parallel`, `-DUSING_OPENMP=ON`)**, achieving up to **27.15x OpenMP speedup** and **21.47x CUDA GPU speedup** on 131k-JJ PTL-interconnected circuits.
 - Added high-speed binary output formats: `.bin` (column-major `JOSIMBIN` float64), `.npy` (NumPy structured array), and `.rawb` (SPICE3 binary raw), along with Python loader [`scripts/josim_io.py`](scripts/josim_io.py).
 - Implemented $O(1)$ hash-map lookups for mutual inductance (`K`) and `.print`/`.save` trace resolution.
 - Implemented in-place CSR value updates and `klu_l_refactor` on `RTYPE=1` Josephson junction state transitions.

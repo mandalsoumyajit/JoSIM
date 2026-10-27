@@ -28,6 +28,7 @@ struct CliOptions {
     int64_t                         verbose       = 0;
     bool                            minimal       = false;
     bool                            parallel      = false;
+    bool                            gpu           = false;
     bool                            fixedStep     = false;
     int64_t                         corrector     = 0;
     bool                            sanityCheck   = false;

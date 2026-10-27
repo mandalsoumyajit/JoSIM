@@ -3,12 +3,16 @@
 #ifndef JOSIM_SIMULATION_HPP
 #define JOSIM_SIMULATION_HPP
 
+#ifdef JOSIM_CUDA
+#include "JoSIM/CudaSolver.hpp"
+#endif
 #include "JoSIM/Errors.hpp"
 #include "JoSIM/LUSolve.hpp"
 #include "JoSIM/Matrix.hpp"
 #include "JoSIM/Misc.hpp"
 
 #include <cassert>
+#include <memory>
 #include <suitesparse/klu.h>
 
 namespace JoSIM {
@@ -37,6 +41,20 @@ struct KluPartition {
     klu_l_numeric*       numeric  = nullptr;
     klu_l_common         common{};
     bool                 needsLU = false;
+
+    // Per-partition device index lists for windowed PTL block-parallel execution
+    std::vector<int64_t> jjIndices;
+    std::vector<int64_t> resIndices;
+    std::vector<int64_t> indIndices;
+    std::vector<int64_t> capIndices;
+    std::vector<int64_t> vsIndices;
+    std::vector<int64_t> psIndices;
+    std::vector<int64_t> csIndices;
+    std::vector<int64_t> ccvsIndices;
+    std::vector<int64_t> vccsIndices;
+    std::vector<int64_t> txPort1Indices;
+    std::vector<int64_t> txPort2Indices;
+    std::vector<int64_t> traceGlobalRows;
 };
 
 class Simulation {
@@ -47,6 +65,7 @@ class Simulation {
     JoSIM::AnalysisType atyp_;
     bool                minOut_;
     bool                parallel_                = false;
+    bool                gpu_                     = false;
     bool                fixedStep_               = false;
     bool                warnStep_                = false;
     int64_t             verb_                    = 0;
@@ -66,6 +85,8 @@ class Simulation {
     // In-loop print windowing & decimation schedule
     bool                 useDecimation_ = false;
     std::vector<uint8_t> keepStep_;
+    std::vector<int32_t> keptSlot_;
+    int64_t              numKeptSteps_  = 0;
 
     // Contiguous homogeneous device storage for fast hot-loop iteration
     std::vector<JJ>               jjs_;
@@ -80,23 +101,30 @@ class Simulation {
 #ifdef SLU
     LUSolve lu;
 #else
-    int64_t                   simOK_;
-    klu_l_symbolic*           Symbolic_      = nullptr;
-    klu_l_common              Common_{};
-    klu_l_numeric*            Numeric_       = nullptr;
-    bool                      usePartitions_ = false;
-    std::vector<KluPartition> partitions_;
-    std::vector<int64_t>      jjPartIdx_;
-    std::vector<int64_t>      jjPartNzIdx_;
+    int64_t                              simOK_;
+    klu_l_symbolic*                      Symbolic_      = nullptr;
+    klu_l_common                         Common_{};
+    klu_l_numeric*                       Numeric_       = nullptr;
+    bool                                 usePartitions_ = false;
+    int64_t                              windowSize_    = 0;
+    std::vector<KluPartition>            partitions_;
+    std::vector<int64_t>                 jjPartIdx_;
+    std::vector<int64_t>                 jjPartNzIdx_;
+#ifdef JOSIM_CUDA
+    std::unique_ptr<CudaPartitionSolver> cudaSolver_;
+#endif
 #endif
 
     void setup(Input& iObj, Matrix& mObj);
     void setup_partitions(Matrix& mObj);
+    bool setup_gpu_solver(Matrix& mObj);
     void factorize_lu(Matrix& mObj);
     void refactor_lu(Matrix& mObj);
     void solve_lu(Matrix& mObj);
     void free_lu();
     void trans_sim(Matrix& mObj);
+    void trans_sim_omp_windowed(Matrix& mObj);
+    void trans_sim_gpu_windowed(Matrix& mObj);
     void setup_b(Matrix& mObj, int64_t i, double step, double factor = 1);
     void reduce_step(Input& iObj, Matrix& mObj);
     void corrector_jj(Matrix& mObj);

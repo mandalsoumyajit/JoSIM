@@ -340,6 +340,11 @@ void Input::parse_options_and_state_controls() {
                     argCorrectorTol = parse_param(tok.substr(13), parameters);
                 } else if (tok.rfind("KCUTOFF=", 0) == 0) {
                     argKCutoff = std::abs(parse_param(tok.substr(8), parameters));
+                } else if (tok == "GPU" || tok == "GPU=1" || tok == "GPU=TRUE") {
+                    argGpu = true;
+                    argPar = true;
+                } else if (tok == "GPU=0" || tok == "GPU=FALSE") {
+                    argGpu = false;
                 }
             }
         }

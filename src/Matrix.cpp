@@ -113,6 +113,34 @@ void Matrix::create_components(Input& iObj) {
         bar.set_status_text("Creating Matrix");
         bar.set_total((float) iObj.netlist.expNetlist.size());
     }
+    // Map from (source function specification + subckt) to index in sourcegen for deterministic deduplication
+    std::unordered_map<std::string, size_t> sourceDedup;
+    auto get_or_create_source = [&](const std::pair<tokens_t, string_o>& line) -> size_t {
+        std::string fullLine = Misc::vector_to_string(line.first);
+        if (fullLine.find("NOISE") == std::string::npos && line.first.size() > 3) {
+            std::string key;
+            for (size_t k = 3; k < line.first.size(); ++k) {
+                key.append(line.first[k]);
+                key.push_back(' ');
+            }
+            if (line.second) {
+                key.push_back('|');
+                key.append(line.second.value());
+            }
+            auto it = sourceDedup.find(key);
+            if (it != sourceDedup.end()) { return it->second; }
+            const size_t newIdx = sourcegen.size();
+            sourcegen.emplace_back();
+            sourcegen.back().parse_function(fullLine, iObj, line.second);
+            sourceDedup.emplace( std::move(key), newIdx );
+            return newIdx;
+        }
+        const size_t newIdx = sourcegen.size();
+        sourcegen.emplace_back();
+        sourcegen.back().parse_function(fullLine, iObj, line.second);
+        return newIdx;
+    };
+
     // Loop through all the components in the netlist
     for (auto it = iObj.netlist.expNetlist.begin(); it != iObj.netlist.expNetlist.end(); it++) {
         const auto& i = *it;
@@ -145,15 +173,13 @@ void Matrix::create_components(Input& iObj) {
                 components.resistorIndices.emplace_back(components.devices.size() - 1);
                 break;
                 // Current Source
-            case 'I':
-                // Create a current source and add it to the current sources list
-                components.currentsources.emplace_back(CurrentSource(i, nodeConfig.at(cc), nm, lm, sourcegen.size()));
+            case 'I': {
+                const size_t srcIdx = get_or_create_source(i);
+                components.currentsources.emplace_back(CurrentSource(i, nodeConfig.at(cc), nm, lm, srcIdx));
                 components.csMap.emplace(components.currentsources.back().netlistInfo.label_,
                                          components.currentsources.size() - 1);
-                // Add it to the global sources list
-                sourcegen.emplace_back();
-                sourcegen.back().parse_function(Misc::vector_to_string(i.first), iObj, i.second);
                 break;
+            }
                 // Capacitors
             case 'C':
                 // Create a capacitor and add it to the component list
@@ -162,29 +188,18 @@ void Matrix::create_components(Input& iObj) {
                 components.capacitorIndices.emplace_back(components.devices.size() - 1);
                 break;
                 // Voltage/Phase Source
-            case 'P':
-                // if(iObj.argAnal == AnalysisType::Phase) {
-                //  Create a phase source and add it to the component list
-                components.devices.emplace_back(
-                        PhaseSource(i, nodeConfig.at(cc), nm, lm, nc, branchIndex, sourcegen.size()));
-                // Add it to the global sources list
-                sourcegen.emplace_back();
-                sourcegen.back().parse_function(Misc::vector_to_string(i.first), iObj, i.second);
-                // Store this phase source component list index for reference
+            case 'P': {
+                const size_t srcIdx = get_or_create_source(i);
+                components.devices.emplace_back(PhaseSource(i, nodeConfig.at(cc), nm, lm, nc, branchIndex, srcIdx));
                 components.psIndices.emplace_back(components.devices.size() - 1);
                 break;
-                //} else if(iObj.argAnal == AnalysisType::Voltage) {
-            case 'V':
-                // Create a voltage source and add it to the component list
-                components.devices.emplace_back(
-                        VoltageSource(i, nodeConfig.at(cc), nm, lm, nc, branchIndex, sourcegen.size()));
-                // Add it to the global sources list
-                sourcegen.emplace_back();
-                sourcegen.back().parse_function(Misc::vector_to_string(i.first), iObj, i.second);
-                // Store this voltage source component list index for reference
+            }
+            case 'V': {
+                const size_t srcIdx = get_or_create_source(i);
+                components.devices.emplace_back(VoltageSource(i, nodeConfig.at(cc), nm, lm, nc, branchIndex, srcIdx));
                 components.vsIndices.emplace_back(components.devices.size() - 1);
-                //}
                 break;
+            }
                 // Mutual inductance
             case 'K':
                 // Add line to the mutual inductance list for later inspection

@@ -341,10 +341,21 @@ void Input::parse_options_and_state_controls() {
                 } else if (tok.rfind("KCUTOFF=", 0) == 0) {
                     argKCutoff = std::abs(parse_param(tok.substr(8), parameters));
                 } else if (tok == "GPU" || tok == "GPU=1" || tok == "GPU=TRUE") {
-                    argGpu = true;
-                    argPar = true;
+                    argGpu     = true;
+                    argGpuMode = 1;
+                    argPar     = true;
+                } else if (tok == "GPU=2") {
+                    argGpu     = true;
+                    argGpuMode = 2;
+                    argPar     = true;
+                } else if (tok == "GPU=3" || tok == "GPUMONO" || tok == "GPUMONO=1" || tok == "GPUMONO=TRUE"
+                           || tok == "CUSOLVERRF" || tok == "CUSOLVERRF=1") {
+                    argGpu     = true;
+                    argGpuMode = 3;
+                    argPar     = true;
                 } else if (tok == "GPU=0" || tok == "GPU=FALSE") {
-                    argGpu = false;
+                    argGpu     = false;
+                    argGpuMode = 0;
                 } else if (tok.rfind("MC=", 0) == 0) {
                     argMcRuns = std::max<int64_t>(1, static_cast<int64_t>(parse_param(tok.substr(3), parameters)));
                 } else if (tok.rfind("BATCH=", 0) == 0) {

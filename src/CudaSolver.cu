@@ -6,6 +6,7 @@
 #include "JoSIM/Constants.hpp"
 
 #include <cuda_runtime.h>
+#include <cusolverRf.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1060,6 +1061,303 @@ __global__ void monolithic_eval_devices_kernel(int32_t       numJJs,
         }
         d_b[ind.curIdx]  = bVal;
         d_indIn2New[tid] = curI;
+    }
+}
+
+// Tier 3 Fully GPU-Resident Monolithic Solver Kernels (cuSolverRF + zero-PCIe device updates)
+__global__ void monolithic_full_setup_b_kernel(int32_t          numJJs,
+                                               int32_t          numRess,
+                                               int32_t          numCaps,
+                                               int32_t          numInds,
+                                               int32_t          numVSs,
+                                               int32_t          numPSs,
+                                               int32_t          numCSs,
+                                               int32_t          numCCVSs,
+                                               int32_t          numVCCSs,
+                                               int32_t          numTxHalves,
+                                               int64_t          i,
+                                               int32_t          s,
+                                               int32_t          w,
+                                               int32_t          numSources,
+                                               int64_t          simSize,
+                                               double           stepSize,
+                                               int32_t          analysisType,
+                                               const double*    __restrict__ d_x,
+                                               double*          __restrict__ d_b,
+                                               double*          __restrict__ d_csrValA,
+                                               GpuJJ*           d_jjs,
+                                               GpuRes*          d_ress,
+                                               GpuInd*          d_inds,
+                                               const GpuMut*    __restrict__ d_muts,
+                                               GpuCap*          d_caps,
+                                               GpuVS*           d_vss,
+                                               const GpuPS*     __restrict__ d_pss,
+                                               const GpuCS*     __restrict__ d_css,
+                                               GpuCCVS*         d_ccvss,
+                                               GpuVCCS*         d_vccss,
+                                               const GpuTxHalf* __restrict__ d_txHalves,
+                                               const double*    __restrict__ d_txRemote1,
+                                               const double*    __restrict__ d_txRemote2,
+                                               const double*    __restrict__ d_srcWindow,
+                                               const double*    __restrict__ d_indIn2Old,
+                                               double*          __restrict__ d_indIn2New,
+                                               int32_t*         d_numChangedNz,
+                                               int32_t*         d_needsTR) {
+    const int32_t tid        = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool    checkPhase = (static_cast<double>(i) / static_cast<double>(simSize) > 0.01);
+
+    // 1. Josephson Junctions
+    if (tid < numJJs) {
+        GpuJJ&       jj   = d_jjs[tid];
+        const double vPos = (jj.posIdx >= 0) ? d_x[jj.posIdx] : 0.0;
+        const double vNeg = (jj.negIdx >= 0) ? d_x[jj.negIdx] : 0.0;
+        jj.pn1            = vPos - vNeg;
+        if (i > 0) {
+            if (analysisType == 0) {
+                jj.vn1 = jj.pn1;
+                jj.pn1 = d_x[jj.varIdx];
+            } else {
+                jj.vn1 = d_x[jj.varIdx];
+            }
+        }
+        const double v0 = 2.5 * jj.vn1 - 2.0 * jj.vn2 + 0.5 * jj.vn3;
+        jj.phi0         = (4.0 / 3.0) * jj.pn1 - (1.0 / 3.0) * jj.pn2
+                  + ((2.0 * stepSize) / (3.0 * Constants::SIGMA)) * v0;
+        if (checkPhase && fabs(jj.phi0 - jj.pn1) > (0.20 * 2.0 * Constants::PI)) {
+            atomicExch(d_needsTR, 1);
+            return;
+        }
+        if (analysisType == 0) {
+            d_b[jj.varIdx]
+                    = Constants::SIGMA * (-(2.0 / stepSize) * jj.pn1 + (1.0 / (2.0 * stepSize)) * jj.pn2);
+        } else {
+            d_b[jj.varIdx] = (4.0 / 3.0) * jj.pn1 - (1.0 / 3.0) * jj.pn2;
+        }
+        jj.pn4 = jj.pn3;
+        jj.pn3 = jj.pn2;
+        jj.pn2 = jj.pn1;
+        jj.vn6 = jj.vn5;
+        jj.vn5 = jj.vn4;
+        jj.vn4 = jj.vn3;
+        jj.vn3 = jj.vn2;
+
+        if (jj.rtype == 1) {
+            bool         updated = false;
+            const double absV    = fabs(v0);
+            if (absV < jj.lowerB) {
+                jj.it = 0.0;
+                if (jj.curNzVal != jj.negInvSubgap) {
+                    jj.curNzVal = jj.negInvSubgap;
+                    updated     = true;
+                }
+            } else if (absV < jj.upperB) {
+                jj.it = jj.lowerB * ((1.0 / jj.r0) - jj.gLarge);
+                if (v0 < 0.0) { jj.it = -jj.it; }
+                if (jj.curNzVal != jj.negInvTrans) {
+                    jj.curNzVal = jj.negInvTrans;
+                    updated     = true;
+                }
+            } else {
+                jj.it = 0.0;
+                if (jj.curNzVal != jj.negInvNormal) {
+                    jj.curNzVal = jj.negInvNormal;
+                    updated     = true;
+                }
+            }
+            if (updated) {
+                d_csrValA[jj.nzIdx] = jj.curNzVal;
+                atomicAdd(d_numChangedNz, 1);
+            }
+        }
+
+        double ic_sin_phi = 0.0;
+        if (jj.cprLen == 1) {
+            ic_sin_phi += jj.ic * (jj.cpr[0] * sin(1.0 * (jj.phi0 - jj.phiOff)));
+        } else {
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                ic_sin_phi += jj.ic * (jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff)));
+            }
+        }
+        jj.cTerm = -(((2.0 * jj.c) / stepSize) * jj.vn1) + ((jj.c / (2.0 * stepSize)) * jj.vn2);
+        if (!jj.tDep) {
+            d_b[jj.curIdx] = jj.curNzVal * (ic_sin_phi + jj.cTerm + jj.it);
+        } else {
+            double sin2_half_phi = 0.0;
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                sin2_half_phi += jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff) / 2.0);
+            }
+            sin2_half_phi  = sin2_half_phi * sin2_half_phi;
+            double sin_phi = 0.0;
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                sin_phi += jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff));
+            }
+            const double sqrt_part = sqrt(1.0 - jj.d * sin2_half_phi);
+            d_b[jj.curIdx]
+                    = jj.curNzVal
+                      * ((((Constants::PI * jj.del) / (2.0 * Constants::EV * jj.rn)) * (sin_phi / sqrt_part)
+                          * tanh(jj.del / (2.0 * Constants::BOLTZMANN * jj.t) * sqrt_part))
+                         + jj.cTerm + jj.it);
+        }
+        jj.vn2 = jj.vn1;
+    }
+
+    // 2. Resistors (Phase mode)
+    if (analysisType == 1 && tid < numRess) {
+        GpuRes&      res  = d_ress[tid];
+        const double vPos = (res.posIdx >= 0) ? d_x[res.posIdx] : 0.0;
+        const double vNeg = (res.negIdx >= 0) ? d_x[res.negIdx] : 0.0;
+        res.pn1           = vPos - vNeg;
+        d_b[res.curIdx]   = (4.0 / 3.0) * res.pn1 - (1.0 / 3.0) * res.pn2;
+        res.pn2           = res.pn1;
+    }
+
+    // 3. Capacitors
+    if (tid < numCaps) {
+        GpuCap&      cap  = d_caps[tid];
+        const double vPos = (cap.posIdx >= 0) ? d_x[cap.posIdx] : 0.0;
+        const double vNeg = (cap.negIdx >= 0) ? d_x[cap.negIdx] : 0.0;
+        cap.pn1           = vPos - vNeg;
+        if (analysisType == 0) {
+            d_b[cap.curIdx] = (4.0 / 3.0) * cap.pn1 - (1.0 / 3.0) * cap.pn2;
+        } else {
+            d_b[cap.curIdx]
+                    = (8.0 / 3.0) * cap.pn1 - (22.0 / 9.0) * cap.pn2 + (8.0 / 9.0) * cap.pn3 - (1.0 / 9.0) * cap.pn4;
+            cap.pn4 = cap.pn3;
+            cap.pn3 = cap.pn2;
+        }
+        cap.pn2 = cap.pn1;
+    }
+
+    // 4. Inductors + Mutual Inductances (Voltage mode)
+    if (analysisType == 0 && tid < numInds) {
+        const GpuInd ind  = d_inds[tid];
+        const double h    = stepSize;
+        const double curI = d_x[ind.curIdx];
+        double       bVal = -(2.0 * ind.L / h) * curI + ((ind.L / (2.0 * h)) * d_indIn2Old[tid]);
+        for (int32_t mIdx = ind.mutStart; mIdx < ind.mutStart + ind.mutCount; ++mIdx) {
+            const GpuMut mut  = d_muts[mIdx];
+            const double mIn2 = (mut.targetIndIdx < tid) ? d_x[mut.targetCurIdx]
+                                                         : d_indIn2Old[mut.targetIndIdx];
+            bVal += (-((2.0 * mut.M) / h) * d_x[mut.targetCurIdx] + (mut.M / (2.0 * h)) * mIn2);
+        }
+        d_b[ind.curIdx]  = bVal;
+        d_indIn2New[tid] = curI;
+    }
+
+    // 5. Voltage Sources
+    if (tid < numVSs) {
+        GpuVS&       vs     = d_vss[tid];
+        const double srcVal = d_srcWindow[(s + 2) * numSources + vs.srcIdx];
+        if (analysisType == 0) {
+            d_b[vs.curIdx] = srcVal;
+        } else {
+            const double vPos = (vs.posIdx >= 0) ? d_x[vs.posIdx] : 0.0;
+            const double vNeg = (vs.negIdx >= 0) ? d_x[vs.negIdx] : 0.0;
+            vs.pn1            = vPos - vNeg;
+            d_b[vs.curIdx]
+                    = ((2.0 * stepSize) / (3.0 * Constants::SIGMA)) * srcVal + (4.0 / 3.0) * vs.pn1
+                      - (1.0 / 3.0) * vs.pn2;
+            vs.pn2 = vs.pn1;
+        }
+    }
+
+    // 6. Phase Sources
+    if (tid < numPSs) {
+        const GpuPS  ps = d_pss[tid];
+        const double s0 = d_srcWindow[(s + 2) * numSources + ps.srcIdx];
+        if (analysisType == 1) {
+            d_b[ps.curIdx] = s0;
+        } else {
+            const double s1 = d_srcWindow[(s + 1) * numSources + ps.srcIdx];
+            const double s2 = d_srcWindow[s * numSources + ps.srcIdx];
+            if (i == 0) {
+                d_b[ps.curIdx] = (Constants::SIGMA / stepSize) * (1.5 * s0);
+            } else if (i == 1) {
+                d_b[ps.curIdx] = (Constants::SIGMA / stepSize) * (1.5 * s0 - 2.0 * s1);
+            } else {
+                d_b[ps.curIdx] = (Constants::SIGMA / stepSize) * (1.5 * s0 - 2.0 * s1 + 0.5 * s2);
+            }
+        }
+    }
+
+    // 7. Current Sources (atomicAdd for shared node KCL)
+    if (tid < numCSs) {
+        const GpuCS  cs     = d_css[tid];
+        const double srcVal = d_srcWindow[(s + 2) * numSources + cs.srcIdx];
+        if (cs.posIdx >= 0) { atomicAdd(&d_b[cs.posIdx], -srcVal); }
+        if (cs.negIdx >= 0) { atomicAdd(&d_b[cs.negIdx], srcVal); }
+    }
+
+    // 8. CCVS & VCCS (Phase mode)
+    if (analysisType == 1) {
+        if (tid < numCCVSs) {
+            GpuCCVS&     ccvs = d_ccvss[tid];
+            const double vPos = (ccvs.posIdx >= 0) ? d_x[ccvs.posIdx] : 0.0;
+            const double vNeg = (ccvs.negIdx >= 0) ? d_x[ccvs.negIdx] : 0.0;
+            ccvs.pn1          = vPos - vNeg;
+            d_b[ccvs.curIdx]  = (4.0 / 3.0) * ccvs.pn1 - (1.0 / 3.0) * ccvs.pn2;
+            ccvs.pn2          = ccvs.pn1;
+        }
+        if (tid < numVCCSs) {
+            GpuVCCS&     vccs = d_vccss[tid];
+            const double vPos = (vccs.posIdx2 >= 0) ? d_x[vccs.posIdx2] : 0.0;
+            const double vNeg = (vccs.negIdx2 >= 0) ? d_x[vccs.negIdx2] : 0.0;
+            vccs.pn1          = vPos - vNeg;
+            d_b[vccs.curIdx]  = (4.0 / 3.0) * vccs.pn1 - (1.0 / 3.0) * vccs.pn2;
+            vccs.pn2          = vccs.pn1;
+        }
+    }
+
+    // 9. Transmission Line Port Halves
+    if (tid < numTxHalves) {
+        const GpuTxHalf txh = d_txHalves[tid];
+        const double    rem = (txh.isPort2 == 0) ? d_txRemote1[txh.txIdx * w + s] : d_txRemote2[txh.txIdx * w + s];
+        if (analysisType == 0) {
+            d_b[txh.curIdx] = rem;
+        } else {
+            d_b[txh.curIdx] = (4.0 / 3.0) * txh.n1 - (1.0 / 3.0) * txh.n2 + rem;
+        }
+    }
+}
+
+__global__ void monolithic_full_post_solve_kernel(int32_t          numTxHalves,
+                                                  int32_t          numRelTraces,
+                                                  int32_t          numKeptSteps,
+                                                  int64_t          i,
+                                                  int32_t          analysisType,
+                                                  const double*    __restrict__ d_x,
+                                                  GpuTxHalf*       d_txHalves,
+                                                  const GpuTxLine* __restrict__ d_txLines,
+                                                  GpuTxHistEntry*  d_txHist,
+                                                  const GpuRelTrace* __restrict__ d_relTraces,
+                                                  const int32_t*   __restrict__ d_keptSlot,
+                                                  double*          d_traceOut) {
+    const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < numTxHalves) {
+        GpuTxHalf       txh   = d_txHalves[tid];
+        const GpuTxLine tx    = d_txLines[txh.txIdx];
+        const double    vPos  = (txh.posIdx >= 0) ? d_x[txh.posIdx] : 0.0;
+        const double    vNeg  = (txh.negIdx >= 0) ? d_x[txh.negIdx] : 0.0;
+        const double    vPort = vPos - vNeg;
+        const double    iPort = d_x[txh.curIdx];
+        const int32_t   hSlot = tx.histOffset + static_cast<int32_t>((tx.loadedSteps + i) % tx.histSize);
+        if (txh.isPort2 == 0) {
+            d_txHist[hSlot].v1 = vPort;
+            d_txHist[hSlot].i1 = iPort;
+        } else {
+            d_txHist[hSlot].v2 = vPort;
+            d_txHist[hSlot].i2 = iPort;
+        }
+        if (analysisType == 1) {
+            txh.n2          = txh.n1;
+            txh.n1          = vPort;
+            d_txHalves[tid] = txh;
+        }
+    }
+    const int32_t kSlot = d_keptSlot[i];
+    if (kSlot >= 0 && tid < numRelTraces) {
+        const GpuRelTrace rt = d_relTraces[tid];
+        d_traceOut[static_cast<size_t>(rt.traceSlot) * numKeptSteps + kSlot] = d_x[rt.localAbsIdx];
     }
 }
 
@@ -2119,6 +2417,306 @@ bool CudaPartitionSolver::step_monolithic_devices(
     return true;
 }
 
+bool CudaPartitionSolver::initialize_monolithic_full(int32_t                            totalRows,
+                                                     int32_t                            numSources,
+                                                     int32_t                            maxWindow,
+                                                     int32_t                            numRelTraces,
+                                                     int32_t                            numKeptSteps,
+                                                     int64_t                            simSize,
+                                                     double                             stepSize,
+                                                     int32_t                            analysisType,
+                                                     const std::vector<int32_t>&        csrRowPtrA,
+                                                     const std::vector<int32_t>&        csrColIndA,
+                                                     const std::vector<double>&         csrValA,
+                                                     const std::vector<int32_t>&        csrRowPtrL,
+                                                     const std::vector<int32_t>&        csrColIndL,
+                                                     const std::vector<double>&         csrValL,
+                                                     const std::vector<int32_t>&        csrRowPtrU,
+                                                     const std::vector<int32_t>&        csrColIndU,
+                                                     const std::vector<double>&         csrValU,
+                                                     const std::vector<int32_t>&        P,
+                                                     const std::vector<int32_t>&        Q,
+                                                     const std::vector<double>&         xInit,
+                                                     const std::vector<GpuJJ>&          jjs,
+                                                     const std::vector<GpuRes>&         ress,
+                                                     const std::vector<GpuInd>&         inds,
+                                                     const std::vector<GpuMut>&         muts,
+                                                     const std::vector<GpuCap>&         caps,
+                                                     const std::vector<GpuVS>&          vss,
+                                                     const std::vector<GpuPS>&          pss,
+                                                     const std::vector<GpuCS>&          css,
+                                                     const std::vector<GpuCCVS>&        ccvss,
+                                                     const std::vector<GpuVCCS>&        vccss,
+                                                     const std::vector<GpuTxHalf>&      txHalves,
+                                                     const std::vector<GpuTxLine>&      txLines,
+                                                     const std::vector<GpuTxHistEntry>& txHist,
+                                                     const std::vector<GpuRelTrace>&    relTraces,
+                                                     const std::vector<int32_t>&        keptSlot) {
+    free_device();
+
+    int deviceCount = 0;
+    if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount <= 0) { return false; }
+
+    mcRuns_       = 1;
+    nParts_       = 1;
+    totalRows_    = totalRows;
+    numSources_   = numSources;
+    maxWindow_    = std::max<int32_t>(1, maxWindow);
+    numRelTraces_ = numRelTraces;
+    numKeptSteps_ = numKeptSteps;
+    numTxLines_   = static_cast<int32_t>(txLines.size());
+    numJJs_       = static_cast<int32_t>(jjs.size());
+    numRess_      = static_cast<int32_t>(ress.size());
+    numCaps_      = static_cast<int32_t>(caps.size());
+    numInds_      = static_cast<int32_t>(inds.size());
+    numVSs_       = static_cast<int32_t>(vss.size());
+    numPSs_       = static_cast<int32_t>(pss.size());
+    numCSs_       = static_cast<int32_t>(css.size());
+    numCCVSs_     = static_cast<int32_t>(ccvss.size());
+    numVCCSs_        = static_cast<int32_t>(vccss.size());
+    numTxHalves_     = static_cast<int32_t>(txHalves.size());
+    nnzA_            = static_cast<int32_t>(csrValA.size());
+    hasSwitchingJJs_ = false;
+    for (const auto& jj : jjs) {
+        if (jj.rtype == 1) {
+            hasSwitchingJJs_ = true;
+            break;
+        }
+    }
+    h_keptSlot_   = keptSlot;
+    simSize_      = simSize;
+    stepSize_     = stepSize;
+    analysisType_ = analysisType;
+
+    // Upload CSR matrix A, permutation vectors P and Q, and solution/RHS vectors
+    if (!alloc_and_upload(&d_luRp_, csrRowPtrA)) { return false; }
+    if (!alloc_and_upload(&d_luCi_, csrColIndA)) { return false; }
+    if (!alloc_and_upload(&d_partNz_, csrValA)) { return false; }
+    if (!alloc_and_upload(&d_P_, P)) { return false; }
+    if (!alloc_and_upload(&d_Q_, Q)) { return false; }
+    if (!alloc_and_upload(&d_xLocal_, xInit)) { return false; }
+    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_bLocal_), totalRows_ * sizeof(double)));
+    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_rfTemp_), totalRows_ * sizeof(double)));
+
+    if (!alloc_and_upload(&d_jjs_, jjs)) { return false; }
+    if (!alloc_and_upload(&d_ress_, ress)) { return false; }
+    if (!alloc_and_upload(&d_inds_, inds)) { return false; }
+    if (!alloc_and_upload(&d_muts_, muts)) { return false; }
+    if (!alloc_and_upload(&d_caps_, caps)) { return false; }
+    if (!alloc_and_upload(&d_vss_, vss)) { return false; }
+    if (!alloc_and_upload(&d_pss_, pss)) { return false; }
+    if (!alloc_and_upload(&d_css_, css)) { return false; }
+    if (!alloc_and_upload(&d_ccvss_, ccvss)) { return false; }
+    if (!alloc_and_upload(&d_vccss_, vccss)) { return false; }
+    if (!alloc_and_upload(&d_txHalves_, txHalves)) { return false; }
+    if (!alloc_and_upload(&d_txLines_, txLines)) { return false; }
+    if (!alloc_and_upload(&d_txHist_, txHist)) { return false; }
+    if (!alloc_and_upload(&d_relTraces_, relTraces)) { return false; }
+    if (!alloc_and_upload(&d_keptSlot_, keptSlot)) { return false; }
+
+    if (numInds_ > 0) {
+        std::vector<double> indIn2(numInds_, 0.0);
+        for (int32_t idx = 0; idx < numInds_; ++idx) { indIn2[idx] = inds[idx].In2; }
+        if (!alloc_and_upload(&d_indIn2Old_, indIn2)) { return false; }
+        JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_indIn2New_), numInds_ * sizeof(double)));
+    }
+    if (numTxLines_ > 0 && maxWindow_ > 0) {
+        const size_t remBytes = static_cast<size_t>(numTxLines_) * maxWindow_ * sizeof(double);
+        JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_txRemote1_), remBytes));
+        JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_txRemote2_), remBytes));
+    }
+    if (numSources_ > 0 && maxWindow_ > 0) {
+        const size_t srcBytes = static_cast<size_t>(maxWindow_ + 2) * numSources_ * sizeof(double);
+        JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_srcWindow_), srcBytes));
+    }
+    if (numRelTraces_ > 0 && numKeptSteps_ > 0) {
+        const size_t traceBytes = static_cast<size_t>(numRelTraces_) * numKeptSteps_ * sizeof(double);
+        JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_traceOut_), traceBytes));
+    }
+    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_numChangedNz_), sizeof(int32_t)));
+    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_needsTR_), sizeof(int32_t)));
+    JOSIM_CUDA_CHECK(cudaMemset(d_numChangedNz_, 0, sizeof(int32_t)));
+    JOSIM_CUDA_CHECK(cudaMemset(d_needsTR_, 0, sizeof(int32_t)));
+
+    // Initialize cuSolverRF handle, setup host factors L and U, analyze DAG, and perform initial refactorization
+    cusolverRfHandle_t rf = nullptr;
+    if (cusolverRfCreate(&rf) != CUSOLVER_STATUS_SUCCESS || rf == nullptr) { return false; }
+    rfHandle_ = reinterpret_cast<void*>(rf);
+
+    if (cusolverRfSetMatrixFormat(rf, CUSOLVERRF_MATRIX_FORMAT_CSR, CUSOLVERRF_UNIT_DIAGONAL_STORED_L)
+        != CUSOLVER_STATUS_SUCCESS) {
+        return false;
+    }
+    if (cusolverRfSetAlgs(rf, CUSOLVERRF_FACTORIZATION_ALG0, CUSOLVERRF_TRIANGULAR_SOLVE_ALG1)
+        != CUSOLVER_STATUS_SUCCESS) {
+        return false;
+    }
+    if (cusolverRfSetResetValuesFastMode(rf, CUSOLVERRF_RESET_VALUES_FAST_MODE_ON) != CUSOLVER_STATUS_SUCCESS) {
+        return false;
+    }
+
+    if (cusolverRfSetupHost(totalRows_,
+                            nnzA_,
+                            const_cast<int32_t*>(csrRowPtrA.data()),
+                            const_cast<int32_t*>(csrColIndA.data()),
+                            const_cast<double*>(csrValA.data()),
+                            static_cast<int32_t>(csrValL.size()),
+                            const_cast<int32_t*>(csrRowPtrL.data()),
+                            const_cast<int32_t*>(csrColIndL.data()),
+                            const_cast<double*>(csrValL.data()),
+                            static_cast<int32_t>(csrValU.size()),
+                            const_cast<int32_t*>(csrRowPtrU.data()),
+                            const_cast<int32_t*>(csrColIndU.data()),
+                            const_cast<double*>(csrValU.data()),
+                            const_cast<int32_t*>(P.data()),
+                            const_cast<int32_t*>(Q.data()),
+                            rf)
+        != CUSOLVER_STATUS_SUCCESS) {
+        return false;
+    }
+
+    if (cusolverRfAnalyze(rf) != CUSOLVER_STATUS_SUCCESS) { return false; }
+    if (cusolverRfResetValues(totalRows_, nnzA_, d_luRp_, d_luCi_, d_partNz_, d_P_, d_Q_, rf)
+        != CUSOLVER_STATUS_SUCCESS) {
+        return false;
+    }
+    if (cusolverRfRefactor(rf) != CUSOLVER_STATUS_SUCCESS) { return false; }
+
+    initialized_ = true;
+    return true;
+}
+
+bool CudaPartitionSolver::step_monolithic_full_window(int64_t i0, int64_t i1, const double* h_srcWindow) {
+    const int32_t w = static_cast<int32_t>(i1 - i0);
+    if (w <= 0) { return true; }
+
+    cusolverRfHandle_t rf = reinterpret_cast<cusolverRfHandle_t>(rfHandle_);
+    if (rf == nullptr) { return false; }
+
+    if (numSources_ > 0 && h_srcWindow != nullptr) {
+        const size_t srcBytes = static_cast<size_t>(w + 2) * numSources_ * sizeof(double);
+        JOSIM_CUDA_CHECK(cudaMemcpy(d_srcWindow_, h_srcWindow, srcBytes, cudaMemcpyHostToDevice));
+    }
+
+    if (numTxLines_ > 0) {
+        const int32_t total  = numTxLines_ * w;
+        const int32_t block  = 128;
+        const int32_t blocks = (total + block - 1) / block;
+        precompute_tx_remote_kernel<<<blocks, block>>>(numTxLines_,
+                                                       i0,
+                                                       w,
+                                                       stepSize_,
+                                                       analysisType_,
+                                                       d_txLines_,
+                                                       d_txHist_,
+                                                       d_txRemote1_,
+                                                       d_txRemote2_);
+    }
+
+    const int32_t nResWork = (analysisType_ == 1) ? numRess_ : 0;
+    const int32_t nIndWork = (analysisType_ == 0) ? numInds_ : 0;
+    int32_t       maxDev   = std::max(std::max(numJJs_, nResWork), std::max(numCaps_, nIndWork));
+    maxDev                 = std::max(maxDev, std::max(numVSs_, numPSs_));
+    maxDev                 = std::max(maxDev, std::max(numCSs_, numTxHalves_));
+    if (analysisType_ == 1) { maxDev = std::max(maxDev, std::max(numCCVSs_, numVCCSs_)); }
+
+    const int32_t devBlock  = 256;
+    const int32_t devBlocks = (maxDev + devBlock - 1) / devBlock;
+
+    const int32_t postItems  = std::max(numTxHalves_, numRelTraces_);
+    const int32_t postBlock  = 128;
+    const int32_t postBlocks = (postItems + postBlock - 1) / postBlock;
+
+    for (int32_t s = 0; s < w; ++s) {
+        const int64_t i = i0 + s;
+        JOSIM_CUDA_CHECK(cudaMemsetAsync(d_bLocal_, 0, totalRows_ * sizeof(double)));
+        if (maxDev > 0) {
+            monolithic_full_setup_b_kernel<<<devBlocks, devBlock>>>(numJJs_,
+                                                                    numRess_,
+                                                                    numCaps_,
+                                                                    numInds_,
+                                                                    numVSs_,
+                                                                    numPSs_,
+                                                                    numCSs_,
+                                                                    numCCVSs_,
+                                                                    numVCCSs_,
+                                                                    numTxHalves_,
+                                                                    i,
+                                                                    s,
+                                                                    w,
+                                                                    numSources_,
+                                                                    simSize_,
+                                                                    stepSize_,
+                                                                    analysisType_,
+                                                                    d_xLocal_,
+                                                                    d_bLocal_,
+                                                                    d_partNz_,
+                                                                    d_jjs_,
+                                                                    d_ress_,
+                                                                    d_inds_,
+                                                                    d_muts_,
+                                                                    d_caps_,
+                                                                    d_vss_,
+                                                                    d_pss_,
+                                                                    d_css_,
+                                                                    d_ccvss_,
+                                                                    d_vccss_,
+                                                                    d_txHalves_,
+                                                                    d_txRemote1_,
+                                                                    d_txRemote2_,
+                                                                    d_srcWindow_,
+                                                                    d_indIn2Old_,
+                                                                    d_indIn2New_,
+                                                                    d_numChangedNz_,
+                                                                    d_needsTR_);
+            if (analysisType_ == 0 && numInds_ > 0) { std::swap(d_indIn2Old_, d_indIn2New_); }
+        }
+
+        if (hasSwitchingJJs_) {
+            int32_t h_numChanged = 0;
+            JOSIM_CUDA_CHECK(
+                    cudaMemcpy(&h_numChanged, d_numChangedNz_, sizeof(int32_t), cudaMemcpyDeviceToHost));
+            if (h_numChanged > 0) {
+                JOSIM_CUDA_CHECK(cudaMemsetAsync(d_numChangedNz_, 0, sizeof(int32_t)));
+                if (cusolverRfResetValues(
+                            totalRows_, nnzA_, d_luRp_, d_luCi_, d_partNz_, d_P_, d_Q_, rf)
+                    != CUSOLVER_STATUS_SUCCESS) {
+                    return false;
+                }
+                if (cusolverRfRefactor(rf) != CUSOLVER_STATUS_SUCCESS) { return false; }
+            }
+        }
+
+        if (cusolverRfSolve(rf, d_P_, d_Q_, 1, d_rfTemp_, totalRows_, d_bLocal_, totalRows_)
+            != CUSOLVER_STATUS_SUCCESS) {
+            return false;
+        }
+        std::swap(d_xLocal_, d_bLocal_);
+
+        const bool needPost = (numTxHalves_ > 0)
+                              || (d_keptSlot_ != nullptr && i >= 0
+                                  && i < static_cast<int64_t>(h_keptSlot_.size()) && h_keptSlot_[i] >= 0);
+        if (postItems > 0 && needPost) {
+            monolithic_full_post_solve_kernel<<<postBlocks, postBlock>>>(numTxHalves_,
+                                                                         numRelTraces_,
+                                                                         numKeptSteps_,
+                                                                         i,
+                                                                         analysisType_,
+                                                                         d_xLocal_,
+                                                                         d_txHalves_,
+                                                                         d_txLines_,
+                                                                         d_txHist_,
+                                                                         d_relTraces_,
+                                                                         d_keptSlot_,
+                                                                         d_traceOut_);
+        }
+    }
+
+    int32_t h_needsTR = 0;
+    JOSIM_CUDA_CHECK(cudaMemcpy(&h_needsTR, d_needsTR_, sizeof(int32_t), cudaMemcpyDeviceToHost));
+    return (h_needsTR == 0);
+}
+
 void CudaPartitionSolver::download_results(std::vector<double>& h_traceOut,
                                            std::vector<double>& h_xFinal) {
     if (!initialized_) { return; }
@@ -2145,6 +2743,11 @@ void CudaPartitionSolver::download_results(std::vector<double>& h_traceOut,
 }
 
 void CudaPartitionSolver::free_device() {
+    if (rfHandle_ != nullptr) {
+        cusolverRfDestroy(reinterpret_cast<cusolverRfHandle_t>(rfHandle_));
+        rfHandle_ = nullptr;
+    }
+    safe_cuda_free(d_rfTemp_);
     safe_cuda_free(d_parts_);
     safe_cuda_free(d_P_);
     safe_cuda_free(d_Q_);

@@ -37,6 +37,7 @@ class Input {
     bool                                                         argMin;
     bool                                                         argPar          = false;
     bool                                                         argGpu          = false;
+    int64_t                                                      argGpuMode      = 1;
     bool                                                         argFixedStep    = false;
     bool                                                         argWarnStep     = false;
     bool                                                         argTxInterp     = false;
@@ -57,6 +58,7 @@ class Input {
         argMin                     = cli_options.minimal;
         argPar                     = cli_options.parallel;
         argGpu                     = cli_options.gpu;
+        argGpuMode                 = cli_options.gpuMode;
         argFixedStep               = cli_options.fixedStep;
         argCorrector               = cli_options.corrector;
         argMcRuns                  = cli_options.batchRuns;

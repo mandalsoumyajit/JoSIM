@@ -29,6 +29,7 @@ struct CliOptions {
     bool                            minimal       = false;
     bool                            parallel      = false;
     bool                            gpu           = false;
+    int64_t                         gpuMode       = 1;
     bool                            fixedStep     = false;
     int64_t                         corrector     = 0;
     int64_t                         batchRuns     = 1;

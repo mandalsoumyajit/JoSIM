@@ -54,6 +54,7 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     minOut_                  = iObj.argMin;
     parallel_                = iObj.argPar;
     gpu_                     = iObj.argGpu;
+    gpuMode_                 = iObj.argGpuMode;
 #ifdef JOSIM_CUDA
     if (gpu_) { CudaPartitionSolver::warmup_device(); }
 #endif
@@ -254,6 +255,7 @@ void Simulation::setup_partitions(Matrix& mObj) {
     cudaSolver_.reset();
 #endif
     const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
+    if (gpu_ && gpuMode_ >= 2 && mcRuns_ <= 1) { return; }
     if (N < 32 && mcRuns_ <= 1) { return; }
     if (N < 4) { return; }
 
@@ -1020,6 +1022,389 @@ bool Simulation::setup_gpu_monolithic(Matrix& mObj) {
 #endif
 }
 
+bool Simulation::setup_gpu_monolithic_full(Matrix& mObj) {
+#if defined(JOSIM_CUDA) && !defined(SLU)
+    if (usePartitions_ || hasJJThermalNoise_ || hasResistorThermalNoise_ || correctorIter_ > 0
+        || saveStateFile_.has_value()) {
+        return false;
+    }
+    const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
+    if (N < 4 || !Symbolic_ || !Numeric_ || !Symbolic_->Q || !Numeric_->Pnum || Common_.btf != 0 || Common_.scale != 0
+        || Numeric_->Offp[N] != 0) {
+        return false;
+    }
+
+    const int64_t lnz = Numeric_->lnz;
+    const int64_t unz = Numeric_->unz;
+    if (lnz <= 0 || unz <= 0) { return false; }
+
+    std::vector<int64_t> Lp64(N + 1), Li64(lnz), Up64(N + 1), Ui64(unz);
+    std::vector<int64_t> Fp64(N + 1), Fi64(1), Pnum64(N), Q64(N), R64(N + 1);
+    std::vector<double>  Lx(lnz), Ux(unz), Fx(1), Rs(N);
+    if (!klu_l_extract(Numeric_,
+                       Symbolic_,
+                       Lp64.data(),
+                       Li64.data(),
+                       Lx.data(),
+                       Up64.data(),
+                       Ui64.data(),
+                       Ux.data(),
+                       Fp64.data(),
+                       Fi64.data(),
+                       Fx.data(),
+                       Pnum64.data(),
+                       Q64.data(),
+                       Rs.data(),
+                       R64.data(),
+                       &Common_)) {
+        return false;
+    }
+
+    // Permutations for CSR matrix A: (P * A * Q) = L_csr * U_csr
+    // where P[r] = Symbolic_->Q[r] and Q[c] = Numeric_->Pnum[c]
+    std::vector<int32_t> P(N), Q(N);
+    for (int64_t i = 0; i < N; ++i) {
+        P[i] = static_cast<int32_t>(Q64[i]);
+        Q[i] = static_cast<int32_t>(Pnum64[i]);
+    }
+
+    // Build sorted CSR factors L_csr (unit diagonal) and U_csr (non-unit diagonal)
+    // From KLU: (P_klu * A^T * Q_klu)^T = U_klu^T * L_klu^T = (U_klu^T * D^{-1}) * (D * L_klu^T)
+    std::vector<double>  diagD(N, 1.0);
+    std::vector<int32_t> csrRowPtrL(N + 1, 0), csrColIndL(unz, 0);
+    std::vector<double>  csrValL(unz, 0.0);
+    std::vector<std::pair<int32_t, double>> rowBuf;
+    for (int64_t r = 0; r < N; ++r) {
+        const int64_t kStart = Up64[r];
+        const int64_t kEnd   = Up64[r + 1];
+        csrRowPtrL[r]        = static_cast<int32_t>(kStart);
+        rowBuf.clear();
+        for (int64_t k = kStart; k < kEnd; ++k) {
+            rowBuf.emplace_back(static_cast<int32_t>(Ui64[k]), Ux[k]);
+        }
+        std::sort(rowBuf.begin(), rowBuf.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (rowBuf.empty() || rowBuf.back().first != static_cast<int32_t>(r) || rowBuf.back().second == 0.0) {
+            return false;
+        }
+        diagD[r] = rowBuf.back().second;
+        for (size_t idx = 0; idx < rowBuf.size(); ++idx) {
+            const int32_t col        = rowBuf[idx].first;
+            csrColIndL[kStart + idx] = col;
+            csrValL[kStart + idx]    = (col == static_cast<int32_t>(r)) ? 1.0 : (rowBuf[idx].second / diagD[col]);
+        }
+    }
+    csrRowPtrL[N] = static_cast<int32_t>(unz);
+
+    std::vector<int32_t> csrRowPtrU(N + 1, 0), csrColIndU(lnz, 0);
+    std::vector<double>  csrValU(lnz, 0.0);
+    for (int64_t r = 0; r < N; ++r) {
+        const int64_t kStart = Lp64[r];
+        const int64_t kEnd   = Lp64[r + 1];
+        csrRowPtrU[r]        = static_cast<int32_t>(kStart);
+        rowBuf.clear();
+        for (int64_t k = kStart; k < kEnd; ++k) {
+            rowBuf.emplace_back(static_cast<int32_t>(Li64[k]), Lx[k]);
+        }
+        std::sort(rowBuf.begin(), rowBuf.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (rowBuf.empty() || rowBuf.front().first != static_cast<int32_t>(r)) { return false; }
+        const double dR = diagD[r];
+        for (size_t idx = 0; idx < rowBuf.size(); ++idx) {
+            csrColIndU[kStart + idx] = rowBuf[idx].first;
+            csrValU[kStart + idx]    = rowBuf[idx].second * dR;
+        }
+    }
+    csrRowPtrU[N] = static_cast<int32_t>(lnz);
+
+    // Deduplicate and sort CSR matrix A while mapping original nonzero indices to deduplicated CSR indices
+    std::vector<int32_t> csrRowPtrA(N + 1, 0);
+    std::vector<int32_t> csrColIndA;
+    std::vector<double>  csrValA;
+    csrColIndA.reserve(mObj.ci.size());
+    csrValA.reserve(mObj.nz.size());
+    std::vector<int32_t> origNzToDedupNz(mObj.nz.size(), -1);
+    std::vector<std::pair<int32_t, int64_t>> colOrigPairs;
+    for (int64_t r = 0; r < N; ++r) {
+        csrRowPtrA[r]        = static_cast<int32_t>(csrColIndA.size());
+        const int64_t kStart = mObj.rp[r];
+        const int64_t kEnd   = mObj.rp[r + 1];
+        colOrigPairs.clear();
+        for (int64_t k = kStart; k < kEnd; ++k) {
+            colOrigPairs.emplace_back(static_cast<int32_t>(mObj.ci[k]), k);
+        }
+        std::sort(colOrigPairs.begin(), colOrigPairs.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+        for (size_t idx = 0; idx < colOrigPairs.size(); ++idx) {
+            const int32_t col   = colOrigPairs[idx].first;
+            const int64_t origK = colOrigPairs[idx].second;
+            if (!csrColIndA.empty() && static_cast<int32_t>(csrColIndA.size()) > csrRowPtrA[r]
+                && csrColIndA.back() == col) {
+                csrValA.back()        += mObj.nz[origK];
+                origNzToDedupNz[origK] = static_cast<int32_t>(csrValA.size()) - 1;
+            } else {
+                origNzToDedupNz[origK] = static_cast<int32_t>(csrValA.size());
+                csrColIndA.push_back(col);
+                csrValA.push_back(mObj.nz[origK]);
+            }
+        }
+    }
+    csrRowPtrA[N] = static_cast<int32_t>(csrColIndA.size());
+
+    // Populate device arrays
+    std::vector<GpuJJ>     gpuJJs(jjs_.size());
+    std::vector<GpuRes>    gpuRess(resistors_.size());
+    std::vector<GpuInd>    gpuInds(inductors_.size());
+    std::vector<GpuMut>    gpuMuts;
+    std::vector<GpuCap>    gpuCaps(capacitors_.size());
+    std::vector<GpuVS>     gpuVSs(vsources_.size());
+    std::vector<GpuPS>     gpuPSs(psources_.size());
+    std::vector<GpuCS>     gpuCSs(mObj.components.currentsources.size());
+    std::vector<GpuCCVS>   gpuCCVSs(ccvss_.size());
+    std::vector<GpuVCCS>   gpuVCCSs(vccss_.size());
+    std::vector<GpuTxHalf> gpuTxHalves;
+
+    for (size_t idx = 0; idx < jjs_.size(); ++idx) {
+        const auto& jj   = jjs_[idx];
+        const auto& m    = jj.model_;
+        GpuJJ&      gjj  = gpuJJs[idx];
+        gjj.posIdx       = jj.indexInfo.posIndex_ ? static_cast<int32_t>(jj.indexInfo.posIndex_.value()) : -1;
+        gjj.negIdx       = jj.indexInfo.negIndex_ ? static_cast<int32_t>(jj.indexInfo.negIndex_.value()) : -1;
+        gjj.curIdx       = static_cast<int32_t>(jj.indexInfo.currentIndex_.value());
+        gjj.varIdx       = static_cast<int32_t>(jj.variableIndex_);
+        gjj.nzIdx        = origNzToDedupNz[jj.nzBackIndex_];
+        gjj.rtype        = m.rtype();
+        gjj.tDep         = m.tDep() ? 1 : 0;
+        const auto& cpr  = m.cpr();
+        gjj.cprLen       = std::min<int32_t>(8, static_cast<int32_t>(cpr.size()));
+        for (int32_t h = 0; h < gjj.cprLen; ++h) { gjj.cpr[h] = cpr[h]; }
+        gjj.ic           = m.ic();
+        gjj.c            = m.c();
+        gjj.r0           = m.r0();
+        gjj.rn           = m.rn();
+        gjj.phiOff       = m.phiOff();
+        gjj.t            = m.t();
+        gjj.d            = m.d();
+        gjj.del          = jj.del_;
+        gjj.lowerB       = jj.lowerB_;
+        gjj.upperB       = jj.upperB_;
+        gjj.gLarge       = jj.gLarge_;
+        gjj.negInvSubgap = jj.negInvSubgap_;
+        gjj.negInvTrans  = jj.negInvTrans_;
+        gjj.negInvNormal = jj.negInvNormal_;
+        gjj.pn1          = jj.pn1_;
+        gjj.pn2          = jj.pn2_;
+        gjj.pn3          = jj.pn3_;
+        gjj.pn4          = jj.pn4_;
+        gjj.phi0         = jj.phi0_;
+        gjj.vn1          = jj.vn1_;
+        gjj.vn2          = jj.vn2_;
+        gjj.vn3          = jj.vn3_;
+        gjj.vn4          = jj.vn4_;
+        gjj.vn5          = jj.vn5_;
+        gjj.vn6          = jj.vn6_;
+        gjj.it           = jj.it_;
+        gjj.curNzVal     = jj.matrixInfo.nonZeros_.back();
+        gjj.cTerm        = jj.cTerm_;
+    }
+
+    for (size_t idx = 0; idx < resistors_.size(); ++idx) {
+        const auto& res  = resistors_[idx];
+        GpuRes&     gres = gpuRess[idx];
+        gres.posIdx      = res.indexInfo.posIndex_ ? static_cast<int32_t>(res.indexInfo.posIndex_.value()) : -1;
+        gres.negIdx      = res.indexInfo.negIndex_ ? static_cast<int32_t>(res.indexInfo.negIndex_.value()) : -1;
+        gres.curIdx      = static_cast<int32_t>(res.indexInfo.currentIndex_.value());
+        gres.pn1         = res.pn1_;
+        gres.pn2         = res.pn2_;
+    }
+
+    for (size_t idx = 0; idx < inductors_.size(); ++idx) {
+        const auto& ind  = inductors_[idx];
+        GpuInd&     gind = gpuInds[idx];
+        gind.curIdx      = static_cast<int32_t>(ind.indexInfo.currentIndex_.value());
+        gind.mutStart    = static_cast<int32_t>(gpuMuts.size());
+        gind.L           = ind.netlistInfo.value_;
+        gind.In2         = ind.In2_;
+        gind.In3         = ind.In3_;
+        gind.In4         = ind.In4_;
+        for (const auto& m : ind.get_mutualInductance()) {
+            GpuMut gmut{};
+            gmut.targetIndIdx = static_cast<int32_t>(m.first);
+            gmut.targetCurIdx = static_cast<int32_t>(inductors_[m.first].indexInfo.currentIndex_.value());
+            gmut.M            = m.second;
+            gpuMuts.push_back(gmut);
+        }
+        gind.mutCount = static_cast<int32_t>(gpuMuts.size()) - gind.mutStart;
+    }
+
+    for (size_t idx = 0; idx < capacitors_.size(); ++idx) {
+        const auto& cap  = capacitors_[idx];
+        GpuCap&     gcap = gpuCaps[idx];
+        gcap.posIdx      = cap.indexInfo.posIndex_ ? static_cast<int32_t>(cap.indexInfo.posIndex_.value()) : -1;
+        gcap.negIdx      = cap.indexInfo.negIndex_ ? static_cast<int32_t>(cap.indexInfo.negIndex_.value()) : -1;
+        gcap.curIdx      = static_cast<int32_t>(cap.indexInfo.currentIndex_.value());
+        gcap.pn1         = cap.pn1_;
+        gcap.pn2         = cap.pn2_;
+        gcap.pn3         = cap.pn3_;
+        gcap.pn4         = cap.pn4_;
+    }
+
+    for (size_t idx = 0; idx < vsources_.size(); ++idx) {
+        const auto& vs  = vsources_[idx];
+        GpuVS&      gvs = gpuVSs[idx];
+        gvs.posIdx      = vs.indexInfo.posIndex_ ? static_cast<int32_t>(vs.indexInfo.posIndex_.value()) : -1;
+        gvs.negIdx      = vs.indexInfo.negIndex_ ? static_cast<int32_t>(vs.indexInfo.negIndex_.value()) : -1;
+        gvs.curIdx      = static_cast<int32_t>(vs.indexInfo.currentIndex_.value());
+        gvs.srcIdx      = static_cast<int32_t>(vs.sourceIndex_);
+        gvs.pn1         = vs.pn1_;
+        gvs.pn2         = vs.pn2_;
+    }
+
+    for (size_t idx = 0; idx < psources_.size(); ++idx) {
+        const auto& ps  = psources_[idx];
+        GpuPS&      gps = gpuPSs[idx];
+        gps.curIdx      = static_cast<int32_t>(ps.indexInfo.currentIndex_.value());
+        gps.srcIdx      = static_cast<int32_t>(ps.sourceIndex_);
+    }
+
+    for (size_t idx = 0; idx < mObj.components.currentsources.size(); ++idx) {
+        const auto& cs  = mObj.components.currentsources[idx];
+        GpuCS&      gcs = gpuCSs[idx];
+        gcs.posIdx      = cs.indexInfo.posIndex_ ? static_cast<int32_t>(cs.indexInfo.posIndex_.value()) : -1;
+        gcs.negIdx      = cs.indexInfo.negIndex_ ? static_cast<int32_t>(cs.indexInfo.negIndex_.value()) : -1;
+        gcs.srcIdx      = static_cast<int32_t>(cs.sourceIndex_);
+    }
+
+    for (size_t idx = 0; idx < ccvss_.size(); ++idx) {
+        const auto& ccvs  = ccvss_[idx];
+        GpuCCVS&    gccvs = gpuCCVSs[idx];
+        gccvs.posIdx      = ccvs.indexInfo.posIndex_ ? static_cast<int32_t>(ccvs.indexInfo.posIndex_.value()) : -1;
+        gccvs.negIdx      = ccvs.indexInfo.negIndex_ ? static_cast<int32_t>(ccvs.indexInfo.negIndex_.value()) : -1;
+        gccvs.curIdx      = static_cast<int32_t>(ccvs.indexInfo.currentIndex_.value());
+    }
+
+    for (size_t idx = 0; idx < vccss_.size(); ++idx) {
+        const auto& vccs  = vccss_[idx];
+        GpuVCCS&    gvccs = gpuVCCSs[idx];
+        gvccs.posIdx2     = vccs.posIndex2_ ? static_cast<int32_t>(vccs.posIndex2_.value()) : -1;
+        gvccs.negIdx2     = vccs.negIndex2_ ? static_cast<int32_t>(vccs.negIndex2_.value()) : -1;
+        gvccs.curIdx      = static_cast<int32_t>(vccs.indexInfo.currentIndex_.value());
+    }
+
+    std::vector<GpuTxLine>      gpuTxLines(txlines_.size());
+    std::vector<GpuTxHistEntry> gpuTxHist;
+    int32_t                     histOff = 0;
+    int64_t                     kMin    = simSize_ > 0 ? simSize_ : 1;
+    for (size_t idx = 0; idx < txlines_.size(); ++idx) {
+        const auto& tx   = txlines_[idx];
+        GpuTxLine&  gtx  = gpuTxLines[idx];
+        gtx.z0           = tx.netlistInfo.value_;
+        gtx.k            = tx.timestepDelay_;
+        gtx.fracDelay    = tx.fracDelay_;
+        gtx.loadedSteps  = tx.loadedSteps_;
+        gtx.histOffset   = histOff;
+        gtx.histSize     = static_cast<int32_t>(tx.histSize_);
+        histOff         += gtx.histSize;
+        if (tx.timestepDelay_ < kMin) { kMin = tx.timestepDelay_; }
+        for (const auto& h : tx.hist_) { gpuTxHist.push_back({h.v1, h.v2, h.i1, h.i2}); }
+
+        GpuTxHalf p1{};
+        p1.txIdx   = static_cast<int32_t>(idx);
+        p1.isPort2 = 0;
+        p1.posIdx  = tx.indexInfo.posIndex_ ? static_cast<int32_t>(tx.indexInfo.posIndex_.value()) : -1;
+        p1.negIdx  = tx.indexInfo.negIndex_ ? static_cast<int32_t>(tx.indexInfo.negIndex_.value()) : -1;
+        p1.curIdx  = static_cast<int32_t>(tx.indexInfo.currentIndex_.value());
+        p1.n1      = tx.n1_1_;
+        p1.n2      = tx.n2_1_;
+        gpuTxHalves.push_back(p1);
+
+        GpuTxHalf p2{};
+        p2.txIdx   = static_cast<int32_t>(idx);
+        p2.isPort2 = 1;
+        p2.posIdx  = tx.posIndex2_ ? static_cast<int32_t>(tx.posIndex2_.value()) : -1;
+        p2.negIdx  = tx.negIndex2_ ? static_cast<int32_t>(tx.negIndex2_.value()) : -1;
+        p2.curIdx  = static_cast<int32_t>(tx.currentIndex2_);
+        p2.n1      = tx.n1_2_;
+        p2.n2      = tx.n2_2_;
+        gpuTxHalves.push_back(p2);
+    }
+
+    if (txlines_.empty()) {
+        windowSize_ = std::max<int64_t>(1, std::min<int64_t>(simSize_, 1024));
+    } else {
+        windowSize_ = std::max<int64_t>(1, std::min<int64_t>(simSize_, std::min<int64_t>(kMin, 256)));
+    }
+
+    std::vector<GpuRelTrace> gpuRelTraces;
+    if (!mObj.relevantTraces.empty()) {
+        for (int64_t globR : mObj.relevantIndices) {
+            if (globR >= 0 && globR < N) {
+                GpuRelTrace grt{};
+                grt.localAbsIdx = static_cast<int32_t>(globR);
+                grt.traceSlot   = static_cast<int32_t>(gpuRelTraces.size());
+                gpuRelTraces.push_back(grt);
+            }
+        }
+    } else {
+        for (int64_t globR = 0; globR < N; ++globR) {
+            GpuRelTrace grt{};
+            grt.localAbsIdx = static_cast<int32_t>(globR);
+            grt.traceSlot   = static_cast<int32_t>(gpuRelTraces.size());
+            gpuRelTraces.push_back(grt);
+        }
+    }
+
+    std::vector<double> xInit(x_.begin(), x_.begin() + N);
+    cudaSolver_   = std::make_unique<CudaPartitionSolver>();
+    const bool ok = cudaSolver_->initialize_monolithic_full(static_cast<int32_t>(N),
+                                                            static_cast<int32_t>(mObj.sourcegen.size()),
+                                                            static_cast<int32_t>(windowSize_),
+                                                            static_cast<int32_t>(gpuRelTraces.size()),
+                                                            static_cast<int32_t>(numKeptSteps_),
+                                                            simSize_,
+                                                            stepSize_,
+                                                            (atyp_ == AnalysisType::Voltage) ? 0 : 1,
+                                                            csrRowPtrA,
+                                                            csrColIndA,
+                                                            csrValA,
+                                                            csrRowPtrL,
+                                                            csrColIndL,
+                                                            csrValL,
+                                                            csrRowPtrU,
+                                                            csrColIndU,
+                                                            csrValU,
+                                                            P,
+                                                            Q,
+                                                            xInit,
+                                                            gpuJJs,
+                                                            gpuRess,
+                                                            gpuInds,
+                                                            gpuMuts,
+                                                            gpuCaps,
+                                                            gpuVSs,
+                                                            gpuPSs,
+                                                            gpuCSs,
+                                                            gpuCCVSs,
+                                                            gpuVCCSs,
+                                                            gpuTxHalves,
+                                                            gpuTxLines,
+                                                            gpuTxHist,
+                                                            gpuRelTraces,
+                                                            keptSlot_);
+    if (!ok) {
+        cudaSolver_.reset();
+        return false;
+    }
+    if (verb_ >= 1) {
+        std::cout << "JoSIM: Initialized CUDA Tier 3 Fully GPU-Resident Monolithic Solver (cuSolverRF, N = " << N
+                  << ", nnz(L+U) = " << (lnz + unz) << ", window W = " << windowSize_ << ")\n";
+    }
+    return true;
+#else
+    (void) mObj;
+    return false;
+#endif
+}
+
 void Simulation::factorize_lu(Matrix& mObj) {
 #ifdef SLU
     lu.create_matrix(mObj.rp.size() - 1, mObj.nz, mObj.ci, mObj.rp);
@@ -1063,8 +1448,19 @@ void Simulation::factorize_lu(Matrix& mObj) {
     } else {
         simOK_ = klu_l_defaults(&Common_);
         assert(simOK_);
+        if (gpu_ && (gpuMode_ == 3 || gpuMode_ == 1)) {
+            Common_.btf   = 0;
+            Common_.scale = 0;
+        }
         Symbolic_ = klu_l_analyze(mObj.rp.size() - 1, &mObj.rp.front(), &mObj.ci.front(), &Common_);
         Numeric_  = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
+        if (gpu_ && (gpuMode_ == 3 || gpuMode_ == 1) && (!Numeric_ || Common_.status != KLU_OK)) {
+            if (Numeric_) { klu_l_free_numeric(&Numeric_, &Common_); }
+            if (Symbolic_) { klu_l_free_symbolic(&Symbolic_, &Common_); }
+            klu_l_defaults(&Common_);
+            Symbolic_ = klu_l_analyze(mObj.rp.size() - 1, &mObj.rp.front(), &mObj.ci.front(), &Common_);
+            Numeric_  = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
+        }
     }
 #endif
 }
@@ -2620,6 +3016,94 @@ void Simulation::trans_sim_gpu_monolithic(Matrix& mObj) {
 #endif
 }
 
+void Simulation::trans_sim_gpu_monolithic_full(Matrix& mObj) {
+#if defined(JOSIM_CUDA) && !defined(SLU)
+    results.timeAxis.clear();
+    results.timeAxis.reserve(static_cast<size_t>(numKeptSteps_));
+    for (int64_t i = 0; i < simSize_; ++i) {
+        if (keptSlot_[i] >= 0) { results.timeAxis.push_back(i * stepSize_); }
+    }
+
+    ProgressBar bar;
+    if (!minOut_) {
+        bar.create_thread();
+        bar.set_bar_width(30);
+        bar.fill_bar_progress_with("O");
+        bar.fill_bar_remainder_with(" ");
+        bar.set_status_text("Simulating (GPU RF)");
+        bar.set_total(static_cast<float>(simSize_));
+    }
+
+    const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
+    std::vector<double> h_srcWindow(static_cast<size_t>((windowSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
+
+    for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
+        if (!minOut_) { bar.update(static_cast<float>(i0)); }
+        const int64_t i1 = std::min<int64_t>(simSize_, i0 + windowSize_);
+        const int64_t w  = i1 - i0;
+
+        if (numSrc > 0) {
+            for (int64_t s = -2; s < w; ++s) {
+                const int64_t stepIdx = i0 + s;
+                const double  t       = (stepIdx >= 0) ? (stepIdx * stepSize_) : 0.0;
+                double*       row     = h_srcWindow.data() + (s + 2) * numSrc;
+                if (stepIdx >= 0) {
+                    for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) {
+                        row[srcIdx] = mObj.sourcegen[srcIdx].value(t);
+                    }
+                } else {
+                    std::fill(row, row + numSrc, 0.0);
+                }
+            }
+        }
+
+        if (!cudaSolver_->step_monolithic_full_window(i0, i1, numSrc > 0 ? h_srcWindow.data() : nullptr)) {
+            needsTR_ = true;
+            if (!minOut_) {
+                bar.complete();
+                std::cout << "\n";
+            }
+            return;
+        }
+    }
+
+    std::vector<double> h_traceOut;
+    std::vector<double> h_xFinal;
+    cudaSolver_->download_results(h_traceOut, h_xFinal);
+
+    const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
+    for (int64_t r = 0; r < N; ++r) { x_[r] = h_xFinal[r]; }
+
+    int64_t traceSlot = 0;
+    if (!mObj.relevantTraces.empty()) {
+        for (int64_t globR : mObj.relevantIndices) {
+            if (globR >= 0 && globR < N) {
+                auto&         dst = *results.xVector[globR];
+                const double* src = h_traceOut.data() + traceSlot * numKeptSteps_;
+                dst.assign(src, src + numKeptSteps_);
+                ++traceSlot;
+            }
+        }
+    } else {
+        for (int64_t globR = 0; globR < N; ++globR) {
+            if (results.xVector[globR]) {
+                auto&         dst = *results.xVector[globR];
+                const double* src = h_traceOut.data() + traceSlot * numKeptSteps_;
+                dst.assign(src, src + numKeptSteps_);
+            }
+            ++traceSlot;
+        }
+    }
+
+    if (!minOut_) {
+        bar.complete();
+        std::cout << "\n";
+    }
+#else
+    (void) mObj;
+#endif
+}
+
 void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
 #ifndef SLU
     results.timeAxis.clear();
@@ -3231,13 +3715,32 @@ void Simulation::trans_sim(Matrix& mObj) {
     }
 #ifdef JOSIM_CUDA
     if (gpu_) {
-        if (setup_gpu_solver(mObj) && cudaSolver_) {
-            trans_sim_gpu_windowed(mObj);
-            return;
-        }
-        if (setup_gpu_monolithic(mObj) && cudaSolver_) {
-            trans_sim_gpu_monolithic(mObj);
-            return;
+        if (gpuMode_ == 3) {
+            if (setup_gpu_monolithic_full(mObj) && cudaSolver_) {
+                trans_sim_gpu_monolithic_full(mObj);
+                return;
+            }
+        } else if (gpuMode_ == 2) {
+            if (setup_gpu_monolithic(mObj) && cudaSolver_) {
+                trans_sim_gpu_monolithic(mObj);
+                return;
+            }
+        } else {
+            if (setup_gpu_solver(mObj) && cudaSolver_) {
+                trans_sim_gpu_windowed(mObj);
+                return;
+            }
+            const int64_t N      = static_cast<int64_t>(mObj.rp.size()) - 1;
+            const int64_t luNnz  = (Numeric_ != nullptr) ? (Numeric_->lnz + Numeric_->unz) : 0;
+            const bool    mesh2D = (N >= 10000 && luNnz >= 10 * N && luNnz >= 200000);
+            if (mesh2D && setup_gpu_monolithic_full(mObj) && cudaSolver_) {
+                trans_sim_gpu_monolithic_full(mObj);
+                return;
+            }
+            if (setup_gpu_monolithic(mObj) && cudaSolver_) {
+                trans_sim_gpu_monolithic(mObj);
+                return;
+            }
         }
     }
 #endif

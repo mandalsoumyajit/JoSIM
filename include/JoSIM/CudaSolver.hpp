@@ -196,6 +196,46 @@ class CudaPartitionSolver {
                                  double*                                 h_b,
                                  std::vector<std::pair<int32_t, double>>& changedNz);
 
+    // Initialize Tier 3 Fully GPU-Resident Monolithic Solver (cuSolverRF + zero-PCIe fused device kernels)
+    bool initialize_monolithic_full(int32_t                            totalRows,
+                                    int32_t                            numSources,
+                                    int32_t                            maxWindow,
+                                    int32_t                            numRelTraces,
+                                    int32_t                            numKeptSteps,
+                                    int64_t                            simSize,
+                                    double                             stepSize,
+                                    int32_t                            analysisType,
+                                    const std::vector<int32_t>&        csrRowPtrA,
+                                    const std::vector<int32_t>&        csrColIndA,
+                                    const std::vector<double>&         csrValA,
+                                    const std::vector<int32_t>&        csrRowPtrL,
+                                    const std::vector<int32_t>&        csrColIndL,
+                                    const std::vector<double>&         csrValL,
+                                    const std::vector<int32_t>&        csrRowPtrU,
+                                    const std::vector<int32_t>&        csrColIndU,
+                                    const std::vector<double>&         csrValU,
+                                    const std::vector<int32_t>&        P,
+                                    const std::vector<int32_t>&        Q,
+                                    const std::vector<double>&         xInit,
+                                    const std::vector<GpuJJ>&          jjs,
+                                    const std::vector<GpuRes>&         ress,
+                                    const std::vector<GpuInd>&         inds,
+                                    const std::vector<GpuMut>&         muts,
+                                    const std::vector<GpuCap>&         caps,
+                                    const std::vector<GpuVS>&          vss,
+                                    const std::vector<GpuPS>&          pss,
+                                    const std::vector<GpuCS>&          css,
+                                    const std::vector<GpuCCVS>&        ccvss,
+                                    const std::vector<GpuVCCS>&        vccss,
+                                    const std::vector<GpuTxHalf>&      txHalves,
+                                    const std::vector<GpuTxLine>&      txLines,
+                                    const std::vector<GpuTxHistEntry>& txHist,
+                                    const std::vector<GpuRelTrace>&    relTraces,
+                                    const std::vector<int32_t>&        keptSlot);
+
+    // Execute window [i0, i1) using Tier 3 Fully GPU-Resident Monolithic Solver (cuSolverRF)
+    bool step_monolithic_full_window(int64_t i0, int64_t i1, const double* h_srcWindow);
+
     // Download completed trace table (numRelTraces * numKeptSteps) and final xLocal to host
     void download_results(std::vector<double>& h_traceOut, std::vector<double>& h_xFinal);
 
@@ -219,6 +259,17 @@ class CudaPartitionSolver {
     int32_t numRess_      = 0;
     int32_t numCaps_      = 0;
     int32_t numInds_      = 0;
+    int32_t numVSs_       = 0;
+    int32_t numPSs_       = 0;
+    int32_t numCSs_       = 0;
+    int32_t numCCVSs_     = 0;
+    int32_t numVCCSs_     = 0;
+    int32_t numTxHalves_  = 0;
+    int32_t nnzA_            = 0;
+    bool    hasSwitchingJJs_ = false;
+    void*   rfHandle_        = nullptr;
+    double* d_rfTemp_        = nullptr;
+    std::vector<int32_t> h_keptSlot_;
     int32_t maxPartN_       = 0;
     int32_t maxPartLuNnz_   = 0;
     int32_t numSMs_         = 1;

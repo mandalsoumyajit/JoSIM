@@ -137,8 +137,22 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                     break;
                     // Enable GPU acceleration (and parallel partitioned mode)
                 case 'g':
-                    out.gpu      = (i.second.value_or("1") != "0");
-                    out.parallel = true;
+                    if (!i.second) {
+                        out.gpu      = true;
+                        out.gpuMode  = 1;
+                        out.parallel = true;
+                    } else {
+                        try {
+                            const int64_t gval = std::stoll(i.second.value());
+                            out.gpu            = (gval != 0);
+                            out.gpuMode        = gval;
+                            if (out.gpu) { out.parallel = true; }
+                        } catch (const std::invalid_argument&) {
+                            out.gpu      = true;
+                            out.gpuMode  = 1;
+                            out.parallel = true;
+                        }
+                    }
                     break;
                     // Show help menu
                 case 'h':

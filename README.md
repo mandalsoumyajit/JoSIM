@@ -89,8 +89,11 @@ arr = load_josim_npy("output.npy")       # Zero-copy memory-mapped structured ar
   ```spice
   .option kcutoff=1e-3
   ```
-- **CUDA GPU & Multi-Step Windowed PTL Solver (`-g` / `--gpu`, `.option gpu`, `-p` / `--parallel`)**:
-  Build with `-DUSING_CUDA=ON -DUSING_OPENMP=ON` (`CMAKE_CUDA_ARCHITECTURES` automatically defaults to `"native"` on CMake $\ge 3.24$ across Volta, Turing, Ampere, Ada, Hopper, and Blackwell GPUs) to enable CUDA GPU acceleration (`-g` or `.option gpu`) alongside multi-core OpenMP windowed PTL acceleration (`-p`).
+- **CUDA GPU & Multi-Step Windowed PTL / Monolithic `cuSolverRF` Solver (`-g [1|2|3]` / `--gpu[=1|2|3]`, `.option gpu[=1|2|3]`, `.option gpumono`, `.option cusolverrf`, `-p` / `--parallel`)**:
+  Build with `-DUSING_CUDA=ON -DUSING_OPENMP=ON` (`CMAKE_CUDA_ARCHITECTURES` automatically defaults to `"native"` on CMake $\ge 3.24$ across Volta, Turing, Ampere, Ada, Hopper, and Blackwell GPUs) to enable CUDA GPU acceleration:
+  - **`-g` or `-g 1` (`.option gpu`)**: Unified Auto-Dispatcher — selects **Tier 1 Windowed PTL Block-Parallel Solver** when $P \ge 2$ partitions exist, **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver** on 2D/3D monolithic meshes ($\text{nnz}(L+U) \ge 10N$), and **Hybrid Device-GPU + Host-KLU Solver** on 1D monolithic chains.
+  - **`-g 2` (`--gpu=2`, `.option gpu=2`)**: Forces the Hybrid Device-GPU + Host-KLU Monolithic Solver.
+  - **`-g 3` (`--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`)**: Forces the **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver** (zero per-timestep PCIe transfers, achieving **`2.45x–4.21x` GPU speedup** on 0-PTL monolithic 2D Josephson junction arrays up to `65,536` JJs / `393,730` MNA equations).
 - **Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>` / `--batch=<N>`, `.option mc=<N>`, `.spread ... runs=<N>`, `.option mcall`)**:
   Executes `N` independent fabrication-variation trials simultaneously in a single run (parse-once, symbolic-once) across OpenMP CPU threads (`-p -b <N>`) or in a coalesced thread-per-trial CUDA GPU kernel (`-g -b <N>`), outputting Welford ensemble `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, and `<Trace>_MAX` statistics (plus `<Trace>_MC0..MC{N-1}` with `.option mcall`) and a stdout **Monte Carlo Robustness Summary** table.
 
@@ -139,7 +142,26 @@ Reproducible via [`scripts/benchmark_mc_exxact.py`](scripts/benchmark_mc_exxact.
 | **`RSFQ-Pipeline-64B` (2,048 JJs, 64 Blocks)** | 64 | 64 | `12.178 s` | **`0.510 s`** | **`1.243 s`** | **23.87x** | **9.80x** | **6.34x** | `1.45e-17` |
 | **`RSFQ-Pipeline-64B` (2,048 JJs, 64 Blocks)** | 64 | 256 | `48.566 s` | **`1.682 s`** | **`3.192 s`** | **28.87x** | **15.21x** | **12.55x** | `1.45e-17` |
 
-#### D. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
+#### D. Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`) & Unified Auto-Dispatcher (`-g`) (`2x Xeon Gold 6338 / EPYC + NVIDIA RTX A6000`)
+
+Reproducible via [`scripts/benchmark_tier3_exxact.py`](scripts/benchmark_tier3_exxact.py) across **0-PTL monolithic 2D Josephson junction grids ($P=1$, `14,400` to `65,536` JJs)**, **1D monolithic RSFQ/RLK chains ($P=1$)**, and **multi-block PTL networks ($P=256\text{–}800$)** (verified to `0.000e+00`–`1.32e-17` max absolute difference vs. Serial `1T`):
+
+| Circuit | Topology & Scale | Serial `1T` | OpenMP `-p` | GPU Hybrid `-g 2` | GPU `cuSolverRF` `-g 3` | GPU Auto `-g` | `-g 2` Speedup | `-g 3` Speedup | `-g` Auto Speedup |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`Mono-2D-Grid-14kJJ-Phase`** | $120\times120$ 2D Grid (`14,400` JJs, 0 PTL, $P=1$, `-a 1`) | `4.487 s` | `3.898 s` | `3.501 s` | **`1.164 s`** | **`1.148 s`** | 1.28x | **3.86x** | **3.91x** |
+| **`Mono-2D-Grid-14kJJ-Volt`** | $120\times120$ 2D Grid (`14,400` JJs, 0 PTL, $P=1$, `-a 0`) | `4.810 s` | `3.992 s` | `3.258 s` | **`1.158 s`** | **`1.144 s`** | 1.48x | **4.16x** | **4.21x** |
+| **`Mono-2D-Grid-25kJJ-Phase`** | $160\times160$ 2D Grid (`25,600` JJs, 0 PTL, $P=1$, `-a 1`) | `8.867 s` | `8.673 s` | `7.750 s` | **`2.407 s`** | **`2.395 s`** | 1.14x | **3.68x** | **3.70x** |
+| **`Mono-2D-Grid-25kJJ-NR`** | $160\times160$ 2D Grid (`25,600` JJs, 0 PTL, `RTYPE=0`) | `8.804 s` | `8.624 s` | `8.147 s` | **`2.379 s`** | **`2.373 s`** | 1.08x | **3.70x** | **3.71x** |
+| **`Mono-2D-Grid-64kJJ-Phase`** | $256\times256$ 2D Grid (`65,536` JJs, 0 PTL, $P=1$, `-a 1`) | `29.138 s` | `35.176 s` | `24.019 s` | **`11.930 s`** | **`11.904 s`** | 1.21x | **2.44x** | **2.45x** |
+| **`Mono-2D-Grid-64kJJ-NR`** | $256\times256$ 2D Grid (`65,536` JJs, 0 PTL, `RTYPE=0`) | `30.458 s` | `28.171 s` | `25.501 s` | **`11.865 s`** | **`11.873 s`** | 1.19x | **2.57x** | **2.57x** |
+| **`Mono-RSFQ-12kJJ-Phase`** | 1D Monolithic RSFQ Chain (`12,000` JJs, 3k `K`, 0 PTL) | `1.192 s` | `1.152 s` | `0.740 s` | *1D chain* | **`0.673 s`** | 1.61x | — | **1.77x** |
+| **`Mono-RLK-49kK-Phase`** | 1D Coupled RLK Mesh (`3,500` `L`, `49,000` `K`, `-a 1`) | `0.323 s` | `0.379 s` | `0.338 s` | *1D chain* | **`0.238 s`** | 0.96x | — | **1.36x** |
+| **`Mono-RLK-49kK-Volt`** | 1D Coupled RLK Mesh (`3,500` `L`, `49,000` `K`, `-a 0`) | `0.409 s` | `0.429 s` | `0.333 s` | *1D chain* | **`0.267 s`** | 1.23x | — | **1.54x** |
+| **`PTL-256x30JTL-Phase`** | 256-Block PTL Network (`7,680` JJs, $P=256$) | `0.667 s` | `0.616 s` | `0.487 s` | *Partitioned* | **`0.115 s`** | 1.37x | — | **5.82x** |
+| **`PTL-512x30JTL-Phase`** | 512-Block PTL Network (`15,360` JJs, $P=512$) | `2.180 s` | `0.681 s` | `0.922 s` | *Partitioned* | **`0.150 s`** | 2.37x | — | **14.49x** |
+| **`PTL-800x30JTL-Phase`** | 800-Block PTL Network (`24,000` JJs, $P=800$) | `4.170 s` | `0.664 s` | `1.460 s` | *Partitioned* | **`0.300 s`** | 2.86x | — | **13.89x** |
+
+#### E. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
 
 Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh) in WSL (`-O3` Release build with Ninja, comparing upstream `v2.7` / `02a34ee` against this enhanced version):
 

@@ -119,7 +119,7 @@ if(USING_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_sources(josim PRIVATE src/CudaSolver.cu)
   target_compile_definitions(josim PUBLIC JOSIM_CUDA)
-  target_link_libraries(josim PUBLIC CUDA::cudart)
+  target_link_libraries(josim PUBLIC CUDA::cudart CUDA::cusolver CUDA::cusparse)
 endif()
 
 # JoSIM command line interface

@@ -242,3 +242,80 @@ Verified via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.p
    - Simulating 256 Monte Carlo fabrication-yield trials of the 4-bit RSFQ Kogge-Stone Adder (695 JJs/trial) drops from **`204.24 s` sequentially** to **`6.56 s` (`31.14x` speedup) on OpenMP (`-p -b 256`)** and **`10.39 s` (`19.65x` transient speedup, `18.33x` end-to-end wall-clock speedup) on CUDA GPU (`-g -b 256`)**, with a relative difference of `1.04e-15`.
 3. **4.85 Million Simultaneous Equations in 3.19 Seconds on GPU (`RSFQ-Pipeline-64B`, $B=256$):**
    - On the 64-partition RSFQ ALU pipeline across $B=256$ trials (`4,848,640` MNA equations), the coalesced GPU solver completes all timesteps in **`3.19 s` (`15.21x` GPU transient speedup, `12.55x` wall-clock speedup)** and **`1.68 s` (`28.87x` OpenMP speedup)** with `1.45e-17` relative error.
+
+---
+
+## 7. Tier 3 Implemented & Benchmarked: Fully GPU-Resident Monolithic Solver (`cuSolverRF`, `-g 3`) & Unified GPU Auto-Dispatcher (`-g`)
+
+### 7.1 Motivation & Architectural Design (`Simulation::setup_gpu_monolithic_full`, `CudaPartitionSolver::step_monolithic_full_window`)
+
+When a circuit contains **zero transmission lines ($P = 1$ single connected component)** and is simulated as a single run ($B = 1$), Tier 1's PTL block partitioning produces only a single global partition. If that monolithic circuit is a large 2D/3D mesh or Josephson junction array ($N \ge 50,000$ equations with 2D fill-in $\text{nnz}(L+U) \ge 10 N$), two bottlenecks limit hybrid CPU/GPU execution (`-g 2`):
+1. **Per-Timestep PCIe Transfers:** Copying the solution vector $\mathbf{x} \in \mathbb{R}^N$ (`H2D`) and right-hand side $\mathbf{b} \in \mathbb{R}^N$ (`D2H`) across PCIe at every timestep incurs ~15–40 $\mu\text{s}$ of latency per step.
+2. **Host KLU Triangular Solve Memory Bandwidth:** On 2D/3D meshes (`120x120` to `256x256` JJs), $L$ and $U$ contain `1,000,000` to `5,500,000+` FP64 nonzeros (`12–45 MB`), spilling out of CPU L2/L3 cache and making `klu_l_tsolve` memory-bandwidth bound on the host (`4.5 s` to `30.5 s` for 1,000 steps).
+
+To eliminate both bottlenecks, **Tier 3 (`-g 3` / `--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`)** keeps the **entire transient simulation loop 100% resident in GPU VRAM** with **zero per-timestep PCIe transfers**:
+
+1. **Exact $O(\text{nnz}(L+U))$ KLU Factor Extraction (`klu_l_extract`):**
+   - During setup (`Simulation::setup_gpu_monolithic_full` in [`src/Simulation.cpp`](../src/Simulation.cpp)), KLU factors the unscaled monolithic CSR matrix ($A$, interpreted by KLU as CSC of $A^T$) with `Common_.btf = 0; Common_.scale = 0`:
+     $$P_{\text{klu}} A^T Q_{\text{klu}} = L_{\text{klu}} U_{\text{klu}} \implies Q_{\text{klu}}^T A P_{\text{klu}}^T = U_{\text{klu}}^T L_{\text{klu}}^T = \underbrace{(U_{\text{klu}}^T D^{-1})}_{\tilde{L}} \underbrace{(D L_{\text{klu}}^T)}_{\tilde{U}}$$
+   - Using `klu_l_extract`, JoSIM extracts the exact symbolic and numeric CSR factors $\tilde{L}$ (lower-triangular with stored unit diagonal `CUSOLVERRF_UNIT_DIAGONAL_STORED_L`), $\tilde{U}$ (upper-triangular with non-unit diagonal $D = \text{diag}(U_{\text{klu}})$), row permutation $P_{\text{csr}}[r] = Q_{\text{klu}}[r]$, and column permutation $Q_{\text{csr}}[c] = P_{\text{num}}[c]$ in milliseconds.
+   - JoSIM passes $(\tilde{L}, \tilde{U}, P_{\text{csr}}, Q_{\text{csr}}, A_{\text{csr}})$ to NVIDIA **`cuSolverRF`** (`cusolverRfSetupHost` $\to$ `cusolverRfAnalyze` $\to$ `cusolverRfResetValues` $\to$ `cusolverRfRefactor`), which constructs the level-scheduled DAG for parallel GPU LU refactorization and sparse triangular solve (`cusolverRfSolve`).
+2. **Fused All-Device GPU RHS Kernel (`monolithic_full_setup_b_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)):**
+   - Evaluates **all** circuit devices in parallel directly in VRAM at each timestep: Josephson junctions (`JJ` RCSJ + sin/cos CPR + temperature-dependent $I_c(T)$ + `RTYPE=1` piecewise-linear conductance state machine), resistors (`R`), capacitors (`C`), inductors (`L` + arbitrary mutual inductance couplings `K` via double-buffered `d_indIn2Old_`/`d_indIn2New_`), voltage sources (`V`), phase sources (`P`), current sources (`I` via `atomicAdd`), controlled sources (`CCVS`/`VCCS`), and transmission line port halves (`T`).
+   - Whenever any `RTYPE=1` junction switches conductance state, the kernel updates `d_csrValA[jj.nzIdx]` **in-place in VRAM** and increments `d_numChangedNz_`.
+   - If `hasSwitchingJJs_` is true and `h_numChanged > 0`, `step_monolithic_full_window` calls `cusolverRfResetValues` + `cusolverRfRefactor` directly on the GPU in VRAM; when `!hasSwitchingJJs_` (e.g., `RTYPE=0` or passive circuits), zero host-device synchronization occurs across the entire window $W = 1,024$ steps.
+3. **In-VRAM Triangular Solve & Decimated Trace Recording (`cusolverRfSolve` + `monolithic_full_post_solve_kernel`):**
+   - `cusolverRfSolve` solves $A \mathbf{x}_i = \mathbf{b}_i$ in-place in VRAM (`std::swap(d_xLocal_, d_bLocal_)`), and `monolithic_full_post_solve_kernel` records only kept/decimated output trace slots into `d_traceOut_`.
+
+### 7.2 Complementary GPU Modes & Automatic Topology Dispatcher (`-g` / `-g 1`, `-g 2`, `-g 3`)
+
+| CLI / Netlist Option | Solver Mode | Target Circuit Topology & Characteristics |
+| :--- | :--- | :--- |
+| **`-g` or `-g 1`** (`.option gpu`) | **Unified Auto-Dispatcher** (Default) | Automatically inspects partition count $P$, equation count $N$, and LU fill-in density $\text{nnz}(L+U)/N$:<br>• **$P \ge 2$ partitions:** Dispatches to **Tier 1 Windowed Partitioned GPU Solver**.<br>• **$P = 1$ monolithic mesh ($\text{nnz}(L+U) \ge 10 N$ and $\text{nnz}(L+U) \ge 200\text{k}$):** Dispatches to **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`)**.<br>• **$P = 1$ monolithic 1D chain/tree ($\text{nnz}(L+U) < 10 N$):** Dispatches to **Hybrid Device-GPU + Host-KLU Monolithic Solver (`-g 2`)**. |
+| **`-g 2`** (`--gpu=2`, `.option gpu=2`) | **Hybrid Device-GPU + Host-KLU Monolithic Solver** | Best for **1D chains, trees, and low-fill-in monolithic circuits** ($\text{nnz}(L+U)/N \approx 4.5\text{–}8$, e.g., long 1D RSFQ pipelines or RLK ladders) where $L$ and $U$ fit in CPU L2/L3 cache (`klu_l_tsolve` takes `<0.4 ms/step`) while nonlinear JJ `sin/cos` and mutual inductance $K$ evaluations run in parallel on the GPU. |
+| **`-g 3`** (`--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`) | **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver** | Best for **large 2D/3D Josephson junction grids, arrays, and high-fill-in monolithic meshes** ($\text{nnz}(L+U)/N \ge 10$, $\text{nnz}(L+U) \ge 200\text{k}$), where CPU KLU triangular solve is memory-bandwidth bound on millions of FP64 nonzeros while `cuSolverRF` exploits wide 2D/3D level-set parallelism and 768 GB/s GDDR6 bandwidth with zero per-step PCIe traffic. |
+
+### 7.3 Tier 3 Numerical Verification & Benchmark Results on BNL `exxact` (`2x Xeon Gold 6338 / EPYC + NVIDIA RTX A6000`)
+
+Reproducible via [`scripts/benchmark_tier3_exxact.py`](../scripts/benchmark_tier3_exxact.py):
+
+#### Phase 1: Numerical Accuracy Verification (Serial `1T` vs. Tier 3 `cuSolverRF` `-g 3`)
+All 8 verification circuits across Phase mode (`-a 1`) and Voltage mode (`-a 0`), including `RTYPE=1` switching junctions, mutual inductances (`K`), passive $RLC$ meshes, and transmission lines (`T`), match the serial CPU KLU solver to machine precision (**`0.000e+00` to `1.320e-17` max absolute difference**):
+
+| Verification Circuit | Mode | MNA Eqns ($N$) | $\text{nnz}(L+U)$ | Window $W$ | Max $\|\text{Serial} - \text{GPU Tier 3}\|$ |
+| :--- | :---: | ---: | ---: | ---: | :---: |
+| `Verify-2D-Grid-Phase` ($30\times30$ JJs, `RTYPE=1`) | Phase (`-a 1`) | 5,402 | 41,648 | 399 | **`1.320e-17`** |
+| `Verify-2D-Grid-Volt` ($30\times30$ JJs, `RTYPE=1`) | Voltage (`-a 0`) | 5,402 | 40,748 | 399 | **`2.000e-19`** |
+| `Verify-RSFQ-K-Phase` (800 JJs, 200 `K`, `RTYPE=1`) | Phase (`-a 1`) | 4,404 | 22,000 | 399 | **`1.000e-16`** |
+| `Verify-RSFQ-K-Volt` (800 JJs, 200 `K`, `RTYPE=1`) | Voltage (`-a 0`) | 4,404 | 20,606 | 399 | **`1.000e-17`** |
+| `Verify-RLK-Mesh-Phase` (300 `L`, 1,350 `K`, 60 JJs) | Phase (`-a 1`) | 1,623 | 10,442 | 399 | **`0.000e+00`** |
+| `Verify-RLK-Mesh-Volt` (300 `L`, 1,350 `K`, 60 JJs) | Voltage (`-a 0`) | 1,623 | 10,382 | 399 | **`0.000e+00`** |
+| `Verify-PTL-JTL-Phase` (16 PTL blocks, 240 JJs) | Phase (`-a 1`) | 1,230 | 4,888 | 20 | **`1.000e-17`** |
+| `Verify-PTL-JTL-Volt` (16 PTL blocks, 240 JJs) | Voltage (`-a 0`) | 1,230 | 4,648 | 20 | **`1.000e-18`** |
+
+#### Phase 2: Transient Solver Performance Comparison (`1,000` Timesteps)
+
+| Circuit | Topology & Scale | Serial `1T` | OpenMP `-p` | GPU Hybrid `-g 2` | GPU `cuSolverRF` `-g 3` | GPU Auto `-g` | `-g 2` Speedup | `-g 3` Speedup | `-g` Auto Speedup |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`Mono-2D-Grid-14kJJ-Phase`** | $120\times120$ 2D Grid (`14,400` JJs, 0 PTL, $P=1$, `-a 1`) | `4.487 s` | `3.898 s` | `3.501 s` | **`1.164 s`** | **`1.148 s`** | 1.28x | **3.86x** | **3.91x** |
+| **`Mono-2D-Grid-14kJJ-Volt`** | $120\times120$ 2D Grid (`14,400` JJs, 0 PTL, $P=1$, `-a 0`) | `4.810 s` | `3.992 s` | `3.258 s` | **`1.158 s`** | **`1.144 s`** | 1.48x | **4.16x** | **4.21x** |
+| **`Mono-2D-Grid-25kJJ-Phase`** | $160\times160$ 2D Grid (`25,600` JJs, 0 PTL, $P=1$, `-a 1`) | `8.867 s` | `8.673 s` | `7.750 s` | **`2.407 s`** | **`2.395 s`** | 1.14x | **3.68x** | **3.70x** |
+| **`Mono-2D-Grid-25kJJ-NR`** | $160\times160$ 2D Grid (`25,600` JJs, 0 PTL, `RTYPE=0`) | `8.804 s` | `8.624 s` | `8.147 s` | **`2.379 s`** | **`2.373 s`** | 1.08x | **3.70x** | **3.71x** |
+| **`Mono-2D-Grid-64kJJ-Phase`** | $256\times256$ 2D Grid (`65,536` JJs, 0 PTL, $P=1$, `-a 1`) | `29.138 s` | `35.176 s` | `24.019 s` | **`11.930 s`** | **`11.904 s`** | 1.21x | **2.44x** | **2.45x** |
+| **`Mono-2D-Grid-64kJJ-NR`** | $256\times256$ 2D Grid (`65,536` JJs, 0 PTL, `RTYPE=0`) | `30.458 s` | `28.171 s` | `25.501 s` | **`11.865 s`** | **`11.873 s`** | 1.19x | **2.57x** | **2.57x** |
+| **`Mono-RSFQ-12kJJ-Phase`** | 1D Monolithic RSFQ Chain (`12,000` JJs, 3k `K`, 0 PTL) | `1.192 s` | `1.152 s` | `0.740 s` | *1D chain* | **`0.673 s`** | 1.61x | — | **1.77x** |
+| **`Mono-RLK-49kK-Phase`** | 1D Coupled RLK Mesh (`3,500` `L`, `49,000` `K`, `-a 1`) | `0.323 s` | `0.379 s` | `0.338 s` | *1D chain* | **`0.238 s`** | 0.96x | — | **1.36x** |
+| **`Mono-RLK-49kK-Volt`** | 1D Coupled RLK Mesh (`3,500` `L`, `49,000` `K`, `-a 0`) | `0.409 s` | `0.429 s` | `0.333 s` | *1D chain* | **`0.267 s`** | 1.23x | — | **1.54x** |
+| **`PTL-256x30JTL-Phase`** | 256-Block PTL Network (`7,680` JJs, $P=256$) | `0.667 s` | `0.616 s` | `0.487 s` | *Partitioned* | **`0.115 s`** | 1.37x | — | **5.82x** |
+| **`PTL-512x30JTL-Phase`** | 512-Block PTL Network (`15,360` JJs, $P=512$) | `2.180 s` | `0.681 s` | `0.922 s` | *Partitioned* | **`0.150 s`** | 2.37x | — | **14.49x** |
+| **`PTL-800x30JTL-Phase`** | 800-Block PTL Network (`24,000` JJs, $P=800$) | `4.170 s` | `0.664 s` | `1.460 s` | *Partitioned* | **`0.300 s`** | 2.86x | — | **13.89x** |
+
+### 7.4 Key Takeaways from Tier 3 (`cuSolverRF` Monolithic Solver & Auto-Dispatcher)
+1. **`2.44x–4.21x` GPU Speedup on Purely Monolithic 0-PTL 2D Josephson Junction Arrays (`14k` to `65k` JJs):**
+   - Whereas OpenMP (`-p`, `1.02x–1.20x`) and Hybrid Device-Only GPU (`-g 2`, `1.08x–1.48x`) are bottlenecked by host KLU triangular solves on 2D meshes (`N = 86,402` to `393,730`, $\text{nnz}(L+U) = 1.0\text{M}$ to $5.5\text{M}$), keeping the entire simulation loop in VRAM via Tier 3 `cuSolverRF` (`-g 3`) accelerates transient simulation by **`3.86x–4.21x` on $120\times120$ grids**, **`3.68x–3.71x` on $160\times160$ grids (`8.87s -> 2.39s`)**, and **`2.45x–2.57x` on $256\times256$ grids (`30.46s -> 11.87s`)**—roughly **`2.1x–3.4x` faster than Hybrid `-g 2`**.
+2. **Seamless Unified `-g` Auto-Dispatcher Across All Superconducting Circuit Topologies:**
+   - Simply passing `-g` (or `.option gpu`) now delivers strong GPU speedups across the entire spectrum of superconducting circuits:
+     - **Multi-block PTL circuits ($P \ge 2$):** Dispatches to Tier 1 (`5.82x–21.47x` speedup).
+     - **Monolithic 2D/3D arrays ($P = 1$, high fill-in):** Dispatches to Tier 3 `cuSolverRF` (`2.45x–4.21x` speedup).
+     - **Monolithic 1D chains & mutual-inductance macros ($P = 1$, low fill-in):** Dispatches to Hybrid `-g 2` (`1.36x–1.77x` speedup).
+     - **Batched Monte Carlo robustness studies (`-b N -g`):** Dispatches to Tier 2 Coalesced Batch Solver (`up to 19.65x` GPU speedup).

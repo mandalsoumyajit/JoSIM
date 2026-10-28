@@ -376,21 +376,21 @@ Simulator options can be configured in the netlist using the `.option` (or `.opt
 
 **.option**&emsp;*OPTION_KEY*[=*VALUE*]&emsp;[*OPTION_KEY2*[=*VALUE2*] ...]
 
-| Option | Syntax | Origin | Description |
-| ------ | ------ | :---: | ----------- |
-| **SEED** | `.option seed=<int>` | Inherited (`v2.7`) / Enhanced (`v2.8`) | Sets a deterministic integer seed for the random number generator used by **noise** and **spread** (extended in `v2.8` with `JOSIM_SEED` env var and per-trial splitmix64 seeding). |
-| **TXINTERP** / **FRACTX** | `.option txinterp` | **New in Fork (`v2.8`)** | Enables linear fractional-step delay interpolation for all transmission lines (`T` elements) when $T_D / T_{STEP}$ is non-integer. Can also be set per element via `interp=1`. |
-| **FIXEDSTEP** | `.option fixedstep` | **New in Fork (`v2.8`)** | Disables automatic global timestep halving (`reduce_step`) when a Josephson junction's phase step exceeds $0.4\pi$. Equivalent to the `-f` (`--fixed-step`) CLI switch. |
-| **WARNSTEP** | `.option warnstep` | **New in Fork (`v2.8`)** | Prints a diagnostic warning identifying the offending Josephson junction label, halving count, and old/new `TSTEP` whenever automatic step halving or a phase jump occurs. |
-| **CORRECTOR** | `.option corrector=<N>` | **New in Fork (`v2.8`)** | Enables up to `N` implicit predictor-corrector (Picard/BDF2) iterations per timestep on active Josephson junctions (default `0`; `-c` on the CLI defaults to `2`). |
-| **CORRECTORTOL** | `.option correctortol=<val>` | **New in Fork (`v2.8`)** | Sets the phase convergence threshold (in radians, default `1e-3`) that triggers predictor-corrector iteration when `CORRECTOR` > 0. |
-| **KCUTOFF** / **KMIN** | `.option kcutoff=<val>` | **New in Fork (`v2.8`)** | Ignores mutual inductance entries (`K` lines) with $|k| < \text{val}$ during MNA matrix construction, preventing dense LU fill-in from weak parasitic couplings in 3D field-extracted netlists. |
-| **NODAL** | `.option nodal` | **New in Fork (`v2.8`)** | Enables the **Tier 4 Exact Schur-Complement Nodal Admittance Solver** (`-n` / `--nodal`). Analytically eliminates all internal branch equations (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) into the reduced Nodal Admittance matrix $A_{\text{red}}$ ($2\times–6\times$ smaller than standard MNA), reconstructing any requested `.print` branch currents on the fly. Ideal for single-thread execution and monolithic circuits ($P=1\text{–}2$). |
-| **BYPASS** / **LATENCY** | `.option bypass` | **New in Fork (`v2.8`)** | Enables activity-driven quiescent partition bypass during OpenMP windowed simulation (`-p`). Skips `klu_l_tsolve` on partitions whose internal devices and PTL boundary inputs are completely quiescent at a given timestep. |
-| **BYPASSTOL** | `.option bypasstol=<val>` | **New in Fork (`v2.8`)** | Sets the activity threshold (default `1e-12`) used by `.option bypass` to determine whether a partition's RHS or solution vector changed. |
-| **GPU** / **CUDA** | `.option gpu[=1\|2\|3\|4]` | **New in Fork (`v2.8`)** | Enables NVIDIA CUDA GPU acceleration (`CudaPartitionSolver`) when compiled with `-DUSING_CUDA=ON`. Equivalent to `-g [1\|2\|3\|4]` (`--gpu[=1\|2\|3\|4]`). Mode `1` (default) auto-selects between Tier 1 Partitioned, Tier 3 `cuSolverRF` Monolithic (`gpu=3`), and Hybrid Device-GPU (`gpu=2`); mode `2` forces Hybrid Device-GPU; mode `3` (or `.option gpumono` / `.option cusolverrf`) forces the Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic MNA Solver; mode `4` (or `.option gpunodal`) forces the Tier 4 Fully GPU-Resident `cuSolverRF` Nodal Admittance Solver on $A_{\text{red}}$. |
-| **MC** / **BATCH** / **RUNS** | `.option mc=<N>` | **New in Fork (`v2.8`)** | Executes a batched Monte Carlo ensemble of `N` fabrication-spread (`.spread`) trials in a single simulation run. Equivalent to `-b <N>` (`--batch=<N>`) or `.spread ... runs=<N>`. |
-| **MCALL** | `.option mcall` | **New in Fork (`v2.8`)** | When running batched Monte Carlo (`mc > 1`), appends all individual trial waveforms (`<Trace>_MC0 .. <Trace>_MC{N-1}`) to the output file in addition to the ensemble `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, and `<Trace>_MAX` traces. |
+| Syntax | Origin | Description |
+| :--- | :---: | :--- |
+| `.option seed=<int>` | Inherited (`v2.7`) / Enhanced (`v2.8`) | Sets a deterministic RNG seed for **noise** and **spread** (also settable via `JOSIM_SEED` env var). |
+| `.option nodal` | **New (`v2.8`)** | Enables the **Tier 4 Schur-Complement Nodal Admittance Solver** (`-n`). Eliminates internal branch rows into a $2\times–6\times$ smaller nodal matrix $A_{\text{red}}$. |
+| `.option gpu[=1\|2\|3\|4]` | **New (`v2.8`)** | Enables CUDA GPU solver (`-g [1\|2\|3\|4]`): `1` = Auto, `2` = Hybrid, `3` (`gpumono`/`cusolverrf`) = Tier 3 Monolithic MNA, `4` (`gpunodal`) = Tier 4 Monolithic Nodal. |
+| `.option bypass` | **New (`v2.8`)** | Skips `klu_l_tsolve` on quiescent PTL partitions during OpenMP windowed simulation (`-p`). Alias: `.option latency`. |
+| `.option bypasstol=<val>` | **New (`v2.8`)** | Activity threshold for `.option bypass` (default `1e-12`). |
+| `.option mc=<N>` | **New (`v2.8`)** | Executes `N` batched Monte Carlo (`.spread`) trials in one run (`-b <N>`, aliases: `batch`, `runs`). |
+| `.option mcall` | **New (`v2.8`)** | Appends individual trial waveforms (`<Trace>_MC0 .. MC{N-1}`) to batched Monte Carlo output. |
+| `.option txinterp` | **New (`v2.8`)** | Linearly interpolates fractional transmission-line delays (or per-line `interp=1`; alias: `fractx`). |
+| `.option kcutoff=<val>` | **New (`v2.8`)** | Ignores mutual inductance entries (`K`) with $\|k\| < \text{val}$ during matrix setup (alias: `kmin`). |
+| `.option corrector=<N>` | **New (`v2.8`)** | Enables up to `N` implicit predictor-corrector JJ iterations per step (`-c <N>`). |
+| `.option correctortol=<v>` | **New (`v2.8`)** | Phase convergence threshold (radians, default `1e-3`) for `corrector`. |
+| `.option fixedstep` | **New (`v2.8`)** | Disables automatic timestep halving on $>0.4\pi$ phase jumps (`-f`). |
+| `.option warnstep` | **New (`v2.8`)** | Prints diagnostic warning naming the JJ and time that triggered step halving. |
 
 Examples:
 ```cir

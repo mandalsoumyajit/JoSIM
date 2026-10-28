@@ -139,6 +139,7 @@ bash scripts/build_wsl.sh
 ```
 
 For practical guidance on selecting simulation options (`-n` Nodal Admittance, `-p` OpenMP, `-g [1|2|3|4]` CUDA GPU, `-b <N>` Batched Monte Carlo, and `.bin`/`.npy` binary output), see:
+- [Fork Usage, Options & Benchmark Guide](usage_and_benchmarks.md)
 - [Example Usage & Solver Selection Guide](ex_usage.md)
 - [Netlist Syntax & `.option` Control Reference](syntax.md)
 - [GPU & Nodal Solver Architecture & Benchmarks](gpu_architecture.md)

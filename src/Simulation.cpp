@@ -259,6 +259,84 @@ void Simulation::setup_partitions(Matrix& mObj) {
     if (N < 32 && mcRuns_ <= 1) { return; }
     if (N < 4) { return; }
 
+    struct SplitRailInfo {
+        int64_t              vsIdx;
+        int64_t              nodeRow;
+        int64_t              curRow;
+        std::vector<int64_t> parts;
+    };
+    std::vector<SplitRailInfo> splitRails;
+    std::vector<int64_t>       rowToRailIdx(N, -1);
+
+    std::vector<int64_t> colCount(N, 0);
+    for (int64_t r = 0; r < N; ++r) {
+        const int64_t rowStart = mObj.rp[r];
+        const int64_t rowEnd   = mObj.rp[r + 1];
+        if (rowStart == rowEnd) { return; } // Singular empty row; let standard KLU handle error
+        for (int64_t k = rowStart; k < rowEnd; ++k) {
+            const int64_t c = mObj.ci[k];
+            if (c >= 0 && c < N) { ++colCount[c]; }
+        }
+    }
+
+    if (!hasJJThermalNoise_ && !hasResistorThermalNoise_ && correctorIter_ == 0 && !saveStateFile_.has_value()
+        && !loadStateFile_.has_value() && !mObj.relevantTraces.empty()) {
+        std::vector<bool> noSplitRow(N, false);
+        for (int64_t r : mObj.relevantIndices) {
+            if (r >= 0 && r < N) { noSplitRow[r] = true; }
+        }
+        for (const auto& cs : mObj.components.currentsources) {
+            if (cs.indexInfo.posIndex_) { noSplitRow[cs.indexInfo.posIndex_.value()] = true; }
+            if (cs.indexInfo.negIndex_) { noSplitRow[cs.indexInfo.negIndex_.value()] = true; }
+        }
+        for (const auto& ps : psources_) {
+            if (ps.indexInfo.posIndex_) { noSplitRow[ps.indexInfo.posIndex_.value()] = true; }
+            if (ps.indexInfo.negIndex_) { noSplitRow[ps.indexInfo.negIndex_.value()] = true; }
+        }
+        for (const auto& ccvs : ccvss_) {
+            if (ccvs.indexInfo.posIndex_) { noSplitRow[ccvs.indexInfo.posIndex_.value()] = true; }
+            if (ccvs.indexInfo.negIndex_) { noSplitRow[ccvs.indexInfo.negIndex_.value()] = true; }
+            if (ccvs.posIndex2_) { noSplitRow[ccvs.posIndex2_.value()] = true; }
+            if (ccvs.negIndex2_) { noSplitRow[ccvs.negIndex2_.value()] = true; }
+        }
+        for (const auto& vccs : vccss_) {
+            if (vccs.indexInfo.posIndex_) { noSplitRow[vccs.indexInfo.posIndex_.value()] = true; }
+            if (vccs.indexInfo.negIndex_) { noSplitRow[vccs.indexInfo.negIndex_.value()] = true; }
+            if (vccs.posIndex2_) { noSplitRow[vccs.posIndex2_.value()] = true; }
+            if (vccs.negIndex2_) { noSplitRow[vccs.negIndex2_.value()] = true; }
+        }
+        std::vector<int64_t> vsCountOnNode(N, 0);
+        for (const auto& vs : vsources_) {
+            if (vs.indexInfo.posIndex_) { ++vsCountOnNode[vs.indexInfo.posIndex_.value()]; }
+            if (vs.indexInfo.negIndex_) { ++vsCountOnNode[vs.indexInfo.negIndex_.value()]; }
+        }
+
+        for (size_t vIdx = 0; vIdx < vsources_.size(); ++vIdx) {
+            const auto&      vs = vsources_[vIdx];
+            const NodeConfig nc = vs.indexInfo.nodeConfig_;
+            if (nc != NodeConfig::POSGND && nc != NodeConfig::GNDNEG) { continue; }
+            const int64_t r_v = (nc == NodeConfig::POSGND) ? vs.indexInfo.posIndex_.value()
+                                                           : vs.indexInfo.negIndex_.value();
+            const int64_t c_v = vs.indexInfo.currentIndex_.value();
+            if (r_v < 0 || r_v >= N || c_v < 0 || c_v >= N) { continue; }
+            if (noSplitRow[c_v] || vsCountOnNode[r_v] != 1) { continue; }
+            if (mObj.rp[c_v + 1] - mObj.rp[c_v] != 1 || mObj.ci[mObj.rp[c_v]] != r_v) { continue; }
+            if (colCount[c_v] != 1) { continue; }
+            bool hasCvInRv = false;
+            for (int64_t k = mObj.rp[r_v]; k < mObj.rp[r_v + 1]; ++k) {
+                if (mObj.ci[k] == c_v) {
+                    hasCvInRv = true;
+                    break;
+                }
+            }
+            if (!hasCvInRv || (mObj.rp[r_v + 1] - mObj.rp[r_v]) < 4) { continue; }
+            const int64_t railIdx = static_cast<int64_t>(splitRails.size());
+            splitRails.push_back({static_cast<int64_t>(vIdx), r_v, c_v, {}});
+            rowToRailIdx[r_v] = railIdx;
+            rowToRailIdx[c_v] = railIdx;
+        }
+    }
+
     std::vector<int64_t> parent(N);
     for (int64_t i = 0; i < N; ++i) { parent[i] = i; }
     auto find_root = [&](int64_t x) {
@@ -269,13 +347,13 @@ void Simulation::setup_partitions(Matrix& mObj) {
         return x;
     };
     for (int64_t r = 0; r < N; ++r) {
+        if (rowToRailIdx[r] >= 0) { continue; }
         const int64_t rowStart = mObj.rp[r];
         const int64_t rowEnd   = mObj.rp[r + 1];
-        if (rowStart == rowEnd) { return; } // Singular empty row; let standard KLU handle error
-        const int64_t rootR = find_root(r);
+        const int64_t rootR    = find_root(r);
         for (int64_t k = rowStart; k < rowEnd; ++k) {
             const int64_t c = mObj.ci[k];
-            if (c >= 0 && c < N) {
+            if (c >= 0 && c < N && rowToRailIdx[c] < 0) {
                 const int64_t rootC = find_root(c);
                 if (rootR != rootC) { parent[rootC] = rootR; }
             }
@@ -284,15 +362,20 @@ void Simulation::setup_partitions(Matrix& mObj) {
     // Ensure POSNEG current sources stay within a single partition
     for (const auto& cs : mObj.components.currentsources) {
         if (cs.indexInfo.posIndex_ && cs.indexInfo.negIndex_) {
-            const int64_t r1 = find_root(cs.indexInfo.posIndex_.value());
-            const int64_t r2 = find_root(cs.indexInfo.negIndex_.value());
-            if (r1 != r2) { parent[r2] = r1; }
+            const int64_t u1 = cs.indexInfo.posIndex_.value();
+            const int64_t u2 = cs.indexInfo.negIndex_.value();
+            if (rowToRailIdx[u1] < 0 && rowToRailIdx[u2] < 0) {
+                const int64_t r1 = find_root(u1);
+                const int64_t r2 = find_root(u2);
+                if (r1 != r2) { parent[r2] = r1; }
+            }
         }
     }
 
     std::unordered_map<int64_t, int64_t> rootToPart;
-    std::vector<int64_t>                 rowPart(N);
+    std::vector<int64_t>                 rowPart(N, -1);
     for (int64_t r = 0; r < N; ++r) {
+        if (rowToRailIdx[r] >= 0) { continue; }
         const int64_t root = find_root(r);
         auto          it   = rootToPart.find(root);
         if (it == rootToPart.end()) {
@@ -305,14 +388,89 @@ void Simulation::setup_partitions(Matrix& mObj) {
     }
 
     const int64_t nParts = static_cast<int64_t>(rootToPart.size());
-    if (nParts < 2 && mcRuns_ <= 1 && !(gpu_ && N <= 4096)) { return; }
+    if (nParts < 1) { return; }
+
+    for (auto& rail : splitRails) {
+        for (int64_t k = mObj.rp[rail.nodeRow]; k < mObj.rp[rail.nodeRow + 1]; ++k) {
+            const int64_t c = mObj.ci[k];
+            if (c >= 0 && c < N && rowToRailIdx[c] < 0 && rowPart[c] >= 0) {
+                rail.parts.push_back(rowPart[c]);
+            }
+        }
+        std::sort(rail.parts.begin(), rail.parts.end());
+        rail.parts.erase(std::unique(rail.parts.begin(), rail.parts.end()), rail.parts.end());
+        if (rail.parts.empty()) { rail.parts.push_back(0); }
+    }
+
+    std::vector<int64_t> estPartN(nParts, 0);
+    for (int64_t r = 0; r < N; ++r) {
+        if (rowToRailIdx[r] < 0) { ++estPartN[rowPart[r]]; }
+    }
+    for (const auto& rail : splitRails) {
+        for (int64_t p : rail.parts) { estPartN[p] += 2; }
+    }
+    int64_t maxPartN = 0;
+    for (int64_t p = 0; p < nParts; ++p) { maxPartN = std::max<int64_t>(maxPartN, estPartN[p]); }
+
+    if (nParts < 2 && mcRuns_ <= 1) { return; }
+    if (mcRuns_ <= 1 && maxPartN * 4 > N * 3) { return; }
+    if (gpu_ && mcRuns_ <= 1 && (maxPartN > 512 || nParts < 4 || N < 2048)) { return; }
 
     partitions_.resize(nParts);
     std::vector<int64_t> localRow(N, 0);
     for (int64_t r = 0; r < N; ++r) {
+        if (rowToRailIdx[r] >= 0) { continue; }
         const int64_t p  = rowPart[r];
         localRow[r]      = partitions_[p].n++;
         partitions_[p].globalRows.push_back(r);
+    }
+
+    const size_t                      nSplitRails = splitRails.size();
+    std::vector<std::vector<int64_t>> railPartNodeGlob(nSplitRails, std::vector<int64_t>(nParts, -1));
+    std::vector<std::vector<int64_t>> railPartNodeLoc(nSplitRails, std::vector<int64_t>(nParts, -1));
+    std::vector<std::vector<int64_t>> railPartCurLoc(nSplitRails, std::vector<int64_t>(nParts, -1));
+    std::vector<std::vector<int64_t>> partRailList(nParts);
+
+    int64_t nextVirtualRow = N;
+    for (size_t rIdx = 0; rIdx < nSplitRails; ++rIdx) {
+        const auto& rail = splitRails[rIdx];
+        for (size_t m = 0; m < rail.parts.size(); ++m) {
+            const int64_t p           = rail.parts[m];
+            const int64_t globNodeRow = (m == 0) ? rail.nodeRow : nextVirtualRow++;
+            const int64_t globCurRow  = (m == 0) ? rail.curRow : nextVirtualRow++;
+            if (m == 0) {
+                rowPart[rail.nodeRow]  = p;
+                rowPart[rail.curRow]   = p;
+                localRow[rail.nodeRow] = partitions_[p].n;
+                localRow[rail.curRow]  = partitions_[p].n + 1;
+            }
+            const int64_t locNode = partitions_[p].n++;
+            partitions_[p].globalRows.push_back(globNodeRow);
+            const int64_t locCur = partitions_[p].n++;
+            partitions_[p].globalRows.push_back(globCurRow);
+
+            railPartNodeGlob[rIdx][p] = globNodeRow;
+            railPartNodeLoc[rIdx][p]  = locNode;
+            railPartCurLoc[rIdx][p]   = locCur;
+            partRailList[p].push_back(static_cast<int64_t>(rIdx));
+
+            if (m > 0) {
+                VoltageSource vsClone = vsources_[rail.vsIdx];
+                if (vsClone.indexInfo.nodeConfig_ == NodeConfig::POSGND) {
+                    vsClone.indexInfo.posIndex_ = globNodeRow;
+                } else {
+                    vsClone.indexInfo.negIndex_ = globNodeRow;
+                }
+                vsClone.indexInfo.currentIndex_ = globCurRow;
+                const int64_t cloneVsIdx        = static_cast<int64_t>(vsources_.size());
+                vsources_.push_back(vsClone);
+                partitions_[p].vsIndices.push_back(cloneVsIdx);
+            }
+        }
+    }
+    if (nextVirtualRow > N) {
+        b_.assign(static_cast<size_t>(nextVirtualRow), 0.0);
+        x_.resize(static_cast<size_t>(nextVirtualRow), 0.0);
     }
 
     std::vector<int64_t> globalNzToPartNz(mObj.nz.size(), -1);
@@ -321,24 +479,61 @@ void Simulation::setup_partitions(Matrix& mObj) {
         part.rp.reserve(part.n + 1);
         part.rp.push_back(0);
         part.xLocal.assign(part.n, 0.0);
-        for (int64_t locR = 0; locR < part.n; ++locR) {
+        const int64_t nNonRail = part.n - 2 * static_cast<int64_t>(partRailList[p].size());
+        for (int64_t locR = 0; locR < nNonRail; ++locR) {
             const int64_t globR    = part.globalRows[locR];
             const int64_t rowStart = mObj.rp[globR];
             const int64_t rowEnd   = mObj.rp[globR + 1];
             for (int64_t k = rowStart; k < rowEnd; ++k) {
                 globalNzToPartNz[k] = static_cast<int64_t>(part.nz.size());
-                part.ci.push_back(localRow[mObj.ci[k]]);
+                const int64_t c     = mObj.ci[k];
+                const int64_t rIdx  = (c >= 0 && c < N) ? rowToRailIdx[c] : -1;
+                const int64_t locC  = (rIdx >= 0) ? railPartNodeLoc[rIdx][p] : localRow[c];
+                part.ci.push_back(locC);
                 part.nz.push_back(mObj.nz[k]);
             }
             part.rp.push_back(static_cast<int64_t>(part.nz.size()));
         }
+        for (int64_t rIdx : partRailList[p]) {
+            const auto&   rail     = splitRails[rIdx];
+            const int64_t rowStart = mObj.rp[rail.nodeRow];
+            const int64_t rowEnd   = mObj.rp[rail.nodeRow + 1];
+            for (int64_t k = rowStart; k < rowEnd; ++k) {
+                const int64_t c = mObj.ci[k];
+                if (c == rail.curRow) {
+                    part.ci.push_back(railPartCurLoc[rIdx][p]);
+                    part.nz.push_back(mObj.nz[k]);
+                } else if (c >= 0 && c < N && rowToRailIdx[c] < 0 && rowPart[c] == p) {
+                    part.ci.push_back(localRow[c]);
+                    part.nz.push_back(mObj.nz[k]);
+                }
+            }
+            part.rp.push_back(static_cast<int64_t>(part.nz.size()));
+
+            const int64_t kCur = mObj.rp[rail.curRow];
+            part.ci.push_back(railPartNodeLoc[rIdx][p]);
+            part.nz.push_back(mObj.nz[kCur]);
+            part.rp.push_back(static_cast<int64_t>(part.nz.size()));
+        }
     }
+
+    auto remap_node = [&](std::optional<int64_t>& nodeOpt, int64_t p) {
+        if (!splitRails.empty() && nodeOpt.has_value()) {
+            const int64_t u = nodeOpt.value();
+            if (u >= 0 && u < N && rowToRailIdx[u] >= 0) {
+                const int64_t gNew = railPartNodeGlob[rowToRailIdx[u]][p];
+                if (gNew >= 0) { nodeOpt = gNew; }
+            }
+        }
+    };
 
     jjPartIdx_.resize(jjs_.size(), 0);
     jjPartNzIdx_.resize(jjs_.size(), 0);
     for (size_t idx = 0; idx < jjs_.size(); ++idx) {
         const int64_t globR = jjs_[idx].indexInfo.currentIndex_.value();
         const int64_t p     = rowPart[globR];
+        remap_node(jjs_[idx].indexInfo.posIndex_, p);
+        remap_node(jjs_[idx].indexInfo.negIndex_, p);
         jjPartIdx_[idx]     = p;
         jjPartNzIdx_[idx]   = globalNzToPartNz[jjs_[idx].nzBackIndex_];
         partitions_[p].jjIndices.push_back(static_cast<int64_t>(idx));
@@ -358,6 +553,8 @@ void Simulation::setup_partitions(Matrix& mObj) {
     for (size_t idx = 0; idx < resistors_.size(); ++idx) {
         const int64_t globR = resistors_[idx].indexInfo.currentIndex_.value();
         const int64_t p     = rowPart[globR];
+        remap_node(resistors_[idx].indexInfo.posIndex_, p);
+        remap_node(resistors_[idx].indexInfo.negIndex_, p);
         resPartIdx_[idx]    = p;
         resPartNzIdx_[idx]  = find_part_nz(p, globR, globR);
         partitions_[p].resIndices.push_back(static_cast<int64_t>(idx));
@@ -369,6 +566,8 @@ void Simulation::setup_partitions(Matrix& mObj) {
     for (size_t idx = 0; idx < inductors_.size(); ++idx) {
         const int64_t globR = inductors_[idx].indexInfo.currentIndex_.value();
         const int64_t p     = rowPart[globR];
+        remap_node(inductors_[idx].indexInfo.posIndex_, p);
+        remap_node(inductors_[idx].indexInfo.negIndex_, p);
         indPartIdx_[idx]    = p;
         indPartNzIdx_[idx]  = find_part_nz(p, globR, globR);
         const auto& muts    = inductors_[idx].get_mutualInductance();
@@ -385,11 +584,14 @@ void Simulation::setup_partitions(Matrix& mObj) {
     for (size_t idx = 0; idx < capacitors_.size(); ++idx) {
         const int64_t globR = capacitors_[idx].indexInfo.currentIndex_.value();
         const int64_t p     = rowPart[globR];
+        remap_node(capacitors_[idx].indexInfo.posIndex_, p);
+        remap_node(capacitors_[idx].indexInfo.negIndex_, p);
         capPartIdx_[idx]    = p;
         capPartNzIdx_[idx]  = find_part_nz(p, globR, globR);
         partitions_[p].capIndices.push_back(static_cast<int64_t>(idx));
     }
-    for (size_t idx = 0; idx < vsources_.size(); ++idx) {
+    const size_t nOrigVs = mObj.components.vsIndices.size();
+    for (size_t idx = 0; idx < nOrigVs; ++idx) {
         partitions_[rowPart[vsources_[idx].indexInfo.currentIndex_.value()]].vsIndices.push_back(
                 static_cast<int64_t>(idx));
     }
@@ -417,11 +619,16 @@ void Simulation::setup_partitions(Matrix& mObj) {
     }
     int64_t kMin = txlines_.empty() ? 8192 : 1024;
     for (size_t idx = 0; idx < txlines_.size(); ++idx) {
-        const auto& tx = txlines_[idx];
-        kMin           = std::min<int64_t>(kMin, tx.timestepDelay_);
-        partitions_[rowPart[tx.indexInfo.currentIndex_.value()]].txPort1Indices.push_back(
-                static_cast<int64_t>(idx));
-        partitions_[rowPart[tx.currentIndex2_]].txPort2Indices.push_back(static_cast<int64_t>(idx));
+        auto&         tx = txlines_[idx];
+        const int64_t p1 = rowPart[tx.indexInfo.currentIndex_.value()];
+        const int64_t p2 = rowPart[tx.currentIndex2_];
+        remap_node(tx.indexInfo.posIndex_, p1);
+        remap_node(tx.indexInfo.negIndex_, p1);
+        remap_node(tx.posIndex2_, p2);
+        remap_node(tx.negIndex2_, p2);
+        kMin = std::min<int64_t>(kMin, tx.timestepDelay_);
+        partitions_[p1].txPort1Indices.push_back(static_cast<int64_t>(idx));
+        partitions_[p2].txPort2Indices.push_back(static_cast<int64_t>(idx));
     }
     windowSize_ = (kMin >= 1) ? std::min<int64_t>(kMin, std::max<int64_t>(1, simSize_)) : 0;
 
@@ -442,7 +649,8 @@ void Simulation::setup_partitions(Matrix& mObj) {
     usePartitions_ = true;
     if (verb_ >= 1) {
         std::cout << "JoSIM: Partitioned MNA matrix (" << N << " equations) into " << nParts
-                  << " independent KLU blocks (PTL lookahead window W = " << windowSize_ << " steps)\n";
+                  << " independent KLU blocks (max block = " << maxPartN
+                  << " eqns, PTL lookahead window W = " << windowSize_ << " steps)\n";
     }
 #else
     (void) mObj;
@@ -457,9 +665,14 @@ bool Simulation::setup_gpu_solver(Matrix& mObj) {
     }
 
     const int64_t nParts = static_cast<int64_t>(partitions_.size());
-    const int64_t N      = static_cast<int64_t>(mObj.rp.size()) - 1;
+    if (nParts < 4) { return false; }
+    for (int64_t p = 0; p < nParts; ++p) {
+        if (partitions_[p].n > 512) { return false; }
+    }
+    const int64_t N              = static_cast<int64_t>(mObj.rp.size()) - 1;
+    const int64_t totalStateRows = std::max<int64_t>(N, static_cast<int64_t>(x_.size()));
 
-    std::vector<int32_t> globalToAbsLocal(N, 0);
+    std::vector<int32_t> globalToAbsLocal(totalStateRows, 0);
     int32_t              rowOffset = 0;
     for (int64_t p = 0; p < nParts; ++p) {
         const auto& part = partitions_[p];
@@ -479,7 +692,7 @@ bool Simulation::setup_gpu_solver(Matrix& mObj) {
     std::vector<double>         luVal;
     std::vector<double>         partNz;
     std::vector<double>         xInit(rowOffset, 0.0);
-    for (int64_t r = 0; r < N; ++r) { xInit[globalToAbsLocal[r]] = x_[r]; }
+    for (int64_t r = 0; r < totalStateRows; ++r) { xInit[globalToAbsLocal[r]] = x_[r]; }
 
     P.reserve(rowOffset);
     Q.reserve(rowOffset);
@@ -1448,17 +1661,22 @@ void Simulation::factorize_lu(Matrix& mObj) {
     } else {
         simOK_ = klu_l_defaults(&Common_);
         assert(simOK_);
-        if (gpu_ && (gpuMode_ == 3 || gpuMode_ == 1)) {
+        int64_t       maxRowDeg = 0;
+        const int64_t nRows     = static_cast<int64_t>(mObj.rp.size()) - 1;
+        for (int64_t r = 0; r < nRows; ++r) {
+            maxRowDeg = std::max<int64_t>(maxRowDeg, mObj.rp[r + 1] - mObj.rp[r]);
+        }
+        if (gpu_ && (gpuMode_ == 3 || (gpuMode_ == 1 && maxRowDeg <= 32))) {
             Common_.btf   = 0;
             Common_.scale = 0;
         }
-        Symbolic_ = klu_l_analyze(mObj.rp.size() - 1, &mObj.rp.front(), &mObj.ci.front(), &Common_);
+        Symbolic_ = klu_l_analyze(nRows, &mObj.rp.front(), &mObj.ci.front(), &Common_);
         Numeric_  = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
-        if (gpu_ && (gpuMode_ == 3 || gpuMode_ == 1) && (!Numeric_ || Common_.status != KLU_OK)) {
+        if (gpu_ && Common_.btf == 0 && (!Numeric_ || Common_.status != KLU_OK)) {
             if (Numeric_) { klu_l_free_numeric(&Numeric_, &Common_); }
             if (Symbolic_) { klu_l_free_symbolic(&Symbolic_, &Common_); }
             klu_l_defaults(&Common_);
-            Symbolic_ = klu_l_analyze(mObj.rp.size() - 1, &mObj.rp.front(), &mObj.ci.front(), &Common_);
+            Symbolic_ = klu_l_analyze(nRows, &mObj.rp.front(), &mObj.ci.front(), &Common_);
             Numeric_  = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
         }
     }
@@ -1577,11 +1795,12 @@ void Simulation::free_lu() {
 
 void Simulation::trans_sim_mc(Matrix& mObj) {
 #ifndef SLU
-    const int64_t B      = mcRuns_;
-    const int64_t nParts = static_cast<int64_t>(partitions_.size());
-    const int64_t N      = static_cast<int64_t>(mObj.rp.size()) - 1;
+    const int64_t B              = mcRuns_;
+    const int64_t nParts         = static_cast<int64_t>(partitions_.size());
+    const int64_t N              = static_cast<int64_t>(mObj.rp.size()) - 1;
+    const int64_t totalStateRows = std::max<int64_t>(N, static_cast<int64_t>(x_.size()));
 
-    std::vector<int32_t> globalToAbsLocal(N, 0);
+    std::vector<int32_t> globalToAbsLocal(totalStateRows, 0);
     int32_t              baseRowOffset = 0;
     for (int64_t p = 0; p < nParts; ++p) {
         const auto& part = partitions_[p];
@@ -1601,7 +1820,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
     std::vector<double>      baseLuVal;
     std::vector<double>      basePartNz;
     std::vector<double>      baseXInit(baseRowOffset, 0.0);
-    for (int64_t r = 0; r < N; ++r) { baseXInit[globalToAbsLocal[r]] = x_[r]; }
+    for (int64_t r = 0; r < totalStateRows; ++r) { baseXInit[globalToAbsLocal[r]] = x_[r]; }
 
     baseP.reserve(baseRowOffset);
     baseQ.reserve(baseRowOffset);
@@ -3127,7 +3346,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
         bar.set_total(static_cast<float>(simSize_));
     }
 
-    b_.assign(mObj.rp.size(), 0.0);
+    b_.assign(std::max(mObj.rp.size(), x_.size()), 0.0);
 
     const int64_t       nParts   = static_cast<int64_t>(partitions_.size());
     const int64_t       numSrc   = static_cast<int64_t>(mObj.sourcegen.size());
@@ -3671,7 +3890,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
 
 void Simulation::trans_sim(Matrix& mObj) {
     // Ensure the b vector is sized once
-    b_.assign(mObj.rp.size(), 0.0);
+    b_.assign(std::max(mObj.rp.size(), x_.size()), 0.0);
     if (loadStateFile_.has_value()) {
         load_state(loadStateFile_.value(), mObj);
     } else if (startup_) {
@@ -3737,7 +3956,7 @@ void Simulation::trans_sim(Matrix& mObj) {
                 trans_sim_gpu_monolithic_full(mObj);
                 return;
             }
-            if (setup_gpu_monolithic(mObj) && cudaSolver_) {
+            if (jjs_.size() >= 8192 && setup_gpu_monolithic(mObj) && cudaSolver_) {
                 trans_sim_gpu_monolithic(mObj);
                 return;
             }

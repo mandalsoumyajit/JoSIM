@@ -356,7 +356,7 @@ An example:
 
 If an inductor has a value of *2pH*, this is its nominal value. If a local spread of *0.2* is specified this means a random value can be chosen anywhere between *1.6pH* and *2.4pH*. If global inductor specific spread is specified as *0.3* and the local spread is not defined, the value can be anything within the range *1.4pH -  2.6pH*. Similarly if the global spread is defined as *0.5* then the value each time the simulation is run can be anywhere between *1pH* and *3pH*.
 
-#### Batched Monte Carlo Execution (`-b <N>`, `.option mc=<N>`, `.spread ... runs=<N>`)
+#### Batched Monte Carlo Execution (`-b <N>`, `.option mc=<N>`, `.spread ... runs=<N>`) — *[New in v2.8 Fork]*
 
 When `N > 1` Monte Carlo trials are requested via `-b <N>` (`--batch=<N>`), `.option mc=<N>` (`.option batch=<N>`), or `.spread ... runs=<N>`, JoSIM parses the netlist and performs symbolic graph partitioning **only once**, then executes all `N` independent fabrication-yield trials simultaneously in a single invocation using either:
 - **Multi-Core OpenMP (`-p` / `--parallel`)**: Distributes independent Monte Carlo trials and circuit partitions across CPU threads using deterministic per-trial seeds (`baseSeed ^ (b * 0x9E3779B97F4A7C15ULL)`).
@@ -376,21 +376,21 @@ Simulator options can be configured in the netlist using the `.option` (or `.opt
 
 **.option**&emsp;*OPTION_KEY*[=*VALUE*]&emsp;[*OPTION_KEY2*[=*VALUE2*] ...]
 
-| Option | Syntax | Description |
-| ------ | ------ | ----------- |
-| **SEED** | `.option seed=<int>` | Sets a deterministic integer seed for the random number generator used by **noise** and **spread**. The current run's seed is also printed in verbose mode (`-V 1`). |
-| **TXINTERP** / **FRACTX** | `.option txinterp` | Enables linear fractional-step delay interpolation for all transmission lines (`T` elements) when $T_D / T_{STEP}$ is non-integer. Can also be set per element via `interp=1`. |
-| **FIXEDSTEP** | `.option fixedstep` | Disables automatic global timestep halving (`reduce_step`) when a Josephson junction's phase step exceeds $0.4\pi$. Equivalent to the `-f` (`--fixed-step`) CLI switch. |
-| **WARNSTEP** | `.option warnstep` | Prints a diagnostic warning identifying the offending Josephson junction label, halving count, and old/new `TSTEP` whenever automatic step halving or a phase jump occurs. |
-| **CORRECTOR** | `.option corrector=<N>` | Enables up to `N` implicit predictor-corrector (Picard/BDF2) iterations per timestep on active Josephson junctions (default `0`; `-c` on the CLI defaults to `2`). |
-| **CORRECTORTOL** | `.option correctortol=<val>` | Sets the phase convergence threshold (in radians, default `1e-3`) that triggers predictor-corrector iteration when `CORRECTOR` > 0. |
-| **KCUTOFF** / **KMIN** | `.option kcutoff=<val>` | Ignores mutual inductance entries (`K` lines) with $|k| < \text{val}$ during MNA matrix construction, preventing dense LU fill-in from weak parasitic couplings in 3D field-extracted netlists. |
-| **NODAL** | `.option nodal` | Enables the **Tier 4 Exact Schur-Complement Nodal Admittance Solver** (`-n` / `--nodal`). Analytically eliminates all internal branch equations (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) into the reduced Nodal Admittance matrix $A_{\text{red}}$ ($2\times–6\times$ smaller than standard MNA), reconstructing any requested `.print` branch currents on the fly. Ideal for single-thread execution and monolithic circuits ($P=1\text{–}2$). |
-| **BYPASS** / **LATENCY** | `.option bypass` | Enables activity-driven quiescent partition bypass during OpenMP windowed simulation (`-p`). Skips `klu_l_tsolve` on partitions whose internal devices and PTL boundary inputs are completely quiescent at a given timestep. |
-| **BYPASSTOL** | `.option bypasstol=<val>` | Sets the activity threshold (default `1e-12`) used by `.option bypass` to determine whether a partition's RHS or solution vector changed. |
-| **GPU** / **CUDA** | `.option gpu[=1\|2\|3\|4]` | Enables NVIDIA CUDA GPU acceleration (`CudaPartitionSolver`) when compiled with `-DUSING_CUDA=ON`. Equivalent to `-g [1\|2\|3\|4]` (`--gpu[=1\|2\|3\|4]`). Mode `1` (default) auto-selects between Tier 1 Partitioned, Tier 3 `cuSolverRF` Monolithic (`gpu=3`), and Hybrid Device-GPU (`gpu=2`); mode `2` forces Hybrid Device-GPU; mode `3` (or `.option gpumono` / `.option cusolverrf`) forces the Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic MNA Solver; mode `4` (or `.option gpunodal`) forces the Tier 4 Fully GPU-Resident `cuSolverRF` Nodal Admittance Solver on $A_{\text{red}}$. |
-| **MC** / **BATCH** / **RUNS** | `.option mc=<N>` | Executes a batched Monte Carlo ensemble of `N` fabrication-spread (`.spread`) trials in a single simulation run. Equivalent to `-b <N>` (`--batch=<N>`) or `.spread ... runs=<N>`. |
-| **MCALL** | `.option mcall` | When running batched Monte Carlo (`mc > 1`), appends all individual trial waveforms (`<Trace>_MC0 .. <Trace>_MC{N-1}`) to the output file in addition to the ensemble `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, and `<Trace>_MAX` traces. |
+| Option | Syntax | Origin | Description |
+| ------ | ------ | :---: | ----------- |
+| **SEED** | `.option seed=<int>` | Inherited (`v2.7`) / Enhanced (`v2.8`) | Sets a deterministic integer seed for the random number generator used by **noise** and **spread** (extended in `v2.8` with `JOSIM_SEED` env var and per-trial splitmix64 seeding). |
+| **TXINTERP** / **FRACTX** | `.option txinterp` | **New in Fork (`v2.8`)** | Enables linear fractional-step delay interpolation for all transmission lines (`T` elements) when $T_D / T_{STEP}$ is non-integer. Can also be set per element via `interp=1`. |
+| **FIXEDSTEP** | `.option fixedstep` | **New in Fork (`v2.8`)** | Disables automatic global timestep halving (`reduce_step`) when a Josephson junction's phase step exceeds $0.4\pi$. Equivalent to the `-f` (`--fixed-step`) CLI switch. |
+| **WARNSTEP** | `.option warnstep` | **New in Fork (`v2.8`)** | Prints a diagnostic warning identifying the offending Josephson junction label, halving count, and old/new `TSTEP` whenever automatic step halving or a phase jump occurs. |
+| **CORRECTOR** | `.option corrector=<N>` | **New in Fork (`v2.8`)** | Enables up to `N` implicit predictor-corrector (Picard/BDF2) iterations per timestep on active Josephson junctions (default `0`; `-c` on the CLI defaults to `2`). |
+| **CORRECTORTOL** | `.option correctortol=<val>` | **New in Fork (`v2.8`)** | Sets the phase convergence threshold (in radians, default `1e-3`) that triggers predictor-corrector iteration when `CORRECTOR` > 0. |
+| **KCUTOFF** / **KMIN** | `.option kcutoff=<val>` | **New in Fork (`v2.8`)** | Ignores mutual inductance entries (`K` lines) with $|k| < \text{val}$ during MNA matrix construction, preventing dense LU fill-in from weak parasitic couplings in 3D field-extracted netlists. |
+| **NODAL** | `.option nodal` | **New in Fork (`v2.8`)** | Enables the **Tier 4 Exact Schur-Complement Nodal Admittance Solver** (`-n` / `--nodal`). Analytically eliminates all internal branch equations (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) into the reduced Nodal Admittance matrix $A_{\text{red}}$ ($2\times–6\times$ smaller than standard MNA), reconstructing any requested `.print` branch currents on the fly. Ideal for single-thread execution and monolithic circuits ($P=1\text{–}2$). |
+| **BYPASS** / **LATENCY** | `.option bypass` | **New in Fork (`v2.8`)** | Enables activity-driven quiescent partition bypass during OpenMP windowed simulation (`-p`). Skips `klu_l_tsolve` on partitions whose internal devices and PTL boundary inputs are completely quiescent at a given timestep. |
+| **BYPASSTOL** | `.option bypasstol=<val>` | **New in Fork (`v2.8`)** | Sets the activity threshold (default `1e-12`) used by `.option bypass` to determine whether a partition's RHS or solution vector changed. |
+| **GPU** / **CUDA** | `.option gpu[=1\|2\|3\|4]` | **New in Fork (`v2.8`)** | Enables NVIDIA CUDA GPU acceleration (`CudaPartitionSolver`) when compiled with `-DUSING_CUDA=ON`. Equivalent to `-g [1\|2\|3\|4]` (`--gpu[=1\|2\|3\|4]`). Mode `1` (default) auto-selects between Tier 1 Partitioned, Tier 3 `cuSolverRF` Monolithic (`gpu=3`), and Hybrid Device-GPU (`gpu=2`); mode `2` forces Hybrid Device-GPU; mode `3` (or `.option gpumono` / `.option cusolverrf`) forces the Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic MNA Solver; mode `4` (or `.option gpunodal`) forces the Tier 4 Fully GPU-Resident `cuSolverRF` Nodal Admittance Solver on $A_{\text{red}}$. |
+| **MC** / **BATCH** / **RUNS** | `.option mc=<N>` | **New in Fork (`v2.8`)** | Executes a batched Monte Carlo ensemble of `N` fabrication-spread (`.spread`) trials in a single simulation run. Equivalent to `-b <N>` (`--batch=<N>`) or `.spread ... runs=<N>`. |
+| **MCALL** | `.option mcall` | **New in Fork (`v2.8`)** | When running batched Monte Carlo (`mc > 1`), appends all individual trial waveforms (`<Trace>_MC0 .. <Trace>_MC{N-1}`) to the output file in addition to the ensemble `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, and `<Trace>_MAX` traces. |
 
 Examples:
 ```cir
@@ -402,7 +402,7 @@ Examples:
 .option gpu=4
 ```
 
-### State Checkpointing (`.savestate` / `.loadstate`)
+### State Checkpointing (`.savestate` / `.loadstate`) — *[New in v2.8 Fork]*
 
 For large circuits that require a long initial bias-conditioning or settling window before applying data stimuli, JoSIM can serialize and restore the full simulator state (the MNA solution vector $\mathbf{x}$, all multi-step device history registers, and the complete circular delay ring buffers of all transmission lines) in a compact binary checkpoint file (`JOSIMSTA` v2):
 
@@ -476,14 +476,14 @@ Multi-file output can be achieved by separating output commands with the followi
 
 This indicates that every output request that follows this command needs to be stored in the file specified by *filepath*. Both `.file` and the `-o` (`--output=`) command-line switch automatically select the output format from the file extension:
 
-| Extension | Format | Description |
-| --------- | ------ | ----------- |
-| `.csv` | Comma-Separated Values (ASCII) | Standard comma-separated text table with header row (`time,...`). |
-| `.dat` | Space-Separated Values (ASCII) | Standard space-separated text table with header row. |
-| `.raw` or no extension | SPICE3 Raw (ASCII) | Standard ASCII SPICE rawfile (`Values:` section). |
-| `.bin` | Native JoSIM Binary (`JOSIMBIN`) | High-speed column-major IEEE-754 `float64` binary format with self-describing trace metadata header. ~37x faster to write and ~38% smaller than `.csv`. |
-| `.npy` | NumPy Structured Array (`.npy`) | Standard NumPy v1.0/v2.0 structured array with named `<f8` columns, directly loadable via `numpy.load()` or `scripts/josim_io.py`. |
-| `.rawb` or `.braw` | SPICE3 Binary Raw (`Binary:`) | Standard SPICE3 binary rawfile with ASCII preamble followed by interleaved IEEE-754 `float64` records. |
+| Extension | Format | Origin | Description |
+| --------- | ------ | :---: | ----------- |
+| `.csv` | Comma-Separated Values (ASCII) | Inherited (`v2.7`) | Standard comma-separated text table with header row (`time,...`). |
+| `.dat` | Space-Separated Values (ASCII) | Inherited (`v2.7`) | Standard space-separated text table with header row. |
+| `.raw` or no extension | SPICE3 Raw (ASCII) | Inherited (`v2.7`) | Standard ASCII SPICE rawfile (`Values:` section). |
+| `.bin` | Native JoSIM Binary (`JOSIMBIN`) | **New in Fork (`v2.8`)** | High-speed column-major IEEE-754 `float64` binary format with self-describing trace metadata header. ~37x faster to write and ~38% smaller than `.csv`. |
+| `.npy` | NumPy Structured Array (`.npy`) | **New in Fork (`v2.8`)** | Standard NumPy v1.0/v2.0 structured array with named `<f8` columns, directly loadable via `numpy.load()` or `scripts/josim_io.py`. |
+| `.rawb` or `.braw` | SPICE3 Binary Raw (`Binary:`) | **New in Fork (`v2.8`)** | Standard SPICE3 binary rawfile with ASCII preamble followed by interleaved IEEE-754 `float64` records. |
 
 I.e. 
 

@@ -20,6 +20,18 @@ Below is a macro overview of the process performed by JoSIM. This is very basic 
 
 <center><img src="img/josim_macro.svg" alt="JoSIM Macro Overview" style="width:600px;" /></center>
 
+## Inherited Upstream (`v2.7`) vs. New in This Fork (`v2.8`)
+
+This repository is an enhanced fork branched from upstream **`JoeyDelp/JoSIM` `v2.7` (commit `02a34ee`)**:
+- **Inherited from Upstream (`v2.7`):** Standard SPICE netlist syntax, RCSJ Josephson junction models (`RTYPE=0` and `RTYPE=1`, Haberkorn tunneling, multi-harmonic CPR, thermal noise `.temp`/`.neb`), Phase (`-a 1`) and Voltage (`-a 0`) Modified Nodal Analysis (MNA) with 2nd-order Gear (BDF2) integration, serial SuiteSparse KLU / SuperLU solving, and ASCII output formats (`.csv`, `.dat`, `.raw`).
+- **New in This Fork (`v2.8`):**
+  1. **Core Single-Thread & Memory Optimizations:** $O(1)$ hash-map lookups (`deviceMap`, `csMap`), in-place CSR updates + `klu_l_refactor` on `RTYPE=1` switching, self-contained PTL circular ring buffers (`hist_`), and in-loop `PRSTART`/`PRSTEP` decimation (**1.5x–3.4x faster single-thread MNA** and **2x–17.6x lower peak RAM**).
+  2. **Tier 1 Multi-Step Windowed PTL Block-Parallel Solver (`-p` OpenMP & `-g` CUDA GPU):** Exact causal lookahead windowing across PTLs and independent channels (**up to `27.15x` OpenMP speedup** and **`21.47x` GPU speedup**).
+  3. **Tier 2 Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>`, `.option mc=<N>`, `.option mcall`):** Simultaneous multi-trial fabrication yield execution with Welford ensemble statistics (**up to `31.14x` OpenMP speedup** and **`19.65x` GPU speedup**).
+  4. **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`, `.option gpu=3`):** Zero-PCIe in-VRAM simulation loop (**`2.45x–4.21x` GPU speedup** on 2D JJ arrays).
+  5. **Tier 4 Exact Schur-Complement Nodal Admittance Solver (`-n`, `.option nodal`, `-g 4`, `.option gpu=4`) & Quiescent Bypass (`.option bypass`):** Eliminates internal branch rows to shrink the matrix by **2x–6x** (**`1.47x–2.47x` additional single-thread speedup** on production macros `r5cal`, `r10f1n`, `xadd4` and **`3.36x–4.37x`** on 2D JJ grids; **4.3x–28.8x total speedup over `v2.6.5`**).
+  6. **High-Speed Binary I/O & Numerical Controls:** `.npy` (NumPy structured array), `.bin` (`JOSIMBIN` column-major float64), `.rawb`, `.savestate`/`.loadstate` checkpointing, `.option txinterp` fractional PTL interpolation, `.option kcutoff`, `-c` predictor-corrector, and `-f` fixed-step control.
+
 
 ## Project layout
 

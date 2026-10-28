@@ -134,16 +134,62 @@ arr = np.load("./ex_jtl_basic.npy", mmap_mode="r")
 print(arr.dtype.names)  # ('time', 'V(VIN)', 'I(ROUT)', 'P(B01)', 'P(B02)')
 ```
 
-## Multi-Core OpenMP (`-p`) & CUDA GPU (`-g`) Acceleration
+## Selecting the Optimal Solver Mode (`-n`, `-p`, `-g`, `-b`)
 
-When JoSIM is compiled with `-DUSING_OPENMP=ON` and `-DUSING_CUDA=ON`, large multi-tile PTL-connected chips and multi-channel non-PTL circuits (such as SQUID/detector readout arrays and parallel bit-slices) can be accelerated using `-p` (`--parallel`) or `-g` (`--gpu`, or `.option gpu` inside the netlist):
+JoSIM includes multiple specialized solver paths that all produce machine-precision identical results ($\le 10^{-14}$ relative difference). Use the guide below to choose the right flags for your circuit topology and compute environment:
+
+### 1. Single-Core / Cluster Job Pool Execution (`-n` / `--nodal`)
+When running single-threaded jobs (for example in a cluster pool where each job is allocated 1 CPU core) or simulating monolithic circuits that have few or no transmission-line partitions ($P = 1\text{–}2$, such as `r5cal`, `r10f1n`, `xadd4`, `dff`, or 2D JJ grids), enable the **Tier 4 Schur-Complement Nodal Admittance Solver** with `-n` (or `.option nodal` in the deck):
 
 ```bash
-# Run with multi-core OpenMP windowed block-parallel solver
-OMP_NUM_THREADS=24 josim-cli -p -o ./output.bin ./large_design.cir
-
-# Run with NVIDIA CUDA GPU solver
-josim-cli -g -o ./output.bin ./large_design.cir
+josim-cli -n -o ./output.npy ./monolithic_macro.cir
 ```
 
-See [GPU Acceleration Architecture & Benchmarks](gpu_architecture.md) for detailed scaling benchmarks across both PTL-coupled processor tiles (**up to `27.15x` OpenMP speedup and `21.47x` GPU speedup** on 131k JJs) and non-PTL / 3D-extracted RLK circuits (**up to `24.98x` OpenMP speedup and `10.30x` GPU speedup** on 1.21M MNA equations with 393k mutual inductances and 131k capacitors).
+- **How it works:** Analytically eliminates all internal branch rows (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) into the reduced Nodal Admittance matrix $A_{\text{red}}$ of size $N_{\text{red}} \ll N$ (**2x–6x smaller matrix**), reconstructing any requested `.print` branch currents on the fly.
+- **Typical speedup:** **1.5x–2.5x faster** on production single-block macros (`r5cal`, `r10f1n`, `xadd4`) and **3.1x–4.2x faster** on 2D Josephson junction grids—using **only 1 CPU thread**.
+
+### 2. Universal Multi-Core CPU Execution (`-p -n`)
+When running on a multi-core workstation or server (compiled with `-DUSING_OPENMP=ON`), combining `-p` and `-n` automatically selects the fastest CPU solver based on your circuit's partition structure:
+
+```bash
+# Automatically uses Windowed PTL OpenMP when P >= 4, or Nodal Admittance when P <= 2
+josim-cli -p -n -o ./output.npy ./design.cir
+
+# Optionally specify the OpenMP thread count (defaults to min(16, max_threads, P))
+OMP_NUM_THREADS=16 josim-cli -p -n -o ./output.npy ./design.cir
+```
+
+- **When the circuit partitions across PTLs or independent channels ($P \ge 4$, e.g. `coupler`, `adder`, multi-tile processors, multi-channel SQUID arrays):** JoSIM runs the **Tier 1 Multi-Step Windowed Block-Parallel OpenMP Solver** (`3.6x` speedup on `adder`, `7.5x` on `coupler`, and up to `27.1x` on 4,096-tile circuits). You can also add `.option bypass` to the deck to skip `klu_l_tsolve` on quiescent partitions.
+- **When the circuit is monolithic ($P = 1\text{–}2$):** JoSIM automatically uses the **Tier 4 Nodal Admittance Solver (`-n`)**, avoiding OpenMP barrier overhead on small/medium monolithic decks while parallelizing device evaluations when the circuit exceeds 32k devices (`4.37x` speedup on `Mono-2D-Grid-14kJJ`).
+
+### 3. NVIDIA CUDA GPU Acceleration (`-g`, `-g 2`, `-g 3`, `-g 4`)
+When compiled with `-DUSING_CUDA=ON`, JoSIM provides four GPU solver modes:
+
+```bash
+# Mode 1 (Default Auto-Dispatcher): selects Tier 1 PTL, Tier 3 cuSolverRF, or Hybrid GPU
+josim-cli -g -o ./output.bin ./large_ptl_chip.cir
+
+# Mode 2: Hybrid Device-GPU + Host-KLU (best for 1D monolithic chains / RLK ladders)
+josim-cli -g 2 -o ./output.bin ./monolithic_1d_chain.cir
+
+# Mode 3: Tier 3 Fully GPU-Resident cuSolverRF Monolithic MNA Solver (best for RTYPE=0 2D/3D grids)
+josim-cli -g 3 -o ./output.bin ./jj_grid_2d.cir
+
+# Mode 4: Tier 4 Fully GPU-Resident cuSolverRF Nodal Admittance Solver (best for RTYPE=1 switching 2D/3D grids)
+josim-cli -g 4 -o ./output.bin ./jj_grid_2d_switching.cir
+```
+
+### 4. Batched Monte Carlo (`.spread`) Yield & Margin Analysis (`-b <N>`)
+To run $B = 32\text{–}4,096$ fabrication-variation trials (`.spread`) for yield or critical-margin analysis, use `-b <N>` (`--batch=<N>`) or `.option mc=<N>`:
+
+```bash
+# Run 256 Monte Carlo trials in parallel across OpenMP CPU threads (up to 31x speedup)
+JOSIM_SEED=12345 josim-cli -p -b 256 -o ./mc_yield.npy ./ksa4bit_spread.cir
+
+# Or run 256 Monte Carlo trials in lockstep on an NVIDIA GPU (up to 20x speedup)
+JOSIM_SEED=12345 josim-cli -g -b 256 -o ./mc_yield.npy ./ksa4bit_spread.cir
+```
+
+By default, JoSIM writes 4 ensemble traces per `.print` variable (`<Trace>` mean, `<Trace>_STD` standard deviation, `<Trace>_MIN`, and `<Trace>_MAX`) using Welford's online algorithm and prints a **Monte Carlo Robustness Summary** table to stdout. Add `.option mcall` to the netlist if you also want all individual trial waveforms (`<Trace>_MC0 .. <Trace>_MC{B-1}`).
+
+See [GPU Acceleration Architecture & Benchmarks](gpu_architecture.md) for detailed scaling benchmarks across all four tiers.

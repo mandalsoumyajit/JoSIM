@@ -35,7 +35,93 @@ or via \
 
 ---
 
-## Performance, Binary I/O & Enhanced Features
+## Quick-Start Usage & Solver Selection Guide
+
+JoSIM provides multiple specialized solver engines—ranging from single-thread **Schur-Complement Nodal Admittance (`-n`)** to **Multi-Step Windowed OpenMP (`-p`)**, **Fully GPU-Resident `cuSolverRF` (`-g 3`, `-g 4`)**, and **Batched Monte Carlo (`-b <N>`)**—all producing machine-precision equivalent waveforms ($\le 10^{-14}$ relative difference).
+
+### 1. Decision Matrix: Which Simulation Options Should I Use?
+
+| Circuit / Workload Type | Recommended CLI Invocation | Equivalent Netlist `.option` | Resource Footprint | Why & Expected Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **Default Single-Core / Cluster Pool Job**<br>*(Any circuit when running 1 thread per job slot, or monolithic macros with $P=1\text{–}2$ like `r5cal`, `r10f1n`, `xadd4`, `dff`)* | `josim-cli -n -o out.npy deck.cir` | `.option nodal` | **1 CPU thread** | Eliminates internal branch rows (`JJ`, `R`, `C`, uncoupled `L`, `T`, `V`/`P`), shrinking the matrix by **2x–6x**. Delivers **1.5x–2.5x single-core speedup** on production macros (`r5cal`, `r10f1n`) and **3.1x–4.2x** on 2D JJ grids. |
+| **Universal Multi-Core CPU Mode**<br>*(Best single command when multiple CPU cores are available and circuit topology varies)* | `josim-cli -p -n -o out.npy deck.cir` | `.option nodal` *(with `-p`)* | **Up to 16 OpenMP threads** *(auto-capped to 1 NUMA socket)* | **Best of both worlds:** If the circuit partitions across PTLs ($P \ge 4$, e.g. `coupler`, `adder`), runs the **Windowed PTL OpenMP Solver (`3.6x–27x` speedup)**; if the circuit is monolithic ($P=1\text{–}2$), automatically runs the **Nodal Admittance Solver (`-n`, `1.5x–4.4x` speedup)** with zero OpenMP overhead. |
+| **Multi-Block PTL Chip or Multi-Channel Array on CPU**<br>*(Circuits with $P \ge 4$ PTL-coupled blocks or independent SQUID readout channels)* | `josim-cli -p -o out.npy deck.cir` | `.option bypass` *(optional)* | **Up to 16–32 OpenMP threads** | Advances all $P$ partitions independently across the causal PTL delay window $W = \min(T_d / \Delta t)$ steps in L1/L2 cache (**`3.6x` on `adder`**, **`7.5x` on `coupler`**, up to **`27.1x` on 4,096-tile fabrics**). Add `.option bypass` to skip quiescent partitions. |
+| **Multi-Block PTL Chip on NVIDIA GPU**<br>*(Large PTL fabrics with $P \ge 64$ balanced blocks of $\le 512$ eqns and $W \ge 8$ steps)* | `josim-cli -g -o out.npy deck.cir` | `.option gpu` | **1 NVIDIA GPU** | Assigns 1 CUDA warp per partition with full $L_p + U_p$ factors in shared memory (**up to `21.5x` GPU speedup** on 131k-JJ PTL tile arrays). Automatically falls back if $P$ is unbalanced or $W < 8$. |
+| **Large Monolithic 2D/3D JJ Array ($>10\text{k}$ JJs, 0 PTLs) on GPU** | `josim-cli -g 3 -o out.npy deck.cir`<br>*or* `josim-cli -g 4 -o out.npy deck.cir` | `.option gpu=3` *(or `.option gpu=4`)* | **1 NVIDIA GPU** | Keeps the entire timestep loop 100% in GPU VRAM using `cuSolverRF` with zero per-step PCIe transfers (**`2.5x–4.2x` speedup** on `14k–65k` JJ 2D grids). Use `-g 3` for non-switching (`RTYPE=0`) grids and **`-g 4` (`1.98x` faster than `-g 3`)** when `RTYPE=1` junctions switch frequently. |
+| **Batched Monte Carlo (`.spread`) Yield / Margin Sweep**<br>*($B = 32\text{–}4,096$ fabrication-variation trials of the same circuit)* | **CPU:** `josim-cli -p -b 256 -o mc.npy deck.cir`<br>**GPU:** `josim-cli -g -b 256 -o mc.npy deck.cir` | `.option mc=256`<br>`.spread 0.1 runs=256` | **OpenMP CPU** or **1 NVIDIA GPU** | Parses and symbolically analyzes the circuit **once**, then solves all $B$ trials simultaneously (**`23x–31x` OpenMP speedup**, **`12x–20x` GPU speedup**—even on $P=1$ monolithic circuits and small standard cells!). |
+
+---
+
+### 2. Complete Command-Line Interface (CLI) Reference
+
+```bash
+josim-cli [OPTIONS] <input.cir>
+```
+
+| Switch | Long Form | Argument | Description & Guidance |
+| :--- | :--- | :--- | :--- |
+| **`-a <0\|1>`** | `--analysis=<0\|1>` | `0` or `1` | Analysis convention: `1` = **Phase mode** (default, solves for node phases $\phi$), `0` = **Voltage mode** (solves for node voltages $v$). Both produce identical physical results. |
+| **`-n`** | `--nodal` | *[0\|1]* | **Tier 4 Schur-Complement Nodal Admittance Solver.** Analytically eliminates internal branch rows (`JJ`, `R`, `C`, uncoupled `L`, `T`, grounded `V`/`P`) into a $2\times–6\times$ smaller nodal matrix $A_{\text{red}}$ and reconstructs `.print` currents on the fly. **Recommended for all 1-thread runs and monolithic circuits.** |
+| **`-p`** | `--parallel` | *none* | **Multi-Core OpenMP Solver** (requires build with `-DUSING_OPENMP=ON`). Activates multi-step windowed PTL block-parallel solving when $P \ge 4$ partitions exist, parallel device updates on $>32\text{k}$-device meshes, and multi-threaded batched Monte Carlo (`-b`). Combine as **`-p -n`** to automatically use nodal reduction on $P=1\text{–}2$ circuits. |
+| **`-g [1\|2\|3\|4]`** | `--gpu[=1\|2\|3\|4]` | `1`–`4` *(opt)* | **NVIDIA CUDA GPU Solver** (requires build with `-DUSING_CUDA=ON`):<br>• **`-g` or `-g 1`**: **Auto-Dispatcher** (Tier 1 PTL solver when $P \ge 2$ balanced & $W \ge 8$; Tier 3 `cuSolverRF` on 2D/3D meshes; Hybrid `-g 2` on 1D chains; Tier 2 Coalesced Batch GPU when `-b <N>` is active).<br>• **`-g 2`**: **Hybrid Device-GPU + Host-KLU Solver** (best for 1D monolithic chains/RLK ladders).<br>• **`-g 3`**: **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic MNA Solver** (zero per-step PCIe transfers; best for large 2D/3D arrays).<br>• **`-g 4`**: **Tier 4 Fully GPU-Resident `cuSolverRF` Nodal Admittance Solver** (`cuSolverRF` on the reduced nodal matrix $A_{\text{red}}$; up to `1.98x` faster than `-g 3` on switching 2D grids). |
+| **`-b <N>`** | `--batch=<N>` | Integer $N \ge 2$ | **Tier 2 Batched Monte Carlo (`.spread`) Solver.** Runs $N$ perturbed fabrication-variation trials simultaneously in one invocation. Combine with `-p` (OpenMP CPU) or `-g` (CUDA GPU). |
+| **`-o <path>`** | `--output=<path>` | File path | Output file path. Format is selected automatically by extension:<br>• **`.npy`**: NumPy structured array (**recommended**: 23x faster to load in Python, zero precision loss).<br>• **`.bin`**: Native column-major `JOSIMBIN` float64 (**fastest**: 37x faster write than CSV, 38% smaller).<br>• **`.rawb`**: SPICE3 binary `.raw`.<br>• **`.csv` / `.dat` / `.raw`**: ASCII text formats (7 significant digits; slow on $>500$ traces). |
+| **`-c [N]`** | `--corrector[=N]` | Integer $N$ *(opt)* | **Implicit Predictor-Corrector JJ Iteration.** Performs up to $N$ damped Picard/BDF2 corrector iterations per timestep on active JJs (defaults to $N=2$ if `-c` is given without a number). |
+| **`-f`** | `--fixed-step` | *[0\|1]* | **Fixed Timestep.** Disables automatic global timestep halving (`reduce_step`) when a junction's phase step exceeds $0.4\pi$. |
+| **`-m [0\|1]`** | `--minimal` | `0` or `1` | Suppresses progress bars and console status output (useful for batch scripts). |
+| **`-V <1\|2\|3>`** | `--Verbose=<1\|2\|3>` | `1`, `2`, or `3` | Verbosity level: `1` = circuit & partition stats + RNG seed + step-halving warnings; `2` = `1` + evaluated `.param` values; `3` = `2` + full flattened netlist. |
+| **`-s [SUBCKT]`** | `--sanitycheck` | Subcircuit *(opt)* | Experimental connectivity sanity check (verifies each cell node connects to $\ge 2$ elements). |
+| **`-i`** | `--input` | *none* | Reads the circuit netlist from `stdin` until `.end` or `EOF`. |
+| **`-h`** / **`-v`** | `--help` / `--version` | *none* | Prints the CLI help guide (`-h`) or version & build commit info (`-v`). |
+
+---
+
+### 3. Complete Netlist `.option` & Control Cards Reference
+
+All solver, accuracy, and checkpointing features can also be embedded directly inside a `.cir` deck using `.option <key>[=<value>]`:
+
+| Netlist Control | Syntax | Equivalent CLI | Description |
+| :--- | :--- | :--- | :--- |
+| **Nodal Solver** | `.option nodal` | `-n` / `--nodal` | Enables the Tier 4 Schur-Complement Nodal Admittance solver ($A_{\text{red}}$). |
+| **GPU Solver Mode** | `.option gpu[=1\|2\|3\|4]`<br>`.option gpumono`<br>`.option gpunodal` | `-g [1\|2\|3\|4]` | Enables CUDA GPU acceleration (`1` = Auto, `2` = Hybrid, `3` / `gpumono` / `cusolverrf` = Tier 3 Monolithic MNA, `4` / `gpunodal` = Tier 4 Monolithic Nodal). |
+| **Quiescent Bypass** | `.option bypass`<br>`.option bypasstol=<val>`<br>`.option latency=<val>` | *Netlist only* | Skips `klu_l_tsolve` on quiescent PTL partitions during OpenMP windowed simulation (`-p`) when all internal devices and PTL inputs change by less than `bypasstol` (default `1e-12`). |
+| **Batched Monte Carlo** | `.option mc=<N>`<br>`.spread <val> runs=<N>`<br>`.option mcall` | `-b <N>` | Runs `N` batched `.spread` trials simultaneously. By default outputs Welford `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`; add `.option mcall` to also output individual `<Trace>_MC0 .. MC{N-1}` waveforms. |
+| **RNG Seed** | `.option seed=<uint64>` | `JOSIM_SEED=<uint64>` | Fixes the deterministic RNG seed for thermal noise (`.temp`/`.neb`) and `.spread` Monte Carlo. |
+| **Fractional PTL Delay** | `.option txinterp`<br>*or* `T1 ... interp=1` | *Netlist only* | Linearly interpolates transmission-line delay buffers when $T_d / T_{\text{step}}$ is non-integer, eliminating delay-rounding drift across timestep sweeps. |
+| **Mutual `K` Cutoff** | `.option kcutoff=<val>`<br>`.option kmin=<val>` | *Netlist only* | Prunes weak parasitic mutual inductance couplings with $|k| < \text{val}$ during matrix setup to prevent dense LU fill-in on 3D field-extracted (`InductEx`) layouts. |
+| **JJ Corrector** | `.option corrector=<N>`<br>`.option correctortol=<val>` | `-c <N>` | Performs up to `N` implicit predictor-corrector iterations per timestep when a junction's phase correction exceeds `correctortol` (default `1e-3` rad). |
+| **Step Halving Control** | `.option fixedstep`<br>`.option warnstep` | `-f`<br>`-V 1` | `fixedstep` disables automatic step halving on $>0.4\pi$ phase jumps; `warnstep` prints the exact JJ name and time that triggered step halving. |
+| **State Checkpointing** | `.savestate <file> [time]`<br>`.loadstate <file>` | *Netlist only* | Serializes (`.savestate` / `.savebias`) or restores (`.loadstate` / `.loadbias`) the complete simulator state—including mid-flight PTL ring buffers—to skip bias-settling phases in subsequent runs. |
+
+---
+
+### 4. Practical Usage Recipes
+
+```bash
+# 1. Single-threaded production run (ideal for cluster job pools or monolithic circuits like r5cal, r10f1n, xadd4):
+josim-cli -n -o results.npy circuit.cir
+
+# 2. Multi-core workstation/server run (auto-selects Windowed PTL OpenMP when P >= 4, or Nodal solver when P <= 2):
+josim-cli -p -n -o results.npy circuit.cir
+
+# 3. Pin OpenMP thread count explicitly (e.g., 8 threads for a cluster slot):
+OMP_NUM_THREADS=8 josim-cli -p -n -o results.npy circuit.cir
+
+# 4. Large PTL-coupled multi-tile processor on NVIDIA GPU (Tier 1 shared-memory warp-per-partition solver):
+josim-cli -g -o results.bin ptl_processor.cir
+
+# 5. Large 0-PTL 2D/3D Josephson junction array on NVIDIA GPU (Tier 3 / Tier 4 cuSolverRF in VRAM):
+josim-cli -g 3 -o results.bin jj_grid_rtype0.cir
+josim-cli -g 4 -o results.bin jj_grid_rtype1_switching.cir
+
+# 6. 256-trial Monte Carlo (.spread) fabrication yield study on Multi-Core CPU or GPU:
+JOSIM_SEED=42 josim-cli -p -b 256 -o yield_stats.npy circuit_with_spread.cir
+JOSIM_SEED=42 josim-cli -g -b 256 -o yield_stats.npy circuit_with_spread.cir
+```
+
+---
+
+## Performance, Binary I/O & Architectural Highlights
 
 This enhanced fork of JoSIM delivers significant single-core, multi-threaded (`-p`), numerical integration, and binary I/O improvements (see [`ENHANCEMENT_PLAN.md`](ENHANCEMENT_PLAN.md) for architectural details):
 

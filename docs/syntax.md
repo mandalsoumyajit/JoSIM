@@ -385,17 +385,21 @@ Simulator options can be configured in the netlist using the `.option` (or `.opt
 | **CORRECTOR** | `.option corrector=<N>` | Enables up to `N` implicit predictor-corrector (Picard/BDF2) iterations per timestep on active Josephson junctions (default `0`; `-c` on the CLI defaults to `2`). |
 | **CORRECTORTOL** | `.option correctortol=<val>` | Sets the phase convergence threshold (in radians, default `1e-3`) that triggers predictor-corrector iteration when `CORRECTOR` > 0. |
 | **KCUTOFF** / **KMIN** | `.option kcutoff=<val>` | Ignores mutual inductance entries (`K` lines) with $|k| < \text{val}$ during MNA matrix construction, preventing dense LU fill-in from weak parasitic couplings in 3D field-extracted netlists. |
-| **GPU** / **CUDA** | `.option gpu[=1\|2\|3]` | Enables NVIDIA CUDA GPU acceleration (`CudaPartitionSolver`) when compiled with `-DUSING_CUDA=ON`. Equivalent to `-g [1\|2\|3]` (`--gpu[=1\|2\|3]`). Mode `1` (default) auto-selects between Tier 1 Partitioned, Tier 3 `cuSolverRF` Monolithic (`gpu=3`), and Hybrid Device-GPU (`gpu=2`); mode `2` forces Hybrid Device-GPU; mode `3` (or `.option gpumono` / `.option cusolverrf`) forces the Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver. |
+| **NODAL** | `.option nodal` | Enables the **Tier 4 Exact Schur-Complement Nodal Admittance Solver** (`-n` / `--nodal`). Analytically eliminates all internal branch equations (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) into the reduced Nodal Admittance matrix $A_{\text{red}}$ ($2\times–6\times$ smaller than standard MNA), reconstructing any requested `.print` branch currents on the fly. Ideal for single-thread execution and monolithic circuits ($P=1\text{–}2$). |
+| **BYPASS** / **LATENCY** | `.option bypass` | Enables activity-driven quiescent partition bypass during OpenMP windowed simulation (`-p`). Skips `klu_l_tsolve` on partitions whose internal devices and PTL boundary inputs are completely quiescent at a given timestep. |
+| **BYPASSTOL** | `.option bypasstol=<val>` | Sets the activity threshold (default `1e-12`) used by `.option bypass` to determine whether a partition's RHS or solution vector changed. |
+| **GPU** / **CUDA** | `.option gpu[=1\|2\|3\|4]` | Enables NVIDIA CUDA GPU acceleration (`CudaPartitionSolver`) when compiled with `-DUSING_CUDA=ON`. Equivalent to `-g [1\|2\|3\|4]` (`--gpu[=1\|2\|3\|4]`). Mode `1` (default) auto-selects between Tier 1 Partitioned, Tier 3 `cuSolverRF` Monolithic (`gpu=3`), and Hybrid Device-GPU (`gpu=2`); mode `2` forces Hybrid Device-GPU; mode `3` (or `.option gpumono` / `.option cusolverrf`) forces the Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic MNA Solver; mode `4` (or `.option gpunodal`) forces the Tier 4 Fully GPU-Resident `cuSolverRF` Nodal Admittance Solver on $A_{\text{red}}$. |
 | **MC** / **BATCH** / **RUNS** | `.option mc=<N>` | Executes a batched Monte Carlo ensemble of `N` fabrication-spread (`.spread`) trials in a single simulation run. Equivalent to `-b <N>` (`--batch=<N>`) or `.spread ... runs=<N>`. |
 | **MCALL** | `.option mcall` | When running batched Monte Carlo (`mc > 1`), appends all individual trial waveforms (`<Trace>_MC0 .. <Trace>_MC{N-1}`) to the output file in addition to the ensemble `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, and `<Trace>_MAX` traces. |
 
 Examples:
 ```cir
 .option seed=4190754512324517577
+.option nodal
 .option txinterp warnstep
 .option corrector=2 correctortol=1e-4
 .option kcutoff=1e-3
-.option gpu
+.option gpu=4
 ```
 
 ### State Checkpointing (`.savestate` / `.loadstate`)

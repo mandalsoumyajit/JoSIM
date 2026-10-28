@@ -266,6 +266,13 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
               << "1 for Phase analysis (Default)." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // Batched Monte Carlo
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "-b" << std::setw(3) << std::left << "|"
+              << "Executes N batched Monte Carlo (.spread) trials simultaneously." << std::endl;
+    std::cout << std::setw(16) << std::left << "--batch=" << std::setw(3) << std::left << "|"
+              << "Combine with -p (OpenMP CPU) or -g (CUDA GPU), e.g. -p -b 256." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Corrector iterations
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-c" << std::setw(3) << std::left << "|"
@@ -278,6 +285,19 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "-f" << std::setw(3) << std::left << "|"
               << "Disables automatic timestep halving when JJ phase jumps exceed 0.4*pi." << std::endl;
     std::cout << std::setw(16) << std::left << "--fixed-step" << std::setw(3) << std::left << "|" << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // GPU acceleration
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "-g" << std::setw(3) << std::left << "|"
+              << "Enables NVIDIA CUDA GPU solver (requires -DUSING_CUDA=ON)." << std::endl;
+    std::cout << std::setw(16) << std::left << "--gpu=" << std::setw(3) << std::left << "|"
+              << "1 (Default): Auto-dispatch (Tier 1 PTL / Tier 3 cuSolverRF / Hybrid)." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
+              << "2: Hybrid Device-GPU + Host-KLU solver." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
+              << "3: Tier 3 Fully GPU-Resident cuSolverRF Monolithic MNA solver." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
+              << "4: Tier 4 Fully GPU-Resident cuSolverRF Nodal Admittance solver." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Help menu
     // ---------------------------------------------------------------------------
@@ -303,6 +323,17 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "--minimal" << std::setw(3) << std::left << "|"
               << " " << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // Nodal admittance solver
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "-n" << std::setw(3) << std::left << "|"
+              << "Enables Tier 4 Schur-Complement Nodal Admittance solver." << std::endl;
+    std::cout << std::setw(16) << std::left << "--nodal" << std::setw(3) << std::left << "|"
+              << "Eliminates internal branch rows (JJ/R/C/L/T/V/P) to shrink the matrix" << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
+              << "by 2x-6x (1.5x-4.4x faster on monolithic circuits; runs on 1 thread" << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
+              << "by default, or combine with -p as '-p -n')." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Output
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-o" << std::setw(3) << std::left << "|"
@@ -310,16 +341,16 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "--output=" << std::setw(3) << std::left << "|"
               << "Supported extensions: .csv, .dat, .raw, .bin, .npy, .rawb" << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
-              << "Default will be output.csv if no file is specified." << std::endl;
+              << "Use .npy or .bin for 20x-37x faster I/O on many-trace decks." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Parallel Processing
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-p" << std::setw(3) << std::left << "|"
-              << "(EXPERIMENTAL) Enables parallelization of certain functions." << std::endl;
+              << "Enables OpenMP multi-core parallelization (requires -DUSING_OPENMP=ON)." << std::endl;
     std::cout << std::setw(16) << std::left << "--parallel" << std::setw(3) << std::left << "|"
-              << "Requires compilation with OPENMP switch enabled." << std::endl;
+              << "Activates multi-step windowed PTL block-parallel solving (P >= 4)," << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
-              << "Threshold applies, overhead on small circuits negates performance." << std::endl;
+              << "parallel device evaluation on large meshes, and batched Monte Carlo (-b)." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Sanity check switch
     // ---------------------------------------------------------------------------
@@ -350,7 +381,11 @@ void CliOptions::display_help() {
 
     // ---------------------------------------------------------------------------
     std::cout << std::endl;
-    std::cout << "Example command: josim -o ./output.csv test.cir" << std::endl;
+    std::cout << "Example commands:\n";
+    std::cout << "  Single-thread nodal (general/monolithic): josim-cli -n -o out.npy test.cir\n";
+    std::cout << "  Multi-core OpenMP + nodal fallback:       josim-cli -p -n -o out.npy test.cir\n";
+    std::cout << "  CUDA GPU auto-dispatch:                   josim-cli -g -o out.npy test.cir\n";
+    std::cout << "  Batched Monte Carlo (256 trials, OpenMP): josim-cli -p -b 256 -o mc.npy test.cir\n";
     std::cout << std::endl;
     exit(0);
 }

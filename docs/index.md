@@ -111,13 +111,13 @@ git clone https://github.com/JoeyDelp/JoSIM.git
 cd JoSIM
 ```
 
-Navigate to the newly cloned/extracted JoSIM directory then run the following commands (adding `-DUSING_OPENMP=ON` to enable OpenMP parallelization with `-p`, and optionally `-DUSING_CUDA=ON` to enable NVIDIA CUDA GPU acceleration with `-g`):
+Navigate to the newly cloned/extracted JoSIM directory then run the following commands (adding `-DUSING_OPENMP=ON` to enable OpenMP parallelization with `-p`, and optionally `-DUSING_CUDA=ON` to enable NVIDIA CUDA GPU acceleration with `-g`; on CMake $\ge 3.24$, `CMAKE_CUDA_ARCHITECTURES` automatically defaults to `native`):
 
 ```bash
 mkdir build
 cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release -DUSING_OPENMP=ON -DUSING_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build . --config Release
+cmake .. -DCMAKE_BUILD_TYPE=Release -DUSING_OPENMP=ON -DUSING_CUDA=ON
+cmake --build . --config Release -j
 ```
 
 On WSL / Ubuntu Linux, you can also run the provided helper script directly from the repository root to build with Ninja and execute the full CTest regression suite:
@@ -126,7 +126,10 @@ On WSL / Ubuntu Linux, you can also run the provided helper script directly from
 bash scripts/build_wsl.sh
 ```
 
-For full architectural details and benchmark results of the Multi-Step Windowed Block-Parallel OpenMP (`-p`) and CUDA GPU (`-g`) solvers across PTL-coupled and Non-PTL superconducting circuits up to 1.21M equations, see [GPU Acceleration Architecture & Benchmarks](gpu_architecture.md).
+For practical guidance on selecting simulation options (`-n` Nodal Admittance, `-p` OpenMP, `-g [1|2|3|4]` CUDA GPU, `-b <N>` Batched Monte Carlo, and `.bin`/`.npy` binary output), see:
+- [Example Usage & Solver Selection Guide](ex_usage.md)
+- [Netlist Syntax & `.option` Control Reference](syntax.md)
+- [GPU & Nodal Solver Architecture & Benchmarks](gpu_architecture.md)
 
 This will generate a JoSIM executable in the **build** directory.
 

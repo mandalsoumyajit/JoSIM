@@ -78,7 +78,7 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
     }
     if (!hasInput && !ap.empty() && ap.back().first && ap.back().second) {
         const char sw = ap.back().first.value();
-        if (sw == 'p' || sw == 'g' || sw == 'f' || sw == 'w' || sw == 'm' || ap.size() == 1) {
+        if (sw == 'p' || sw == 'g' || sw == 'n' || sw == 'f' || sw == 'w' || sw == 'm' || ap.size() == 1) {
             ap.emplace_back(std::make_pair(std::nullopt, ap.back().second));
             ap.at(ap.size() - 2).second = std::nullopt;
         }
@@ -147,12 +147,17 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                             out.gpu            = (gval != 0);
                             out.gpuMode        = gval;
                             if (out.gpu) { out.parallel = true; }
+                            if (gval == 4) { out.nodal = true; }
                         } catch (const std::invalid_argument&) {
                             out.gpu      = true;
                             out.gpuMode  = 1;
                             out.parallel = true;
                         }
                     }
+                    break;
+                    // Enable Schur-complement nodal admittance solver (Tier 4)
+                case 'n':
+                    out.nodal = (i.second.value_or("1") != "0");
                     break;
                     // Show help menu
                 case 'h':

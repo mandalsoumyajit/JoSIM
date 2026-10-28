@@ -1361,6 +1361,356 @@ __global__ void monolithic_full_post_solve_kernel(int32_t          numTxHalves,
     }
 }
 
+__device__ __forceinline__ double read_node_x(const double* __restrict__ d_x, int32_t idx) {
+    if (idx >= 0) { return d_x[idx]; }
+    if (idx <= -2) { return d_x[-idx - 2]; }
+    return 0.0;
+}
+
+// Tier 4 Schur-Complement Nodal Admittance GPU setup kernel
+__global__ void nodal_full_setup_b_kernel(int32_t          numJJs,
+                                          int32_t          numRess,
+                                          int32_t          numCaps,
+                                          int32_t          numInds,
+                                          int32_t          numVSs,
+                                          int32_t          numPSs,
+                                          int32_t          numCSs,
+                                          int32_t          numCCVSs,
+                                          int32_t          numVCCSs,
+                                          int32_t          numTxHalves,
+                                          int64_t          i,
+                                          int32_t          s,
+                                          int32_t          w,
+                                          int32_t          numSources,
+                                          int64_t          simSize,
+                                          double           stepSize,
+                                          int32_t          analysisType,
+                                          const double*    __restrict__ d_x,
+                                          double*          d_b,
+                                          double*          d_csrValA,
+                                          GpuJJ*           d_jjs,
+                                          GpuRes*          d_ress,
+                                          const GpuInd*    __restrict__ d_inds,
+                                          const GpuMut*    __restrict__ d_muts,
+                                          GpuCap*          d_caps,
+                                          GpuVS*           d_vss,
+                                          const GpuPS*     __restrict__ d_pss,
+                                          const GpuCS*     __restrict__ d_css,
+                                          GpuCCVS*         d_ccvss,
+                                          GpuVCCS*         d_vccss,
+                                          const GpuTxHalf* __restrict__ d_txHalves,
+                                          const double*    __restrict__ d_txRemote1,
+                                          const double*    __restrict__ d_txRemote2,
+                                          const double*    __restrict__ d_srcWindow,
+                                          const double*    __restrict__ d_indIn2Old,
+                                          double*          __restrict__ d_indIn2New,
+                                          int32_t*         d_numChangedNz,
+                                          int32_t*         d_needsTR) {
+    const int32_t tid        = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool    checkPhase = (static_cast<double>(i) / static_cast<double>(simSize) > 0.01);
+
+    // 1. Josephson Junctions (eliminated into nodal conductance + equivalent current source)
+    if (tid < numJJs) {
+        GpuJJ&       jj   = d_jjs[tid];
+        const double vPos = read_node_x(d_x, jj.posIdx);
+        const double vNeg = read_node_x(d_x, jj.negIdx);
+        const double dx   = vPos - vNeg;
+        jj.pn1            = dx;
+        if (i > 0) {
+            const double varPrev = jj.gVar * (dx - d_x[jj.varIdx]);
+            if (analysisType == 0) {
+                jj.vn1 = dx;
+                jj.pn1 = varPrev;
+            } else {
+                jj.vn1 = varPrev;
+            }
+        }
+        const double v0 = 2.5 * jj.vn1 - 2.0 * jj.vn2 + 0.5 * jj.vn3;
+        jj.phi0         = (4.0 / 3.0) * jj.pn1 - (1.0 / 3.0) * jj.pn2
+                  + ((2.0 * stepSize) / (3.0 * Constants::SIGMA)) * v0;
+        if (checkPhase && fabs(jj.phi0 - jj.pn1) > (0.20 * 2.0 * Constants::PI)) {
+            atomicExch(d_needsTR, 1);
+            return;
+        }
+        double bVar = 0.0;
+        if (analysisType == 0) {
+            bVar = Constants::SIGMA * (-(2.0 / stepSize) * jj.pn1 + (1.0 / (2.0 * stepSize)) * jj.pn2);
+        } else {
+            bVar = (4.0 / 3.0) * jj.pn1 - (1.0 / 3.0) * jj.pn2;
+        }
+        d_b[jj.varIdx] = bVar;
+        jj.pn4         = jj.pn3;
+        jj.pn3         = jj.pn2;
+        jj.pn2         = jj.pn1;
+        jj.vn6         = jj.vn5;
+        jj.vn5         = jj.vn4;
+        jj.vn4         = jj.vn3;
+        jj.vn3         = jj.vn2;
+
+        if (jj.rtype == 1) {
+            const double oldNz   = jj.curNzVal;
+            bool         updated = false;
+            const double absV    = fabs(v0);
+            if (absV < jj.lowerB) {
+                jj.it = 0.0;
+                if (jj.curNzVal != jj.negInvSubgap) {
+                    jj.curNzVal = jj.negInvSubgap;
+                    updated     = true;
+                }
+            } else if (absV < jj.upperB) {
+                jj.it = jj.lowerB * ((1.0 / jj.r0) - jj.gLarge);
+                if (v0 < 0.0) { jj.it = -jj.it; }
+                if (jj.curNzVal != jj.negInvTrans) {
+                    jj.curNzVal = jj.negInvTrans;
+                    updated     = true;
+                }
+            } else {
+                jj.it = 0.0;
+                if (jj.curNzVal != jj.negInvNormal) {
+                    jj.curNzVal = jj.negInvNormal;
+                    updated     = true;
+                }
+            }
+            if (updated) {
+                const double deltaG = jj.gScale * ((-1.0 / jj.curNzVal) - (-1.0 / oldNz));
+                if (jj.nzIdxPP >= 0) { atomicAdd(&d_csrValA[jj.nzIdxPP], deltaG); }
+                if (jj.nzIdxQQ >= 0) { atomicAdd(&d_csrValA[jj.nzIdxQQ], deltaG); }
+                if (jj.nzIdxPQ >= 0) { atomicAdd(&d_csrValA[jj.nzIdxPQ], -deltaG); }
+                if (jj.nzIdxQP >= 0) { atomicAdd(&d_csrValA[jj.nzIdxQP], -deltaG); }
+                atomicAdd(d_numChangedNz, 1);
+            }
+        }
+
+        double ic_sin_phi = 0.0;
+        if (jj.cprLen == 1) {
+            ic_sin_phi += jj.ic * (jj.cpr[0] * sin(1.0 * (jj.phi0 - jj.phiOff)));
+        } else {
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                ic_sin_phi += jj.ic * (jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff)));
+            }
+        }
+        jj.cTerm    = -(((2.0 * jj.c) / stepSize) * jj.vn1) + ((jj.c / (2.0 * stepSize)) * jj.vn2);
+        double bCur = 0.0;
+        if (!jj.tDep) {
+            bCur = jj.curNzVal * (ic_sin_phi + jj.cTerm + jj.it);
+        } else {
+            double sin2_half_phi = 0.0;
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                sin2_half_phi += jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff) / 2.0);
+            }
+            sin2_half_phi  = sin2_half_phi * sin2_half_phi;
+            double sin_phi = 0.0;
+            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
+                sin_phi += jj.cpr[harm] * sin((harm + 1) * (jj.phi0 - jj.phiOff));
+            }
+            const double sqrt_part = sqrt(1.0 - jj.d * sin2_half_phi);
+            bCur                   = jj.curNzVal
+                   * ((((Constants::PI * jj.del) / (2.0 * Constants::EV * jj.rn)) * (sin_phi / sqrt_part)
+                       * tanh(jj.del / (2.0 * Constants::BOLTZMANN * jj.t) * sqrt_part))
+                      + jj.cTerm + jj.it);
+        }
+        const double gCur = -1.0 / jj.curNzVal;
+        const double jCur = (analysisType == 0) ? (gCur * bCur) : (gCur * bCur + (jj.gScale * gCur) * bVar);
+        d_b[jj.curIdx]    = jCur;
+        if (jj.posIdx >= 0) { atomicAdd(&d_b[jj.posIdx], jCur); }
+        if (jj.negIdx >= 0) { atomicAdd(&d_b[jj.negIdx], -jCur); }
+        jj.vn2 = jj.vn1;
+    }
+
+    // 2. Resistors (Phase mode only; Voltage mode resistors have zero RHS)
+    if (analysisType == 1 && tid < numRess) {
+        GpuRes&      res  = d_ress[tid];
+        const double vPos = read_node_x(d_x, res.posIdx);
+        const double vNeg = read_node_x(d_x, res.negIdx);
+        res.pn1           = vPos - vNeg;
+        const double bCur = (4.0 / 3.0) * res.pn1 - (1.0 / 3.0) * res.pn2;
+        res.pn2           = res.pn1;
+        const double jRes = res.g * bCur;
+        if (res.curIdx >= 0) { d_b[res.curIdx] = jRes; }
+        if (res.posIdx >= 0) { atomicAdd(&d_b[res.posIdx], jRes); }
+        if (res.negIdx >= 0) { atomicAdd(&d_b[res.negIdx], -jRes); }
+    }
+
+    // 3. Capacitors
+    if (tid < numCaps) {
+        GpuCap&      cap  = d_caps[tid];
+        const double vPos = read_node_x(d_x, cap.posIdx);
+        const double vNeg = read_node_x(d_x, cap.negIdx);
+        cap.pn1           = vPos - vNeg;
+        double bCur       = 0.0;
+        if (analysisType == 0) {
+            bCur = (4.0 / 3.0) * cap.pn1 - (1.0 / 3.0) * cap.pn2;
+        } else {
+            bCur    = (8.0 / 3.0) * cap.pn1 - (22.0 / 9.0) * cap.pn2 + (8.0 / 9.0) * cap.pn3 - (1.0 / 9.0) * cap.pn4;
+            cap.pn4 = cap.pn3;
+            cap.pn3 = cap.pn2;
+        }
+        cap.pn2           = cap.pn1;
+        const double jCap = cap.g * bCur;
+        if (cap.curIdx >= 0) { d_b[cap.curIdx] = jCap; }
+        if (cap.posIdx >= 0) { atomicAdd(&d_b[cap.posIdx], jCap); }
+        if (cap.negIdx >= 0) { atomicAdd(&d_b[cap.negIdx], -jCap); }
+    }
+
+    // 4. Inductors + Mutual Inductances (Voltage mode only; Phase mode inductors have zero RHS)
+    if (analysisType == 0 && tid < numInds) {
+        const GpuInd ind  = d_inds[tid];
+        const double h    = stepSize;
+        const double curI = (ind.g > 0.0 && i > 0)
+                                    ? (ind.g * (read_node_x(d_x, ind.posIdx) - read_node_x(d_x, ind.negIdx))
+                                       - d_x[ind.curIdx])
+                                    : d_x[ind.curIdx];
+        double       bVal = -(2.0 * ind.L / h) * curI + ((ind.L / (2.0 * h)) * d_indIn2Old[tid]);
+        if (ind.g > 0.0) {
+            const double jInd = ind.g * bVal;
+            d_b[ind.curIdx]   = jInd;
+            if (ind.posIdx >= 0) { atomicAdd(&d_b[ind.posIdx], jInd); }
+            if (ind.negIdx >= 0) { atomicAdd(&d_b[ind.negIdx], -jInd); }
+            d_indIn2New[tid] = curI;
+        } else {
+            for (int32_t mIdx = ind.mutStart; mIdx < ind.mutStart + ind.mutCount; ++mIdx) {
+                const GpuMut mut  = d_muts[mIdx];
+                const double mIn2 = (mut.targetIndIdx < tid) ? d_x[mut.targetCurIdx]
+                                                             : d_indIn2Old[mut.targetIndIdx];
+                bVal += (-((2.0 * mut.M) / h) * d_x[mut.targetCurIdx] + (mut.M / (2.0 * h)) * mIn2);
+            }
+            d_b[ind.curIdx]  = bVal;
+            d_indIn2New[tid] = curI;
+        }
+    }
+
+    // 5. Voltage Sources
+    if (tid < numVSs) {
+        GpuVS&       vs     = d_vss[tid];
+        const double srcVal = d_srcWindow[(s + 2) * numSources + vs.srcIdx];
+        if (analysisType == 0) {
+            d_b[vs.curIdx] = srcVal;
+        } else {
+            const double vPos = read_node_x(d_x, vs.posIdx);
+            const double vNeg = read_node_x(d_x, vs.negIdx);
+            vs.pn1            = vPos - vNeg;
+            d_b[vs.curIdx]
+                    = ((2.0 * stepSize) / (3.0 * Constants::SIGMA)) * srcVal + (4.0 / 3.0) * vs.pn1
+                      - (1.0 / 3.0) * vs.pn2;
+            vs.pn2 = vs.pn1;
+        }
+    }
+
+    // 6. Phase Sources
+    if (tid < numPSs) {
+        const GpuPS  ps = d_pss[tid];
+        const double s0 = d_srcWindow[(s + 2) * numSources + ps.srcIdx];
+        if (analysisType == 1) {
+            d_b[ps.curIdx] = s0;
+        } else {
+            const double s1 = d_srcWindow[(s + 1) * numSources + ps.srcIdx];
+            const double s2 = d_srcWindow[s * numSources + ps.srcIdx];
+            if (i == 0) {
+                d_b[ps.curIdx] = (Constants::SIGMA / stepSize) * (1.5 * s0);
+            } else if (i == 1) {
+                d_b[ps.curIdx] = (Constants::SIGMA / stepSize) * (1.5 * s0 - 2.0 * s1);
+            } else {
+                d_b[ps.curIdx] = (Constants::SIGMA / stepSize) * (1.5 * s0 - 2.0 * s1 + 0.5 * s2);
+            }
+        }
+    }
+
+    // 7. Current Sources (atomicAdd for shared node KCL)
+    if (tid < numCSs) {
+        const GpuCS  cs     = d_css[tid];
+        const double srcVal = d_srcWindow[(s + 2) * numSources + cs.srcIdx];
+        if (cs.posIdx >= 0) { atomicAdd(&d_b[cs.posIdx], -srcVal); }
+        if (cs.negIdx >= 0) { atomicAdd(&d_b[cs.negIdx], srcVal); }
+    }
+
+    // 8. CCVS & VCCS (Phase mode)
+    if (analysisType == 1) {
+        if (tid < numCCVSs) {
+            GpuCCVS&     ccvs = d_ccvss[tid];
+            const double vPos = read_node_x(d_x, ccvs.posIdx);
+            const double vNeg = read_node_x(d_x, ccvs.negIdx);
+            ccvs.pn1          = vPos - vNeg;
+            d_b[ccvs.curIdx]  = (4.0 / 3.0) * ccvs.pn1 - (1.0 / 3.0) * ccvs.pn2;
+            ccvs.pn2          = ccvs.pn1;
+        }
+        if (tid < numVCCSs) {
+            GpuVCCS&     vccs = d_vccss[tid];
+            const double vPos = read_node_x(d_x, vccs.posIdx2);
+            const double vNeg = read_node_x(d_x, vccs.negIdx2);
+            vccs.pn1          = vPos - vNeg;
+            d_b[vccs.curIdx]  = (4.0 / 3.0) * vccs.pn1 - (1.0 / 3.0) * vccs.pn2;
+            vccs.pn2          = vccs.pn1;
+        }
+    }
+
+    // 9. Transmission Line Port Halves (eliminated into nodal conductance + equivalent current source)
+    if (tid < numTxHalves) {
+        const GpuTxHalf txh  = d_txHalves[tid];
+        const double    rem  = (txh.isPort2 == 0) ? d_txRemote1[txh.txIdx * w + s] : d_txRemote2[txh.txIdx * w + s];
+        const double    bCur = (analysisType == 0) ? rem : ((4.0 / 3.0) * txh.n1 - (1.0 / 3.0) * txh.n2 + rem);
+        const double    jTx  = txh.g * bCur;
+        d_b[txh.curIdx]      = jTx;
+        if (txh.posIdx >= 0) { atomicAdd(&d_b[txh.posIdx], jTx); }
+        if (txh.negIdx >= 0) { atomicAdd(&d_b[txh.negIdx], -jTx); }
+    }
+}
+
+__global__ void nodal_full_post_solve_kernel(int32_t            numTxHalves,
+                                             int32_t            numRelTraces,
+                                             int32_t            numKeptSteps,
+                                             int64_t            i,
+                                             int32_t            analysisType,
+                                             const double*      __restrict__ d_x,
+                                             const GpuJJ*       __restrict__ d_jjs,
+                                             GpuTxHalf*         d_txHalves,
+                                             const GpuTxLine*   __restrict__ d_txLines,
+                                             GpuTxHistEntry*    d_txHist,
+                                             const GpuRelTrace* __restrict__ d_relTraces,
+                                             const int32_t*     __restrict__ d_keptSlot,
+                                             double*            d_traceOut) {
+    const int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < numTxHalves) {
+        GpuTxHalf       txh   = d_txHalves[tid];
+        const GpuTxLine tx    = d_txLines[txh.txIdx];
+        const double    vPos  = read_node_x(d_x, txh.posIdx);
+        const double    vNeg  = read_node_x(d_x, txh.negIdx);
+        const double    vPort = vPos - vNeg;
+        const double    iPort = txh.g * vPort - d_x[txh.curIdx];
+        const int32_t   hSlot = tx.histOffset + static_cast<int32_t>((tx.loadedSteps + i) % tx.histSize);
+        if (txh.isPort2 == 0) {
+            d_txHist[hSlot].v1 = vPort;
+            d_txHist[hSlot].i1 = iPort;
+        } else {
+            d_txHist[hSlot].v2 = vPort;
+            d_txHist[hSlot].i2 = iPort;
+        }
+        if (analysisType == 1) {
+            txh.n2          = txh.n1;
+            txh.n1          = vPort;
+            d_txHalves[tid] = txh;
+        }
+    }
+    const int32_t kSlot = d_keptSlot[i];
+    if (kSlot >= 0 && tid < numRelTraces) {
+        const GpuRelTrace rt  = d_relTraces[tid];
+        double            val = 0.0;
+        if (rt.traceType == 0) {
+            val = d_x[rt.localAbsIdx];
+        } else if (rt.traceType == 1) {
+            const double dx = read_node_x(d_x, rt.posIdx) - read_node_x(d_x, rt.negIdx);
+            val             = rt.gBranch * (dx - d_x[rt.localAbsIdx]);
+        } else if (rt.traceType == 2) {
+            const double dx      = read_node_x(d_x, rt.posIdx) - read_node_x(d_x, rt.negIdx);
+            const double gCurEff = rt.gBranch * (-1.0 / d_jjs[rt.jjIdx].curNzVal);
+            val                  = gCurEff * dx - d_x[rt.localAbsIdx];
+        } else {
+            const double dx = read_node_x(d_x, rt.posIdx) - read_node_x(d_x, rt.negIdx);
+            val             = rt.gBranch * dx - d_x[rt.localAbsIdx];
+        }
+        d_traceOut[static_cast<size_t>(rt.traceSlot) * numKeptSteps + kSlot] = val;
+    }
+}
+
 // Thread-per-trial coalesced Monte Carlo kernel:
 // Grid: dim3((B + blockDim.x - 1) / blockDim.x, nBaseParts), Block: warpsPerBlock * 32 (warpsPerBlock in {1, 2, 4})
 // All warps in a block solve trials for the same base partition p = blockIdx.y and share a single copy of the
@@ -2451,7 +2801,8 @@ bool CudaPartitionSolver::initialize_monolithic_full(int32_t                    
                                                      const std::vector<GpuTxLine>&      txLines,
                                                      const std::vector<GpuTxHistEntry>& txHist,
                                                      const std::vector<GpuRelTrace>&    relTraces,
-                                                     const std::vector<int32_t>&        keptSlot) {
+                                                     const std::vector<int32_t>&        keptSlot,
+                                                     int32_t                            nRedRows) {
     free_device();
 
     int deviceCount = 0;
@@ -2460,6 +2811,8 @@ bool CudaPartitionSolver::initialize_monolithic_full(int32_t                    
     mcRuns_       = 1;
     nParts_       = 1;
     totalRows_    = totalRows;
+    nRedRows_     = (nRedRows > 0 && nRedRows <= totalRows) ? nRedRows : totalRows;
+    nodalMode_    = (nRedRows > 0 && nRedRows <= totalRows);
     numSources_   = numSources;
     maxWindow_    = std::max<int32_t>(1, maxWindow);
     numRelTraces_ = numRelTraces;
@@ -2496,7 +2849,8 @@ bool CudaPartitionSolver::initialize_monolithic_full(int32_t                    
     if (!alloc_and_upload(&d_Q_, Q)) { return false; }
     if (!alloc_and_upload(&d_xLocal_, xInit)) { return false; }
     JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_bLocal_), totalRows_ * sizeof(double)));
-    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_rfTemp_), totalRows_ * sizeof(double)));
+    JOSIM_CUDA_CHECK(cudaMemset(d_bLocal_, 0, totalRows_ * sizeof(double)));
+    JOSIM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_rfTemp_), nRedRows_ * sizeof(double)));
 
     if (!alloc_and_upload(&d_jjs_, jjs)) { return false; }
     if (!alloc_and_upload(&d_ress_, ress)) { return false; }
@@ -2555,7 +2909,7 @@ bool CudaPartitionSolver::initialize_monolithic_full(int32_t                    
         return false;
     }
 
-    if (cusolverRfSetupHost(totalRows_,
+    if (cusolverRfSetupHost(nRedRows_,
                             nnzA_,
                             const_cast<int32_t*>(csrRowPtrA.data()),
                             const_cast<int32_t*>(csrColIndA.data()),
@@ -2576,7 +2930,7 @@ bool CudaPartitionSolver::initialize_monolithic_full(int32_t                    
     }
 
     if (cusolverRfAnalyze(rf) != CUSOLVER_STATUS_SUCCESS) { return false; }
-    if (cusolverRfResetValues(totalRows_, nnzA_, d_luRp_, d_luCi_, d_partNz_, d_P_, d_Q_, rf)
+    if (cusolverRfResetValues(nRedRows_, nnzA_, d_luRp_, d_luCi_, d_partNz_, d_P_, d_Q_, rf)
         != CUSOLVER_STATUS_SUCCESS) {
         return false;
     }
@@ -2629,46 +2983,87 @@ bool CudaPartitionSolver::step_monolithic_full_window(int64_t i0, int64_t i1, co
 
     for (int32_t s = 0; s < w; ++s) {
         const int64_t i = i0 + s;
-        JOSIM_CUDA_CHECK(cudaMemsetAsync(d_bLocal_, 0, totalRows_ * sizeof(double)));
+        JOSIM_CUDA_CHECK(cudaMemsetAsync(d_bLocal_, 0, nRedRows_ * sizeof(double)));
         if (maxDev > 0) {
-            monolithic_full_setup_b_kernel<<<devBlocks, devBlock>>>(numJJs_,
-                                                                    numRess_,
-                                                                    numCaps_,
-                                                                    numInds_,
-                                                                    numVSs_,
-                                                                    numPSs_,
-                                                                    numCSs_,
-                                                                    numCCVSs_,
-                                                                    numVCCSs_,
-                                                                    numTxHalves_,
-                                                                    i,
-                                                                    s,
-                                                                    w,
-                                                                    numSources_,
-                                                                    simSize_,
-                                                                    stepSize_,
-                                                                    analysisType_,
-                                                                    d_xLocal_,
-                                                                    d_bLocal_,
-                                                                    d_partNz_,
-                                                                    d_jjs_,
-                                                                    d_ress_,
-                                                                    d_inds_,
-                                                                    d_muts_,
-                                                                    d_caps_,
-                                                                    d_vss_,
-                                                                    d_pss_,
-                                                                    d_css_,
-                                                                    d_ccvss_,
-                                                                    d_vccss_,
-                                                                    d_txHalves_,
-                                                                    d_txRemote1_,
-                                                                    d_txRemote2_,
-                                                                    d_srcWindow_,
-                                                                    d_indIn2Old_,
-                                                                    d_indIn2New_,
-                                                                    d_numChangedNz_,
-                                                                    d_needsTR_);
+            if (nodalMode_) {
+                nodal_full_setup_b_kernel<<<devBlocks, devBlock>>>(numJJs_,
+                                                                   numRess_,
+                                                                   numCaps_,
+                                                                   numInds_,
+                                                                   numVSs_,
+                                                                   numPSs_,
+                                                                   numCSs_,
+                                                                   numCCVSs_,
+                                                                   numVCCSs_,
+                                                                   numTxHalves_,
+                                                                   i,
+                                                                   s,
+                                                                   w,
+                                                                   numSources_,
+                                                                   simSize_,
+                                                                   stepSize_,
+                                                                   analysisType_,
+                                                                   d_xLocal_,
+                                                                   d_bLocal_,
+                                                                   d_partNz_,
+                                                                   d_jjs_,
+                                                                   d_ress_,
+                                                                   d_inds_,
+                                                                   d_muts_,
+                                                                   d_caps_,
+                                                                   d_vss_,
+                                                                   d_pss_,
+                                                                   d_css_,
+                                                                   d_ccvss_,
+                                                                   d_vccss_,
+                                                                   d_txHalves_,
+                                                                   d_txRemote1_,
+                                                                   d_txRemote2_,
+                                                                   d_srcWindow_,
+                                                                   d_indIn2Old_,
+                                                                   d_indIn2New_,
+                                                                   d_numChangedNz_,
+                                                                   d_needsTR_);
+            } else {
+                monolithic_full_setup_b_kernel<<<devBlocks, devBlock>>>(numJJs_,
+                                                                        numRess_,
+                                                                        numCaps_,
+                                                                        numInds_,
+                                                                        numVSs_,
+                                                                        numPSs_,
+                                                                        numCSs_,
+                                                                        numCCVSs_,
+                                                                        numVCCSs_,
+                                                                        numTxHalves_,
+                                                                        i,
+                                                                        s,
+                                                                        w,
+                                                                        numSources_,
+                                                                        simSize_,
+                                                                        stepSize_,
+                                                                        analysisType_,
+                                                                        d_xLocal_,
+                                                                        d_bLocal_,
+                                                                        d_partNz_,
+                                                                        d_jjs_,
+                                                                        d_ress_,
+                                                                        d_inds_,
+                                                                        d_muts_,
+                                                                        d_caps_,
+                                                                        d_vss_,
+                                                                        d_pss_,
+                                                                        d_css_,
+                                                                        d_ccvss_,
+                                                                        d_vccss_,
+                                                                        d_txHalves_,
+                                                                        d_txRemote1_,
+                                                                        d_txRemote2_,
+                                                                        d_srcWindow_,
+                                                                        d_indIn2Old_,
+                                                                        d_indIn2New_,
+                                                                        d_numChangedNz_,
+                                                                        d_needsTR_);
+            }
             if (analysisType_ == 0 && numInds_ > 0) { std::swap(d_indIn2Old_, d_indIn2New_); }
         }
 
@@ -2679,7 +3074,7 @@ bool CudaPartitionSolver::step_monolithic_full_window(int64_t i0, int64_t i1, co
             if (h_numChanged > 0) {
                 JOSIM_CUDA_CHECK(cudaMemsetAsync(d_numChangedNz_, 0, sizeof(int32_t)));
                 if (cusolverRfResetValues(
-                            totalRows_, nnzA_, d_luRp_, d_luCi_, d_partNz_, d_P_, d_Q_, rf)
+                            nRedRows_, nnzA_, d_luRp_, d_luCi_, d_partNz_, d_P_, d_Q_, rf)
                     != CUSOLVER_STATUS_SUCCESS) {
                     return false;
                 }
@@ -2687,7 +3082,7 @@ bool CudaPartitionSolver::step_monolithic_full_window(int64_t i0, int64_t i1, co
             }
         }
 
-        if (cusolverRfSolve(rf, d_P_, d_Q_, 1, d_rfTemp_, totalRows_, d_bLocal_, totalRows_)
+        if (cusolverRfSolve(rf, d_P_, d_Q_, 1, d_rfTemp_, nRedRows_, d_bLocal_, nRedRows_)
             != CUSOLVER_STATUS_SUCCESS) {
             return false;
         }
@@ -2697,18 +3092,34 @@ bool CudaPartitionSolver::step_monolithic_full_window(int64_t i0, int64_t i1, co
                               || (d_keptSlot_ != nullptr && i >= 0
                                   && i < static_cast<int64_t>(h_keptSlot_.size()) && h_keptSlot_[i] >= 0);
         if (postItems > 0 && needPost) {
-            monolithic_full_post_solve_kernel<<<postBlocks, postBlock>>>(numTxHalves_,
-                                                                         numRelTraces_,
-                                                                         numKeptSteps_,
-                                                                         i,
-                                                                         analysisType_,
-                                                                         d_xLocal_,
-                                                                         d_txHalves_,
-                                                                         d_txLines_,
-                                                                         d_txHist_,
-                                                                         d_relTraces_,
-                                                                         d_keptSlot_,
-                                                                         d_traceOut_);
+            if (nodalMode_) {
+                nodal_full_post_solve_kernel<<<postBlocks, postBlock>>>(numTxHalves_,
+                                                                        numRelTraces_,
+                                                                        numKeptSteps_,
+                                                                        i,
+                                                                        analysisType_,
+                                                                        d_xLocal_,
+                                                                        d_jjs_,
+                                                                        d_txHalves_,
+                                                                        d_txLines_,
+                                                                        d_txHist_,
+                                                                        d_relTraces_,
+                                                                        d_keptSlot_,
+                                                                        d_traceOut_);
+            } else {
+                monolithic_full_post_solve_kernel<<<postBlocks, postBlock>>>(numTxHalves_,
+                                                                             numRelTraces_,
+                                                                             numKeptSteps_,
+                                                                             i,
+                                                                             analysisType_,
+                                                                             d_xLocal_,
+                                                                             d_txHalves_,
+                                                                             d_txLines_,
+                                                                             d_txHist_,
+                                                                             d_relTraces_,
+                                                                             d_keptSlot_,
+                                                                             d_traceOut_);
+            }
         }
     }
 

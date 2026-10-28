@@ -53,18 +53,23 @@ struct GpuJJ {
     double  pn1 = 0.0, pn2 = 0.0, pn3 = 0.0, pn4 = 0.0, phi0 = 0.0;
     double  vn1 = 0.0, vn2 = 0.0, vn3 = 0.0, vn4 = 0.0, vn5 = 0.0, vn6 = 0.0;
     double  it = 0.0, cTerm = 0.0, curNzVal = 0.0;
+    int32_t nzIdxPP = -1, nzIdxQQ = -1, nzIdxPQ = -1, nzIdxQP = -1;
+    double  gVar = 0.0, gScale = 1.0;
 };
 
 struct GpuRes {
     int32_t posIdx = -1, negIdx = -1, curIdx = -1;
     double  pn1 = 0.0, pn2 = 0.0;
+    double  g = 0.0;
 };
 
 struct GpuInd {
     int32_t curIdx   = -1;
+    int32_t posIdx   = -1, negIdx = -1;
     int32_t mutStart = 0, mutCount = 0;
     double  L   = 0.0;
     double  In2 = 0.0, In3 = 0.0, In4 = 0.0;
+    double  g   = 0.0;
 };
 
 struct GpuMut {
@@ -76,6 +81,7 @@ struct GpuMut {
 struct GpuCap {
     int32_t posIdx = -1, negIdx = -1, curIdx = -1;
     double  pn1 = 0.0, pn2 = 0.0, pn3 = 0.0, pn4 = 0.0;
+    double  g = 0.0;
 };
 
 struct GpuVS {
@@ -106,6 +112,7 @@ struct GpuTxHalf {
     int32_t isPort2 = 0;
     int32_t posIdx = -1, negIdx = -1, curIdx = -1;
     double  n1 = 0.0, n2 = 0.0;
+    double  g = 0.0;
 };
 
 struct GpuTxHistEntry {
@@ -127,6 +134,11 @@ struct GpuTxLine {
 struct GpuRelTrace {
     int32_t localAbsIdx = 0; // absolute index in d_xLocal
     int32_t traceSlot   = 0; // 0 .. numRelTraces - 1
+    int32_t traceType   = 0; // 0 = direct, 1 = JJ varIdx, 2 = JJ curIdx, 3 = linear branch curIdx
+    int32_t posIdx      = -1;
+    int32_t negIdx      = -1;
+    int32_t jjIdx       = -1;
+    double  gBranch     = 0.0;
 };
 
 class CudaPartitionSolver {
@@ -231,7 +243,8 @@ class CudaPartitionSolver {
                                     const std::vector<GpuTxLine>&      txLines,
                                     const std::vector<GpuTxHistEntry>& txHist,
                                     const std::vector<GpuRelTrace>&    relTraces,
-                                    const std::vector<int32_t>&        keptSlot);
+                                    const std::vector<int32_t>&        keptSlot,
+                                    int32_t                            nRedRows = -1);
 
     // Execute window [i0, i1) using Tier 3 Fully GPU-Resident Monolithic Solver (cuSolverRF)
     bool step_monolithic_full_window(int64_t i0, int64_t i1, const double* h_srcWindow);
@@ -250,6 +263,8 @@ class CudaPartitionSolver {
     int32_t nBaseTxLines_ = 0;
     int32_t nParts_       = 0;
     int32_t totalRows_    = 0;
+    int32_t nRedRows_     = 0;
+    bool    nodalMode_    = false;
     int32_t numSources_   = 0;
     int32_t maxWindow_    = 0;
     int32_t numRelTraces_ = 0;

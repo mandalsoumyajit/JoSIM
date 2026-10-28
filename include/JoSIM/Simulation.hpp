@@ -70,6 +70,9 @@ class Simulation {
     bool                parallel_                = false;
     bool                gpu_                     = false;
     int64_t             gpuMode_                 = 1;
+    bool                nodal_                   = false;
+    bool                bypass_                  = false;
+    double              bypassTol_               = 1e-6;
     bool                fixedStep_               = false;
     bool                warnStep_                = false;
     int64_t             verb_                    = 0;
@@ -122,6 +125,31 @@ class Simulation {
     std::vector<int64_t>                 indPartIdx_;
     std::vector<int64_t>                 indPartNzIdx_;
     std::vector<std::vector<int64_t>>    indMutPartNzIdx_;
+
+    // Tier 4 Schur-Complement Nodal Admittance solver state
+    bool                                 nodalActive_    = false;
+    int32_t                              nodalNRed_      = 0;
+    std::vector<int32_t>                 nodalPermToSolver_;
+    std::vector<int64_t>                 nodalRp_;
+    std::vector<int64_t>                 nodalCi_;
+    std::vector<double>                  nodalNz_;
+    std::vector<double>                  nodalX_;
+    std::vector<double>                  nodalB_;
+    klu_l_symbolic*                      SymbolicRed_    = nullptr;
+    klu_l_numeric*                       NumericRed_     = nullptr;
+    klu_l_common                         CommonRed_{};
+    std::vector<GpuJJ>                   nodalJJs_;
+    std::vector<GpuRes>                  nodalRess_;
+    std::vector<GpuInd>                  nodalInds_;
+    std::vector<GpuMut>                  nodalMuts_;
+    std::vector<GpuCap>                  nodalCaps_;
+    std::vector<GpuVS>                   nodalVSs_;
+    std::vector<GpuPS>                   nodalPSs_;
+    std::vector<GpuCS>                   nodalCSs_;
+    std::vector<GpuCCVS>                 nodalCCVSs_;
+    std::vector<GpuVCCS>                 nodalVCCSs_;
+    std::vector<GpuTxHalf>               nodalTxHalves_;
+    std::vector<GpuRelTrace>             nodalRelTraces_;
 #ifdef JOSIM_CUDA
     std::unique_ptr<CudaPartitionSolver> cudaSolver_;
 #endif
@@ -129,19 +157,24 @@ class Simulation {
 
     void setup(Input& iObj, Matrix& mObj);
     void setup_partitions(Matrix& mObj);
+    bool build_nodal_system(Matrix& mObj);
+    bool setup_cpu_nodal(Matrix& mObj);
     bool setup_gpu_solver(Matrix& mObj);
     bool setup_gpu_monolithic(Matrix& mObj);
     bool setup_gpu_monolithic_full(Matrix& mObj);
+    bool setup_gpu_nodal(Matrix& mObj);
     void factorize_lu(Matrix& mObj);
     void refactor_lu(Matrix& mObj);
     void solve_lu(Matrix& mObj);
     void free_lu();
     void trans_sim(Matrix& mObj);
     void trans_sim_mc(Matrix& mObj);
+    void trans_sim_nodal(Matrix& mObj);
     void trans_sim_omp_windowed(Matrix& mObj);
     void trans_sim_gpu_windowed(Matrix& mObj);
     void trans_sim_gpu_monolithic(Matrix& mObj);
     void trans_sim_gpu_monolithic_full(Matrix& mObj);
+    void trans_sim_gpu_nodal(Matrix& mObj);
     void setup_b(Matrix& mObj, int64_t i, double step, double factor = 1);
     void reduce_step(Input& iObj, Matrix& mObj);
     void corrector_jj(Matrix& mObj);

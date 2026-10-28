@@ -55,6 +55,10 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     parallel_                = iObj.argPar;
     gpu_                     = iObj.argGpu;
     gpuMode_                 = iObj.argGpuMode;
+    nodal_                   = iObj.argNodal;
+    nodalActive_             = false;
+    bypass_                  = iObj.argBypass;
+    bypassTol_               = iObj.argBypassTol;
 #ifdef JOSIM_CUDA
     if (gpu_) { CudaPartitionSolver::warmup_device(); }
 #endif
@@ -255,6 +259,7 @@ void Simulation::setup_partitions(Matrix& mObj) {
     cudaSolver_.reset();
 #endif
     const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
+    if (nodal_ && mcRuns_ <= 1) { return; }
     if (gpu_ && gpuMode_ >= 2 && mcRuns_ <= 1) { return; }
     if (N < 32 && mcRuns_ <= 1) { return; }
     if (N < 4) { return; }
@@ -1618,6 +1623,732 @@ bool Simulation::setup_gpu_monolithic_full(Matrix& mObj) {
 #endif
 }
 
+bool Simulation::build_nodal_system(Matrix& mObj) {
+#ifndef SLU
+    nodalNRed_ = 0;
+    nodalPermToSolver_.clear();
+    nodalRp_.clear();
+    nodalCi_.clear();
+    nodalNz_.clear();
+    nodalJJs_.clear();
+    nodalRess_.clear();
+    nodalInds_.clear();
+    nodalMuts_.clear();
+    nodalCaps_.clear();
+    nodalVSs_.clear();
+    nodalPSs_.clear();
+    nodalCSs_.clear();
+    nodalCCVSs_.clear();
+    nodalVCCSs_.clear();
+    nodalTxHalves_.clear();
+    nodalRelTraces_.clear();
+
+    const int64_t N      = static_cast<int64_t>(mObj.rp.size()) - 1;
+    const int64_t nNodes = static_cast<int64_t>(mObj.nm.size());
+    if (N < 4 || nNodes <= 0 || nNodes >= N) { return false; }
+    if (hasJJThermalNoise_ || hasResistorThermalNoise_ || correctorIter_ > 0 || saveStateFile_.has_value()
+        || loadStateFile_.has_value()) {
+        return false;
+    }
+    if (!mObj.components.cccsIndices.empty() || !mObj.components.vcvsIndices.empty()) { return false; }
+
+    auto valid_2term = [](const IndexInfo& info) -> bool {
+        if (info.nodeConfig_ == NodeConfig::GND) { return false; }
+        if (info.nodeConfig_ == NodeConfig::POSNEG
+            && (!info.posIndex_ || !info.negIndex_ || info.posIndex_.value() == info.negIndex_.value())) {
+            return false;
+        }
+        return true;
+    };
+
+    for (const auto& jj : jjs_) {
+        if (!valid_2term(jj.indexInfo)) { return false; }
+    }
+    for (const auto& res : resistors_) {
+        if (!valid_2term(res.indexInfo)) { return false; }
+    }
+    for (const auto& cap : capacitors_) {
+        if (!valid_2term(cap.indexInfo)) { return false; }
+    }
+    for (const auto& ind : inductors_) {
+        if (!valid_2term(ind.indexInfo)) { return false; }
+    }
+    for (const auto& vs : vsources_) {
+        if (!valid_2term(vs.indexInfo)) { return false; }
+    }
+    for (const auto& ps : psources_) {
+        if (!valid_2term(ps.indexInfo)) { return false; }
+    }
+    for (const auto& tx : txlines_) {
+        if (!valid_2term(tx.indexInfo)) { return false; }
+        if (tx.nodeConfig2_ == NodeConfig::GND) { return false; }
+        if (tx.nodeConfig2_ == NodeConfig::POSNEG
+            && (!tx.posIndex2_ || !tx.negIndex2_ || tx.posIndex2_.value() == tx.negIndex2_.value())) {
+            return false;
+        }
+    }
+
+    std::vector<bool> isRelevantRow(N, mObj.relevantTraces.empty());
+    for (int64_t r : mObj.relevantIndices) {
+        if (r >= 0 && r < N) { isRelevantRow[r] = true; }
+    }
+
+    std::vector<bool>    cannotBeDirichlet(nNodes, false);
+    std::vector<int64_t> vsPsCountOnNode(nNodes, 0);
+    for (const auto& ccvs : ccvss_) {
+        if (ccvs.indexInfo.posIndex_) { cannotBeDirichlet[ccvs.indexInfo.posIndex_.value()] = true; }
+        if (ccvs.indexInfo.negIndex_) { cannotBeDirichlet[ccvs.indexInfo.negIndex_.value()] = true; }
+        if (ccvs.posIndex2_) { cannotBeDirichlet[ccvs.posIndex2_.value()] = true; }
+        if (ccvs.negIndex2_) { cannotBeDirichlet[ccvs.negIndex2_.value()] = true; }
+    }
+    for (const auto& vccs : vccss_) {
+        if (vccs.indexInfo.posIndex_) { cannotBeDirichlet[vccs.indexInfo.posIndex_.value()] = true; }
+        if (vccs.indexInfo.negIndex_) { cannotBeDirichlet[vccs.indexInfo.negIndex_.value()] = true; }
+    }
+    for (const auto& vs : vsources_) {
+        if (vs.indexInfo.posIndex_) { ++vsPsCountOnNode[vs.indexInfo.posIndex_.value()]; }
+        if (vs.indexInfo.negIndex_) { ++vsPsCountOnNode[vs.indexInfo.negIndex_.value()]; }
+    }
+    for (const auto& ps : psources_) {
+        if (ps.indexInfo.posIndex_) { ++vsPsCountOnNode[ps.indexInfo.posIndex_.value()]; }
+        if (ps.indexInfo.negIndex_) { ++vsPsCountOnNode[ps.indexInfo.negIndex_.value()]; }
+    }
+
+    std::vector<bool>    isDirichletNode(nNodes, false);
+    std::vector<double>  dirichletSign(nNodes, 1.0);
+    std::vector<int64_t> vsDirichletNode(vsources_.size(), -1);
+    std::vector<int64_t> psDirichletNode(psources_.size(), -1);
+    std::vector<bool>    isElimRow(N, false);
+
+    for (size_t vIdx = 0; vIdx < vsources_.size(); ++vIdx) {
+        const auto&      vs     = vsources_[vIdx];
+        const NodeConfig nc     = vs.indexInfo.nodeConfig_;
+        const int64_t    curRow = vs.indexInfo.currentIndex_.value();
+        if ((nc == NodeConfig::POSGND || nc == NodeConfig::GNDNEG) && !isRelevantRow[curRow]) {
+            const int64_t node = (nc == NodeConfig::POSGND) ? vs.indexInfo.posIndex_.value()
+                                                            : vs.indexInfo.negIndex_.value();
+            if (node >= 0 && node < nNodes && !cannotBeDirichlet[node] && vsPsCountOnNode[node] == 1
+                && !isDirichletNode[node]) {
+                isDirichletNode[node] = true;
+                dirichletSign[node]   = (nc == NodeConfig::POSGND) ? 1.0 : -1.0;
+                vsDirichletNode[vIdx] = node;
+                isElimRow[curRow]     = true;
+            }
+        }
+    }
+    for (size_t pIdx = 0; pIdx < psources_.size(); ++pIdx) {
+        const auto&      ps     = psources_[pIdx];
+        const NodeConfig nc     = ps.indexInfo.nodeConfig_;
+        const int64_t    curRow = ps.indexInfo.currentIndex_.value();
+        if ((nc == NodeConfig::POSGND || nc == NodeConfig::GNDNEG) && !isRelevantRow[curRow]) {
+            const int64_t node = (nc == NodeConfig::POSGND) ? ps.indexInfo.posIndex_.value()
+                                                            : ps.indexInfo.negIndex_.value();
+            if (node >= 0 && node < nNodes && !cannotBeDirichlet[node] && vsPsCountOnNode[node] == 1
+                && !isDirichletNode[node]) {
+                isDirichletNode[node] = true;
+                dirichletSign[node]   = (nc == NodeConfig::POSGND) ? 1.0 : -1.0;
+                psDirichletNode[pIdx] = node;
+                isElimRow[curRow]     = true;
+            }
+        }
+    }
+
+    for (const auto& jj : jjs_) {
+        isElimRow[jj.variableIndex_]                    = true;
+        isElimRow[jj.indexInfo.currentIndex_.value()]   = true;
+    }
+    for (const auto& res : resistors_) {
+        isElimRow[res.indexInfo.currentIndex_.value()] = true;
+    }
+    for (const auto& cap : capacitors_) {
+        isElimRow[cap.indexInfo.currentIndex_.value()] = true;
+    }
+    for (const auto& ind : inductors_) {
+        if (ind.get_mutualInductance().empty()) {
+            isElimRow[ind.indexInfo.currentIndex_.value()] = true;
+        }
+    }
+    for (const auto& tx : txlines_) {
+        isElimRow[tx.indexInfo.currentIndex_.value()] = true;
+        isElimRow[tx.currentIndex2_]                  = true;
+    }
+
+    nodalPermToSolver_.assign(static_cast<size_t>(N), -1);
+    int32_t nextRed = 0;
+    for (int64_t r = 0; r < N; ++r) {
+        if (!isElimRow[r]) { nodalPermToSolver_[r] = nextRed++; }
+    }
+    nodalNRed_       = nextRed;
+    int32_t nextElim = nodalNRed_;
+    for (int64_t r = 0; r < N; ++r) {
+        if (isElimRow[r]) { nodalPermToSolver_[r] = nextElim++; }
+    }
+
+    std::vector<std::vector<std::pair<int32_t, double>>> rowEntries(static_cast<size_t>(nodalNRed_));
+    for (int64_t origR = 0; origR < N; ++origR) {
+        if (isElimRow[origR]) { continue; }
+        const int32_t redR = nodalPermToSolver_[origR];
+        if (origR < nNodes && isDirichletNode[origR]) {
+            rowEntries[redR].emplace_back(redR, dirichletSign[origR]);
+            continue;
+        }
+        const int64_t kStart = mObj.rp[origR];
+        const int64_t kEnd   = mObj.rp[origR + 1];
+        for (int64_t k = kStart; k < kEnd; ++k) {
+            const int64_t origC = mObj.ci[k];
+            if (origC >= 0 && origC < N && !isElimRow[origC]) {
+                rowEntries[redR].emplace_back(nodalPermToSolver_[origC], mObj.nz[k]);
+            }
+        }
+    }
+
+    auto stamp_nodal_conductance = [&](const int_o& posOpt, const int_o& negOpt, double g) {
+        const int64_t p = posOpt ? posOpt.value() : -1;
+        const int64_t q = negOpt ? negOpt.value() : -1;
+        if (p >= 0 && !isDirichletNode[p]) {
+            rowEntries[p].emplace_back(static_cast<int32_t>(p), g);
+            if (q >= 0) { rowEntries[p].emplace_back(static_cast<int32_t>(q), -g); }
+        }
+        if (q >= 0 && !isDirichletNode[q]) {
+            rowEntries[q].emplace_back(static_cast<int32_t>(q), g);
+            if (p >= 0) { rowEntries[q].emplace_back(static_cast<int32_t>(p), -g); }
+        }
+    };
+
+    for (const auto& jj : jjs_) {
+        const double gVar   = 1.0 / jj.phaseConst_;
+        const double gScale = (atyp_ == AnalysisType::Phase) ? gVar : 1.0;
+        const double gCur   = -1.0 / jj.matrixInfo.nonZeros_.back();
+        stamp_nodal_conductance(jj.indexInfo.posIndex_, jj.indexInfo.negIndex_, gScale * gCur);
+    }
+    for (const auto& res : resistors_) {
+        const double gRes = -1.0 / res.matrixInfo.nonZeros_.back();
+        stamp_nodal_conductance(res.indexInfo.posIndex_, res.indexInfo.negIndex_, gRes);
+    }
+    for (const auto& cap : capacitors_) {
+        const double gCap = -1.0 / cap.matrixInfo.nonZeros_.back();
+        stamp_nodal_conductance(cap.indexInfo.posIndex_, cap.indexInfo.negIndex_, gCap);
+    }
+    for (const auto& ind : inductors_) {
+        if (ind.get_mutualInductance().empty()) {
+            const double gInd = -1.0 / ind.matrixInfo.nonZeros_.back();
+            stamp_nodal_conductance(ind.indexInfo.posIndex_, ind.indexInfo.negIndex_, gInd);
+        }
+    }
+    for (const auto& tx : txlines_) {
+        const double gTx = -1.0 / tx.matrixInfo.nonZeros_.back();
+        stamp_nodal_conductance(tx.indexInfo.posIndex_, tx.indexInfo.negIndex_, gTx);
+        stamp_nodal_conductance(tx.posIndex2_, tx.negIndex2_, gTx);
+    }
+
+    nodalRp_.resize(static_cast<size_t>(nodalNRed_ + 1), 0);
+    for (int32_t r = 0; r < nodalNRed_; ++r) {
+        nodalRp_[r] = static_cast<int64_t>(nodalCi_.size());
+        auto& entries = rowEntries[r];
+        if (entries.empty()) { return false; }
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& kv : entries) {
+            if (!nodalCi_.empty() && static_cast<int64_t>(nodalCi_.size()) > nodalRp_[r]
+                && nodalCi_.back() == static_cast<int64_t>(kv.first)) {
+                nodalNz_.back() += kv.second;
+            } else {
+                nodalCi_.push_back(static_cast<int64_t>(kv.first));
+                nodalNz_.push_back(kv.second);
+            }
+        }
+    }
+    nodalRp_[nodalNRed_] = static_cast<int64_t>(nodalCi_.size());
+
+    auto find_csr_idx = [&](int64_t row, int64_t col) -> int32_t {
+        if (row < 0 || row >= nNodes || col < 0 || col >= nNodes || isDirichletNode[row]) { return -1; }
+        const auto itBegin = nodalCi_.begin() + nodalRp_[row];
+        const auto itEnd   = nodalCi_.begin() + nodalRp_[row + 1];
+        const auto it      = std::lower_bound(itBegin, itEnd, col);
+        if (it == itEnd || *it != col) { return -1; }
+        return static_cast<int32_t>(std::distance(nodalCi_.begin(), it));
+    };
+
+    auto encode_node = [&](const int_o& optNode) -> int32_t {
+        if (!optNode) { return -1; }
+        const int32_t p = static_cast<int32_t>(optNode.value());
+        return isDirichletNode[p] ? -(p + 2) : p;
+    };
+
+    std::vector<GpuRelTrace> traceDescByOrigRow(static_cast<size_t>(N));
+    for (int64_t r = 0; r < N; ++r) {
+        traceDescByOrigRow[r].localAbsIdx = nodalPermToSolver_[r];
+        traceDescByOrigRow[r].traceType   = 0;
+    }
+
+    nodalJJs_.resize(jjs_.size());
+    for (size_t idx = 0; idx < jjs_.size(); ++idx) {
+        const auto&   jj  = jjs_[idx];
+        const auto&   m   = jj.model_;
+        GpuJJ&        gjj = nodalJJs_[idx];
+        const int64_t p   = jj.indexInfo.posIndex_ ? jj.indexInfo.posIndex_.value() : -1;
+        const int64_t q   = jj.indexInfo.negIndex_ ? jj.indexInfo.negIndex_.value() : -1;
+        gjj.posIdx        = encode_node(jj.indexInfo.posIndex_);
+        gjj.negIdx        = encode_node(jj.indexInfo.negIndex_);
+        gjj.curIdx        = nodalPermToSolver_[jj.indexInfo.currentIndex_.value()];
+        gjj.varIdx        = nodalPermToSolver_[jj.variableIndex_];
+        gjj.nzIdxPP       = find_csr_idx(p, p);
+        gjj.nzIdxQQ       = find_csr_idx(q, q);
+        gjj.nzIdxPQ       = find_csr_idx(p, q);
+        gjj.nzIdxQP       = find_csr_idx(q, p);
+        gjj.gVar          = 1.0 / jj.phaseConst_;
+        gjj.gScale        = (atyp_ == AnalysisType::Phase) ? gjj.gVar : 1.0;
+        gjj.rtype         = m.rtype();
+        gjj.tDep          = m.tDep() ? 1 : 0;
+        const auto& cpr   = m.cpr();
+        gjj.cprLen        = std::min<int32_t>(8, static_cast<int32_t>(cpr.size()));
+        for (int32_t h = 0; h < gjj.cprLen; ++h) { gjj.cpr[h] = cpr[h]; }
+        gjj.ic            = m.ic();
+        gjj.c             = m.c();
+        gjj.r0            = m.r0();
+        gjj.rn            = m.rn();
+        gjj.phiOff        = m.phiOff();
+        gjj.t             = m.t();
+        gjj.d             = m.d();
+        gjj.del           = jj.del_;
+        gjj.lowerB        = jj.lowerB_;
+        gjj.upperB        = jj.upperB_;
+        gjj.gLarge        = jj.gLarge_;
+        gjj.negInvSubgap  = jj.negInvSubgap_;
+        gjj.negInvTrans   = jj.negInvTrans_;
+        gjj.negInvNormal  = jj.negInvNormal_;
+        gjj.pn1           = jj.pn1_;
+        gjj.pn2           = jj.pn2_;
+        gjj.pn3           = jj.pn3_;
+        gjj.pn4           = jj.pn4_;
+        gjj.phi0          = jj.phi0_;
+        gjj.vn1           = jj.vn1_;
+        gjj.vn2           = jj.vn2_;
+        gjj.vn3           = jj.vn3_;
+        gjj.vn4           = jj.vn4_;
+        gjj.vn5           = jj.vn5_;
+        gjj.vn6           = jj.vn6_;
+        gjj.it            = jj.it_;
+        gjj.curNzVal      = jj.matrixInfo.nonZeros_.back();
+        gjj.cTerm         = jj.cTerm_;
+
+        GpuRelTrace& tv = traceDescByOrigRow[jj.variableIndex_];
+        tv.localAbsIdx  = gjj.varIdx;
+        tv.traceType    = 1;
+        tv.posIdx       = gjj.posIdx;
+        tv.negIdx       = gjj.negIdx;
+        tv.jjIdx        = static_cast<int32_t>(idx);
+        tv.gBranch      = gjj.gVar;
+
+        GpuRelTrace& tc = traceDescByOrigRow[jj.indexInfo.currentIndex_.value()];
+        tc.localAbsIdx  = gjj.curIdx;
+        tc.traceType    = 2;
+        tc.posIdx       = gjj.posIdx;
+        tc.negIdx       = gjj.negIdx;
+        tc.jjIdx        = static_cast<int32_t>(idx);
+        tc.gBranch      = gjj.gScale;
+    }
+
+    nodalRess_.resize(resistors_.size());
+    for (size_t idx = 0; idx < resistors_.size(); ++idx) {
+        const auto& res  = resistors_[idx];
+        GpuRes&     gres = nodalRess_[idx];
+        gres.posIdx      = encode_node(res.indexInfo.posIndex_);
+        gres.negIdx      = encode_node(res.indexInfo.negIndex_);
+        gres.curIdx      = nodalPermToSolver_[res.indexInfo.currentIndex_.value()];
+        gres.pn1         = res.pn1_;
+        gres.pn2         = res.pn2_;
+        gres.g           = -1.0 / res.matrixInfo.nonZeros_.back();
+
+        GpuRelTrace& tc = traceDescByOrigRow[res.indexInfo.currentIndex_.value()];
+        tc.localAbsIdx  = gres.curIdx;
+        tc.traceType    = 3;
+        tc.posIdx       = gres.posIdx;
+        tc.negIdx       = gres.negIdx;
+        tc.gBranch      = gres.g;
+    }
+
+    nodalInds_.resize(inductors_.size());
+    for (size_t idx = 0; idx < inductors_.size(); ++idx) {
+        const auto& ind  = inductors_[idx];
+        GpuInd&     gind = nodalInds_[idx];
+        gind.posIdx      = encode_node(ind.indexInfo.posIndex_);
+        gind.negIdx      = encode_node(ind.indexInfo.negIndex_);
+        gind.curIdx      = nodalPermToSolver_[ind.indexInfo.currentIndex_.value()];
+        gind.mutStart    = static_cast<int32_t>(nodalMuts_.size());
+        gind.L           = ind.netlistInfo.value_;
+        gind.In2         = ind.In2_;
+        gind.In3         = ind.In3_;
+        gind.In4         = ind.In4_;
+        if (ind.get_mutualInductance().empty()) {
+            gind.g          = -1.0 / ind.matrixInfo.nonZeros_.back();
+            gind.mutCount   = 0;
+            GpuRelTrace& tc = traceDescByOrigRow[ind.indexInfo.currentIndex_.value()];
+            tc.localAbsIdx  = gind.curIdx;
+            tc.traceType    = 3;
+            tc.posIdx       = gind.posIdx;
+            tc.negIdx       = gind.negIdx;
+            tc.gBranch      = gind.g;
+        } else {
+            gind.g = 0.0;
+            for (const auto& m : ind.get_mutualInductance()) {
+                GpuMut gmut{};
+                gmut.targetIndIdx = static_cast<int32_t>(m.first);
+                gmut.targetCurIdx = nodalPermToSolver_[inductors_[m.first].indexInfo.currentIndex_.value()];
+                gmut.M            = m.second;
+                nodalMuts_.push_back(gmut);
+            }
+            gind.mutCount = static_cast<int32_t>(nodalMuts_.size()) - gind.mutStart;
+        }
+    }
+
+    nodalCaps_.resize(capacitors_.size());
+    for (size_t idx = 0; idx < capacitors_.size(); ++idx) {
+        const auto& cap  = capacitors_[idx];
+        GpuCap&     gcap = nodalCaps_[idx];
+        gcap.posIdx      = encode_node(cap.indexInfo.posIndex_);
+        gcap.negIdx      = encode_node(cap.indexInfo.negIndex_);
+        gcap.curIdx      = nodalPermToSolver_[cap.indexInfo.currentIndex_.value()];
+        gcap.pn1         = cap.pn1_;
+        gcap.pn2         = cap.pn2_;
+        gcap.pn3         = cap.pn3_;
+        gcap.pn4         = cap.pn4_;
+        gcap.g           = -1.0 / cap.matrixInfo.nonZeros_.back();
+
+        GpuRelTrace& tc = traceDescByOrigRow[cap.indexInfo.currentIndex_.value()];
+        tc.localAbsIdx  = gcap.curIdx;
+        tc.traceType    = 3;
+        tc.posIdx       = gcap.posIdx;
+        tc.negIdx       = gcap.negIdx;
+        tc.gBranch      = gcap.g;
+    }
+
+    nodalVSs_.resize(vsources_.size());
+    for (size_t idx = 0; idx < vsources_.size(); ++idx) {
+        const auto& vs  = vsources_[idx];
+        GpuVS&      gvs = nodalVSs_[idx];
+        gvs.posIdx      = encode_node(vs.indexInfo.posIndex_);
+        gvs.negIdx      = encode_node(vs.indexInfo.negIndex_);
+        gvs.curIdx      = (vsDirichletNode[idx] >= 0) ? static_cast<int32_t>(vsDirichletNode[idx])
+                                                      : nodalPermToSolver_[vs.indexInfo.currentIndex_.value()];
+        gvs.srcIdx      = static_cast<int32_t>(vs.sourceIndex_);
+        gvs.pn1         = vs.pn1_;
+        gvs.pn2         = vs.pn2_;
+    }
+
+    nodalPSs_.resize(psources_.size());
+    for (size_t idx = 0; idx < psources_.size(); ++idx) {
+        const auto& ps  = psources_[idx];
+        GpuPS&      gps = nodalPSs_[idx];
+        gps.curIdx      = (psDirichletNode[idx] >= 0) ? static_cast<int32_t>(psDirichletNode[idx])
+                                                      : nodalPermToSolver_[ps.indexInfo.currentIndex_.value()];
+        gps.srcIdx      = static_cast<int32_t>(ps.sourceIndex_);
+    }
+
+    nodalCSs_.resize(mObj.components.currentsources.size());
+    for (size_t idx = 0; idx < mObj.components.currentsources.size(); ++idx) {
+        const auto& cs  = mObj.components.currentsources[idx];
+        GpuCS&      gcs = nodalCSs_[idx];
+        gcs.posIdx      = encode_node(cs.indexInfo.posIndex_);
+        gcs.negIdx      = encode_node(cs.indexInfo.negIndex_);
+        gcs.srcIdx      = static_cast<int32_t>(cs.sourceIndex_);
+    }
+
+    nodalCCVSs_.resize(ccvss_.size());
+    for (size_t idx = 0; idx < ccvss_.size(); ++idx) {
+        const auto& ccvs  = ccvss_[idx];
+        GpuCCVS&    gccvs = nodalCCVSs_[idx];
+        gccvs.posIdx      = encode_node(ccvs.indexInfo.posIndex_);
+        gccvs.negIdx      = encode_node(ccvs.indexInfo.negIndex_);
+        gccvs.curIdx      = nodalPermToSolver_[ccvs.indexInfo.currentIndex_.value()];
+    }
+
+    nodalVCCSs_.resize(vccss_.size());
+    for (size_t idx = 0; idx < vccss_.size(); ++idx) {
+        const auto& vccs  = vccss_[idx];
+        GpuVCCS&    gvccs = nodalVCCSs_[idx];
+        gvccs.posIdx2     = encode_node(vccs.posIndex2_);
+        gvccs.negIdx2     = encode_node(vccs.negIndex2_);
+        gvccs.curIdx      = nodalPermToSolver_[vccs.indexInfo.currentIndex_.value()];
+    }
+
+    for (size_t idx = 0; idx < txlines_.size(); ++idx) {
+        const auto&  tx  = txlines_[idx];
+        const double gTx = -1.0 / tx.matrixInfo.nonZeros_.back();
+
+        GpuTxHalf p1{};
+        p1.txIdx   = static_cast<int32_t>(idx);
+        p1.isPort2 = 0;
+        p1.posIdx  = encode_node(tx.indexInfo.posIndex_);
+        p1.negIdx  = encode_node(tx.indexInfo.negIndex_);
+        p1.curIdx  = nodalPermToSolver_[tx.indexInfo.currentIndex_.value()];
+        p1.n1      = tx.n1_1_;
+        p1.n2      = tx.n2_1_;
+        p1.g       = gTx;
+        nodalTxHalves_.push_back(p1);
+
+        GpuRelTrace& tc1 = traceDescByOrigRow[tx.indexInfo.currentIndex_.value()];
+        tc1.localAbsIdx  = p1.curIdx;
+        tc1.traceType    = 3;
+        tc1.posIdx       = p1.posIdx;
+        tc1.negIdx       = p1.negIdx;
+        tc1.gBranch      = p1.g;
+
+        GpuTxHalf p2{};
+        p2.txIdx   = static_cast<int32_t>(idx);
+        p2.isPort2 = 1;
+        p2.posIdx  = encode_node(tx.posIndex2_);
+        p2.negIdx  = encode_node(tx.negIndex2_);
+        p2.curIdx  = nodalPermToSolver_[tx.currentIndex2_];
+        p2.n1      = tx.n1_2_;
+        p2.n2      = tx.n2_2_;
+        p2.g       = gTx;
+        nodalTxHalves_.push_back(p2);
+
+        GpuRelTrace& tc2 = traceDescByOrigRow[tx.currentIndex2_];
+        tc2.localAbsIdx  = p2.curIdx;
+        tc2.traceType    = 3;
+        tc2.posIdx       = p2.posIdx;
+        tc2.negIdx       = p2.negIdx;
+        tc2.gBranch      = p2.g;
+    }
+
+    if (!mObj.relevantTraces.empty()) {
+        for (int64_t globR : mObj.relevantIndices) {
+            if (globR >= 0 && globR < N) {
+                GpuRelTrace grt = traceDescByOrigRow[globR];
+                grt.traceSlot   = static_cast<int32_t>(nodalRelTraces_.size());
+                nodalRelTraces_.push_back(grt);
+            }
+        }
+    } else {
+        for (int64_t globR = 0; globR < N; ++globR) {
+            GpuRelTrace grt = traceDescByOrigRow[globR];
+            grt.traceSlot   = static_cast<int32_t>(nodalRelTraces_.size());
+            nodalRelTraces_.push_back(grt);
+        }
+    }
+
+    return true;
+#else
+    (void) mObj;
+    return false;
+#endif
+}
+
+bool Simulation::setup_cpu_nodal(Matrix& mObj) {
+#ifndef SLU
+    if (nodalActive_ && SymbolicRed_ && NumericRed_) { return true; }
+    if (SymbolicRed_) { klu_l_free_symbolic(&SymbolicRed_, &CommonRed_); }
+    if (NumericRed_) { klu_l_free_numeric(&NumericRed_, &CommonRed_); }
+    if (!build_nodal_system(mObj) || nodalNRed_ <= 0) { return false; }
+
+    klu_l_defaults(&CommonRed_);
+    if (gpu_ && (gpuMode_ == 4 || gpuMode_ == 1)) {
+        CommonRed_.btf   = 0;
+        CommonRed_.scale = 0;
+    }
+    SymbolicRed_ = klu_l_analyze(nodalNRed_, nodalRp_.data(), nodalCi_.data(), &CommonRed_);
+    NumericRed_  = klu_l_factor(nodalRp_.data(), nodalCi_.data(), nodalNz_.data(), SymbolicRed_, &CommonRed_);
+    if (CommonRed_.btf == 0 && (!NumericRed_ || CommonRed_.status != KLU_OK)) {
+        if (NumericRed_) { klu_l_free_numeric(&NumericRed_, &CommonRed_); }
+        if (SymbolicRed_) { klu_l_free_symbolic(&SymbolicRed_, &CommonRed_); }
+        klu_l_defaults(&CommonRed_);
+        SymbolicRed_ = klu_l_analyze(nodalNRed_, nodalRp_.data(), nodalCi_.data(), &CommonRed_);
+        NumericRed_  = klu_l_factor(nodalRp_.data(), nodalCi_.data(), nodalNz_.data(), SymbolicRed_, &CommonRed_);
+    }
+    if (!SymbolicRed_ || !NumericRed_ || CommonRed_.status != KLU_OK) { return false; }
+    const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
+    nodalX_.assign(static_cast<size_t>(nodalNRed_), 0.0);
+    nodalB_.assign(static_cast<size_t>(nodalNRed_), 0.0);
+    for (int64_t r = 0; r < N; ++r) {
+        const int32_t redR = nodalPermToSolver_[r];
+        if (redR >= 0 && redR < nodalNRed_) { nodalX_[redR] = x_[r]; }
+    }
+    nodalActive_ = true;
+    if (verb_ >= 1 && !gpu_) {
+        std::cout << "JoSIM: Initialized Tier 4 Schur-Complement Nodal Solver (N = " << N << " -> N_red = "
+                  << nodalNRed_ << ", nnz(L+U) = " << (NumericRed_->lnz + NumericRed_->unz) << ")\n";
+    }
+    return true;
+#else
+    (void) mObj;
+    return false;
+#endif
+}
+
+bool Simulation::setup_gpu_nodal(Matrix& mObj) {
+#if defined(JOSIM_CUDA) && !defined(SLU)
+    if (mcRuns_ > 1) { return false; }
+    if (nodalActive_ && cudaSolver_) { return true; }
+    if ((!SymbolicRed_ || !NumericRed_) && !setup_cpu_nodal(mObj)) { return false; }
+    if (CommonRed_.btf != 0 || CommonRed_.scale != 0 || SymbolicRed_->nblocks != 1 || !SymbolicRed_->Q
+        || !NumericRed_->Pnum) {
+        return false;
+    }
+    const int64_t N     = static_cast<int64_t>(mObj.rp.size()) - 1;
+    const int64_t nRed  = nodalNRed_;
+    const int64_t lnz   = NumericRed_->lnz;
+    const int64_t unz   = NumericRed_->unz;
+    const int64_t nnzA  = static_cast<int64_t>(nodalCi_.size());
+    if (nRed < 8 || lnz <= 0 || unz <= 0 || (lnz + unz) > 60000000) { return false; }
+
+    std::vector<int64_t> Lp64(nRed + 1), Li64(lnz), Up64(nRed + 1), Ui64(unz);
+    std::vector<int64_t> Fp64(nRed + 1), Fi64(1), P64(nRed), Q64(nRed), R64(nRed + 1);
+    std::vector<double>  Lx(lnz), Ux(unz), Fx(1), Rs(nRed);
+    if (!klu_l_extract(NumericRed_,
+                       SymbolicRed_,
+                       Lp64.data(),
+                       Li64.data(),
+                       Lx.data(),
+                       Up64.data(),
+                       Ui64.data(),
+                       Ux.data(),
+                       Fp64.data(),
+                       Fi64.data(),
+                       Fx.data(),
+                       P64.data(),
+                       Q64.data(),
+                       Rs.data(),
+                       R64.data(),
+                       &CommonRed_)) {
+        return false;
+    }
+
+    std::vector<int32_t> P(nRed), Q(nRed);
+    for (int64_t i = 0; i < nRed; ++i) {
+        P[i] = static_cast<int32_t>(Q64[i]);
+        Q[i] = static_cast<int32_t>(P64[i]);
+    }
+
+    // Build sorted CSR factors L_csr = U_klu^T * D^{-1} (unit diagonal) and U_csr = D * L_klu^T
+    std::vector<double>                     diagD(nRed, 1.0);
+    std::vector<int32_t>                    csrRowPtrL(nRed + 1, 0), csrColIndL(unz, 0);
+    std::vector<double>                     csrValL(unz, 0.0);
+    std::vector<std::pair<int32_t, double>> rowBuf;
+    for (int64_t r = 0; r < nRed; ++r) {
+        const int64_t kStart = Up64[r];
+        const int64_t kEnd   = Up64[r + 1];
+        csrRowPtrL[r]        = static_cast<int32_t>(kStart);
+        rowBuf.clear();
+        for (int64_t k = kStart; k < kEnd; ++k) {
+            rowBuf.emplace_back(static_cast<int32_t>(Ui64[k]), Ux[k]);
+        }
+        std::sort(rowBuf.begin(), rowBuf.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (rowBuf.empty() || rowBuf.back().first != static_cast<int32_t>(r) || rowBuf.back().second == 0.0) {
+            return false;
+        }
+        diagD[r] = rowBuf.back().second;
+        for (size_t idx = 0; idx < rowBuf.size(); ++idx) {
+            const int32_t col        = rowBuf[idx].first;
+            csrColIndL[kStart + idx] = col;
+            csrValL[kStart + idx]    = (col == static_cast<int32_t>(r)) ? 1.0 : (rowBuf[idx].second / diagD[col]);
+        }
+    }
+    csrRowPtrL[nRed] = static_cast<int32_t>(unz);
+
+    std::vector<int32_t> csrRowPtrU(nRed + 1, 0), csrColIndU(lnz, 0);
+    std::vector<double>  csrValU(lnz, 0.0);
+    for (int64_t r = 0; r < nRed; ++r) {
+        const int64_t kStart = Lp64[r];
+        const int64_t kEnd   = Lp64[r + 1];
+        csrRowPtrU[r]        = static_cast<int32_t>(kStart);
+        rowBuf.clear();
+        for (int64_t k = kStart; k < kEnd; ++k) {
+            rowBuf.emplace_back(static_cast<int32_t>(Li64[k]), Lx[k]);
+        }
+        std::sort(rowBuf.begin(), rowBuf.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (rowBuf.empty() || rowBuf.front().first != static_cast<int32_t>(r)) { return false; }
+        const double dR = diagD[r];
+        for (size_t idx = 0; idx < rowBuf.size(); ++idx) {
+            csrColIndU[kStart + idx] = rowBuf[idx].first;
+            csrValU[kStart + idx]    = rowBuf[idx].second * dR;
+        }
+    }
+    csrRowPtrU[nRed] = static_cast<int32_t>(lnz);
+
+    std::vector<int32_t> csrRowPtrA(nRed + 1), csrColIndA(nnzA);
+    for (int64_t r = 0; r <= nRed; ++r) { csrRowPtrA[r] = static_cast<int32_t>(nodalRp_[r]); }
+    for (int64_t k = 0; k < nnzA; ++k) { csrColIndA[k] = static_cast<int32_t>(nodalCi_[k]); }
+
+    std::vector<GpuTxLine>      gpuTxLines(txlines_.size());
+    std::vector<GpuTxHistEntry> gpuTxHist;
+    int32_t                     histOff = 0;
+    int64_t                     kMin    = simSize_ > 0 ? simSize_ : 1;
+    for (size_t idx = 0; idx < txlines_.size(); ++idx) {
+        const auto& tx   = txlines_[idx];
+        GpuTxLine&  gtx  = gpuTxLines[idx];
+        gtx.z0           = tx.netlistInfo.value_;
+        gtx.k            = tx.timestepDelay_;
+        gtx.fracDelay    = tx.fracDelay_;
+        gtx.loadedSteps  = tx.loadedSteps_;
+        gtx.histOffset   = histOff;
+        gtx.histSize     = static_cast<int32_t>(tx.histSize_);
+        histOff         += gtx.histSize;
+        if (tx.timestepDelay_ < kMin) { kMin = tx.timestepDelay_; }
+        for (const auto& h : tx.hist_) { gpuTxHist.push_back({h.v1, h.v2, h.i1, h.i2}); }
+    }
+    if (txlines_.empty()) {
+        windowSize_ = std::max<int64_t>(1, std::min<int64_t>(simSize_, 1024));
+    } else {
+        windowSize_ = std::max<int64_t>(1, std::min<int64_t>(simSize_, std::min<int64_t>(kMin, 256)));
+    }
+
+    std::vector<double> xInit(static_cast<size_t>(N), 0.0);
+    for (int64_t origR = 0; origR < N; ++origR) { xInit[nodalPermToSolver_[origR]] = x_[origR]; }
+
+    cudaSolver_   = std::make_unique<CudaPartitionSolver>();
+    const bool ok = cudaSolver_->initialize_monolithic_full(static_cast<int32_t>(N),
+                                                            static_cast<int32_t>(mObj.sourcegen.size()),
+                                                            static_cast<int32_t>(windowSize_),
+                                                            static_cast<int32_t>(nodalRelTraces_.size()),
+                                                            static_cast<int32_t>(numKeptSteps_),
+                                                            simSize_,
+                                                            stepSize_,
+                                                            (atyp_ == AnalysisType::Voltage) ? 0 : 1,
+                                                            csrRowPtrA,
+                                                            csrColIndA,
+                                                            nodalNz_,
+                                                            csrRowPtrL,
+                                                            csrColIndL,
+                                                            csrValL,
+                                                            csrRowPtrU,
+                                                            csrColIndU,
+                                                            csrValU,
+                                                            P,
+                                                            Q,
+                                                            xInit,
+                                                            nodalJJs_,
+                                                            nodalRess_,
+                                                            nodalInds_,
+                                                            nodalMuts_,
+                                                            nodalCaps_,
+                                                            nodalVSs_,
+                                                            nodalPSs_,
+                                                            nodalCSs_,
+                                                            nodalCCVSs_,
+                                                            nodalVCCSs_,
+                                                            nodalTxHalves_,
+                                                            gpuTxLines,
+                                                            gpuTxHist,
+                                                            nodalRelTraces_,
+                                                            keptSlot_,
+                                                            nodalNRed_);
+    if (!ok) {
+        cudaSolver_.reset();
+        return false;
+    }
+    if (verb_ >= 1) {
+        std::cout << "JoSIM: Initialized CUDA Tier 4 Schur-Complement Nodal Solver (cuSolverRF, N = " << N
+                  << " -> N_red = " << nRed << ", nnz(L+U) = " << (lnz + unz) << ", window W = " << windowSize_
+                  << ")\n";
+    }
+    return true;
+#else
+    (void) mObj;
+    return false;
+#endif
+}
+
 void Simulation::factorize_lu(Matrix& mObj) {
 #ifdef SLU
     lu.create_matrix(mObj.rp.size() - 1, mObj.nz, mObj.ci, mObj.rp);
@@ -1659,6 +2390,30 @@ void Simulation::factorize_lu(Matrix& mObj) {
                     = klu_l_factor(&part.rp.front(), &part.ci.front(), &part.nz.front(), part.symbolic, &part.common);
         }
     } else {
+        bool needsMnaStartup = loadStateFile_.has_value() || saveStateFile_.has_value() || hasJJThermalNoise_
+                               || hasResistorThermalNoise_ || (correctorIter_ > 0);
+        if (!needsMnaStartup && startup_) {
+            for (const auto& jj : jjs_) {
+                if (jj.model_.phiOff() != 0.0) {
+                    needsMnaStartup = true;
+                    break;
+                }
+            }
+            if (!needsMnaStartup) {
+                for (auto& src : mObj.sourcegen) {
+                    if (src.value(-stepSize_) != 0.0 || src.value(0.0) != 0.0) {
+                        needsMnaStartup = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (nodal_ && !needsMnaStartup) {
+#ifdef JOSIM_CUDA
+            if (gpu_ && gpuMode_ == 4 && setup_gpu_nodal(mObj)) { return; }
+#endif
+            if (!gpu_ && setup_cpu_nodal(mObj)) { return; }
+        }
         simOK_ = klu_l_defaults(&Common_);
         assert(simOK_);
         int64_t       maxRowDeg = 0;
@@ -1779,6 +2534,15 @@ void Simulation::free_lu() {
 #ifdef JOSIM_CUDA
     cudaSolver_.reset();
 #endif
+    if (SymbolicRed_) {
+        klu_l_free_symbolic(&SymbolicRed_, &CommonRed_);
+        SymbolicRed_ = nullptr;
+    }
+    if (NumericRed_) {
+        klu_l_free_numeric(&NumericRed_, &CommonRed_);
+        NumericRed_ = nullptr;
+    }
+    nodalActive_ = false;
     if (usePartitions_) {
         for (auto& part : partitions_) {
             if (part.symbolic) { klu_l_free_symbolic(&part.symbolic, &part.common); }
@@ -1787,8 +2551,14 @@ void Simulation::free_lu() {
         partitions_.clear();
         usePartitions_ = false;
     } else {
-        if (Symbolic_) { klu_l_free_symbolic(&Symbolic_, &Common_); }
-        if (Numeric_) { klu_l_free_numeric(&Numeric_, &Common_); }
+        if (Symbolic_) {
+            klu_l_free_symbolic(&Symbolic_, &Common_);
+            Symbolic_ = nullptr;
+        }
+        if (Numeric_) {
+            klu_l_free_numeric(&Numeric_, &Common_);
+            Numeric_ = nullptr;
+        }
     }
 #endif
 }
@@ -3323,6 +4093,663 @@ void Simulation::trans_sim_gpu_monolithic_full(Matrix& mObj) {
 #endif
 }
 
+void Simulation::trans_sim_gpu_nodal(Matrix& mObj) {
+#if defined(JOSIM_CUDA) && !defined(SLU)
+    results.timeAxis.clear();
+    results.timeAxis.reserve(static_cast<size_t>(numKeptSteps_));
+    for (int64_t i = 0; i < simSize_; ++i) {
+        if (keptSlot_[i] >= 0) { results.timeAxis.push_back(i * stepSize_); }
+    }
+
+    ProgressBar bar;
+    if (!minOut_) {
+        bar.create_thread();
+        bar.set_bar_width(30);
+        bar.fill_bar_progress_with("O");
+        bar.fill_bar_remainder_with(" ");
+        bar.set_status_text("Simulating (GPU Nodal)");
+        bar.set_total(static_cast<float>(simSize_));
+    }
+
+    const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
+    std::vector<double> h_srcWindow(static_cast<size_t>((windowSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
+
+    for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
+        if (!minOut_) { bar.update(static_cast<float>(i0)); }
+        const int64_t i1 = std::min<int64_t>(simSize_, i0 + windowSize_);
+        const int64_t w  = i1 - i0;
+
+        if (numSrc > 0) {
+            for (int64_t s = -2; s < w; ++s) {
+                const int64_t stepIdx = i0 + s;
+                const double  t       = (stepIdx >= 0) ? (stepIdx * stepSize_) : 0.0;
+                double*       row     = h_srcWindow.data() + (s + 2) * numSrc;
+                if (stepIdx >= 0) {
+                    for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) {
+                        row[srcIdx] = mObj.sourcegen[srcIdx].value(t);
+                    }
+                } else {
+                    std::fill(row, row + numSrc, 0.0);
+                }
+            }
+        }
+
+        if (!cudaSolver_->step_monolithic_full_window(i0, i1, numSrc > 0 ? h_srcWindow.data() : nullptr)) {
+            needsTR_ = true;
+            if (!minOut_) {
+                bar.complete();
+                std::cout << "\n";
+            }
+            return;
+        }
+    }
+
+    std::vector<double> h_traceOut;
+    std::vector<double> h_xFinal;
+    cudaSolver_->download_results(h_traceOut, h_xFinal);
+
+    const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
+    int64_t       traceSlot = 0;
+    if (!mObj.relevantTraces.empty()) {
+        for (int64_t globR : mObj.relevantIndices) {
+            if (globR >= 0 && globR < N) {
+                auto&         dst = *results.xVector[globR];
+                const double* src = h_traceOut.data() + traceSlot * numKeptSteps_;
+                dst.assign(src, src + numKeptSteps_);
+                if (numKeptSteps_ > 0) { x_[globR] = dst.back(); }
+                ++traceSlot;
+            }
+        }
+    } else {
+        for (int64_t globR = 0; globR < N; ++globR) {
+            if (results.xVector[globR]) {
+                auto&         dst = *results.xVector[globR];
+                const double* src = h_traceOut.data() + traceSlot * numKeptSteps_;
+                dst.assign(src, src + numKeptSteps_);
+                if (numKeptSteps_ > 0) { x_[globR] = dst.back(); }
+            }
+            ++traceSlot;
+        }
+    }
+
+    if (!minOut_) {
+        bar.complete();
+        std::cout << "\n";
+    }
+#else
+    (void) mObj;
+#endif
+}
+
+void Simulation::trans_sim_nodal(Matrix& mObj) {
+#ifndef SLU
+    results.timeAxis.clear();
+    results.timeAxis.reserve(useDecimation_ ? results.printIndices.size() * 3 : simSize_);
+    ProgressBar bar;
+    if (!minOut_) {
+        bar.create_thread();
+        bar.set_bar_width(30);
+        bar.fill_bar_progress_with("O");
+        bar.fill_bar_remainder_with(" ");
+        bar.set_status_text("Simulating (Nodal)");
+        bar.set_total(static_cast<float>(simSize_));
+    }
+
+    const int64_t                     N = static_cast<int64_t>(mObj.rp.size()) - 1;
+    std::vector<std::vector<double>*> traceTargets;
+    traceTargets.reserve(nodalRelTraces_.size());
+    if (!mObj.relevantTraces.empty()) {
+        for (int64_t globR : mObj.relevantIndices) {
+            if (globR >= 0 && globR < N) {
+                traceTargets.push_back(results.xVector[globR] ? &(*results.xVector[globR]) : nullptr);
+            }
+        }
+    } else {
+        for (int64_t globR = 0; globR < N; ++globR) {
+            traceTargets.push_back(results.xVector[globR] ? &(*results.xVector[globR]) : nullptr);
+        }
+    }
+
+    b_.assign(std::max<size_t>(mObj.rp.size(), x_.size()), 0.0);
+    auto read_nx = [&](int32_t idx) -> double {
+        if (idx >= 0) { return nodalX_[idx]; }
+        if (idx <= -2) { return nodalX_[-idx - 2]; }
+        return 0.0;
+    };
+
+    const int64_t nJJ  = static_cast<int64_t>(nodalJJs_.size());
+    const int64_t nRes = static_cast<int64_t>(nodalRess_.size());
+    const int64_t nInd = static_cast<int64_t>(nodalInds_.size());
+    const int64_t nCap = static_cast<int64_t>(nodalCaps_.size());
+    const int64_t nCS  = static_cast<int64_t>(nodalCSs_.size());
+    const int64_t nVS  = static_cast<int64_t>(nodalVSs_.size());
+    const int64_t nPS  = static_cast<int64_t>(nodalPSs_.size());
+    const int64_t nCC  = static_cast<int64_t>(nodalCCVSs_.size());
+    const int64_t nVC  = static_cast<int64_t>(nodalVCCSs_.size());
+    const int64_t nTH  = static_cast<int64_t>(nodalTxHalves_.size());
+
+    for (int64_t i = 0; i < simSize_; ++i) {
+        const double step       = i * stepSize_;
+        const bool   checkPhase = (static_cast<double>(i) / static_cast<double>(simSize_) > 0.01);
+        if (!minOut_) { bar.update(static_cast<float>(i)); }
+
+        std::fill(nodalB_.begin(), nodalB_.end(), 0.0);
+        bool stepNeedsTR  = false;
+        bool stepNeedsRLU = false;
+
+#ifdef _OPENMP
+        if (parallel_ && nJJ >= 16384) {
+            const int nThreads = std::min<int>(8, omp_get_max_threads());
+#pragma omp parallel for schedule(static) num_threads(nThreads) reduction(|| : stepNeedsTR, stepNeedsRLU)
+            for (int64_t jIdx = 0; jIdx < nJJ; ++jIdx) {
+                if (stepNeedsTR) { continue; }
+                GpuJJ& gj  = nodalJJs_[jIdx];
+                JJ&    jj  = jjs_[jIdx];
+                double pn1 = read_nx(gj.posIdx) - read_nx(gj.negIdx);
+                double vn1 = gj.vn1;
+                if (i > 0) {
+                    if (atyp_ == AnalysisType::Voltage) {
+                        vn1 = pn1;
+                        pn1 = gj.gVar * (pn1 - b_[gj.varIdx]);
+                    } else {
+                        vn1 = gj.gVar * (pn1 - b_[gj.varIdx]);
+                    }
+                }
+                gj.pn1            = pn1;
+                gj.vn1            = vn1;
+                const double v0   = (5.0 / 2.0) * vn1 - 2.0 * gj.vn2 + (1.0 / 2.0) * gj.vn3;
+                const double phi0 = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gj.pn2
+                                    + ((1.0 / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0)) * v0;
+                gj.phi0 = phi0;
+                if (checkPhase && std::abs(phi0 - pn1) > (0.20 * 2.0 * Constants::PI)) {
+                    stepNeedsTR = true;
+                    continue;
+                }
+                double bVar = 0.0;
+                if (atyp_ == AnalysisType::Voltage) {
+                    bVar = Constants::SIGMA
+                           * (-(2.0 / stepSize_) * pn1 + (1.0 / (2.0 * stepSize_)) * gj.pn2);
+                } else {
+                    bVar = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gj.pn2;
+                }
+                b_[gj.varIdx] = bVar;
+                gj.pn4        = gj.pn3;
+                gj.pn3        = gj.pn2;
+                gj.pn2        = pn1;
+                gj.vn6        = gj.vn5;
+                gj.vn5        = gj.vn4;
+                gj.vn4        = gj.vn3;
+                gj.vn3        = gj.vn2;
+                if (gj.rtype == 1 && jj.update_value(v0)) {
+                    const double newNz  = jj.matrixInfo.nonZeros_.back();
+                    const double oldG   = -gj.gScale / gj.curNzVal;
+                    const double newG   = -gj.gScale / newNz;
+                    const double deltaG = newG - oldG;
+                    gj.curNzVal         = newNz;
+                    if (gj.nzIdxPP >= 0) {
+#pragma omp atomic
+                        nodalNz_[gj.nzIdxPP] += deltaG;
+                    }
+                    if (gj.nzIdxQQ >= 0) {
+#pragma omp atomic
+                        nodalNz_[gj.nzIdxQQ] += deltaG;
+                    }
+                    if (gj.nzIdxPQ >= 0) {
+#pragma omp atomic
+                        nodalNz_[gj.nzIdxPQ] -= deltaG;
+                    }
+                    if (gj.nzIdxQP >= 0) {
+#pragma omp atomic
+                        nodalNz_[gj.nzIdxQP] -= deltaG;
+                    }
+                    stepNeedsRLU = true;
+                }
+                double ic_sin_phi = 0.0;
+                if (gj.cprLen == 1) {
+                    ic_sin_phi = gj.ic * (gj.cpr[0] * std::sin(phi0 - gj.phiOff));
+                } else {
+                    for (int harm = 0; harm < gj.cprLen; ++harm) {
+                        ic_sin_phi += gj.ic * (gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff)));
+                    }
+                }
+                double bCur = 0.0;
+                if (gj.tDep == 0) {
+                    bCur = gj.curNzVal
+                           * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
+                              + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                } else {
+                    double sin2_half_phi = 0.0;
+                    double sin_phi       = 0.0;
+                    for (int harm = 0; harm < gj.cprLen; ++harm) {
+                        sin2_half_phi += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff) / 2.0);
+                        sin_phi       += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff));
+                    }
+                    sin2_half_phi          = sin2_half_phi * sin2_half_phi;
+                    const double sqrt_part = std::sqrt(1.0 - gj.d * sin2_half_phi);
+                    bCur                   = gj.curNzVal
+                           * ((((Constants::PI * gj.del) / (2.0 * Constants::EV * gj.rn)) * (sin_phi / sqrt_part)
+                               * std::tanh(gj.del / (2.0 * Constants::BOLTZMANN * gj.t) * sqrt_part))
+                              - (((2.0 * gj.c) / stepSize_) * vn1) + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                }
+                b_[gj.curIdx]     = bCur;
+                gj.vn2            = vn1;
+                const double gCur = -1.0 / gj.curNzVal;
+                const double gJ   = gj.gScale * gCur;
+                const double jJJ  = (atyp_ == AnalysisType::Voltage) ? (gCur * bCur) : (gCur * bCur + gJ * bVar);
+                if (gj.posIdx >= 0) {
+#pragma omp atomic
+                    nodalB_[gj.posIdx] += jJJ;
+                }
+                if (gj.negIdx >= 0) {
+#pragma omp atomic
+                    nodalB_[gj.negIdx] -= jJJ;
+                }
+            }
+        } else
+#endif
+        {
+            for (int64_t jIdx = 0; jIdx < nJJ; ++jIdx) {
+                GpuJJ& gj  = nodalJJs_[jIdx];
+                JJ&    jj  = jjs_[jIdx];
+                double pn1 = read_nx(gj.posIdx) - read_nx(gj.negIdx);
+                double vn1 = gj.vn1;
+                if (i > 0) {
+                    if (atyp_ == AnalysisType::Voltage) {
+                        vn1 = pn1;
+                        pn1 = gj.gVar * (pn1 - b_[gj.varIdx]);
+                    } else {
+                        vn1 = gj.gVar * (pn1 - b_[gj.varIdx]);
+                    }
+                }
+                gj.pn1            = pn1;
+                gj.vn1            = vn1;
+                const double v0   = (5.0 / 2.0) * vn1 - 2.0 * gj.vn2 + (1.0 / 2.0) * gj.vn3;
+                const double phi0 = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gj.pn2
+                                    + ((1.0 / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0)) * v0;
+                gj.phi0 = phi0;
+                if (checkPhase && std::abs(phi0 - pn1) > (0.20 * 2.0 * Constants::PI)) {
+                    offendingJJ_ = jj.netlistInfo.label_;
+                    stepNeedsTR  = true;
+                    break;
+                }
+                double bVar = 0.0;
+                if (atyp_ == AnalysisType::Voltage) {
+                    bVar = Constants::SIGMA
+                           * (-(2.0 / stepSize_) * pn1 + (1.0 / (2.0 * stepSize_)) * gj.pn2);
+                } else {
+                    bVar = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gj.pn2;
+                }
+                b_[gj.varIdx] = bVar;
+                gj.pn4        = gj.pn3;
+                gj.pn3        = gj.pn2;
+                gj.pn2        = pn1;
+                gj.vn6        = gj.vn5;
+                gj.vn5        = gj.vn4;
+                gj.vn4        = gj.vn3;
+                gj.vn3        = gj.vn2;
+                if (gj.rtype == 1 && jj.update_value(v0)) {
+                    const double newNz  = jj.matrixInfo.nonZeros_.back();
+                    const double oldG   = -gj.gScale / gj.curNzVal;
+                    const double newG   = -gj.gScale / newNz;
+                    const double deltaG = newG - oldG;
+                    gj.curNzVal         = newNz;
+                    if (gj.nzIdxPP >= 0) { nodalNz_[gj.nzIdxPP] += deltaG; }
+                    if (gj.nzIdxQQ >= 0) { nodalNz_[gj.nzIdxQQ] += deltaG; }
+                    if (gj.nzIdxPQ >= 0) { nodalNz_[gj.nzIdxPQ] -= deltaG; }
+                    if (gj.nzIdxQP >= 0) { nodalNz_[gj.nzIdxQP] -= deltaG; }
+                    stepNeedsRLU = true;
+                }
+                double ic_sin_phi = 0.0;
+                if (gj.cprLen == 1) {
+                    ic_sin_phi = gj.ic * (gj.cpr[0] * std::sin(phi0 - gj.phiOff));
+                } else {
+                    for (int harm = 0; harm < gj.cprLen; ++harm) {
+                        ic_sin_phi += gj.ic * (gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff)));
+                    }
+                }
+                double bCur = 0.0;
+                if (gj.tDep == 0) {
+                    bCur = gj.curNzVal
+                           * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
+                              + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                } else {
+                    double sin2_half_phi = 0.0;
+                    double sin_phi       = 0.0;
+                    for (int harm = 0; harm < gj.cprLen; ++harm) {
+                        sin2_half_phi += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff) / 2.0);
+                        sin_phi       += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff));
+                    }
+                    sin2_half_phi          = sin2_half_phi * sin2_half_phi;
+                    const double sqrt_part = std::sqrt(1.0 - gj.d * sin2_half_phi);
+                    bCur                   = gj.curNzVal
+                           * ((((Constants::PI * gj.del) / (2.0 * Constants::EV * gj.rn)) * (sin_phi / sqrt_part)
+                               * std::tanh(gj.del / (2.0 * Constants::BOLTZMANN * gj.t) * sqrt_part))
+                              - (((2.0 * gj.c) / stepSize_) * vn1) + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                }
+                b_[gj.curIdx]     = bCur;
+                gj.vn2            = vn1;
+                const double gCur = -1.0 / gj.curNzVal;
+                const double gJ   = gj.gScale * gCur;
+                const double jJJ  = (atyp_ == AnalysisType::Voltage) ? (gCur * bCur) : (gCur * bCur + gJ * bVar);
+                if (gj.posIdx >= 0) { nodalB_[gj.posIdx] += jJJ; }
+                if (gj.negIdx >= 0) { nodalB_[gj.negIdx] -= jJJ; }
+            }
+        }
+
+        if (stepNeedsTR) {
+            needsTR_ = true;
+            if (!minOut_) {
+                bar.complete();
+                std::cout << "\n";
+            }
+            return;
+        }
+        if (stepNeedsRLU) {
+            int64_t ok = klu_l_refactor(
+                    nodalRp_.data(), nodalCi_.data(), nodalNz_.data(), SymbolicRed_, NumericRed_, &CommonRed_);
+            if (!ok) {
+                klu_l_free_numeric(&NumericRed_, &CommonRed_);
+                NumericRed_ = klu_l_factor(
+                        nodalRp_.data(), nodalCi_.data(), nodalNz_.data(), SymbolicRed_, &CommonRed_);
+            }
+        }
+
+        // Resistors (Phase mode)
+        if (atyp_ == AnalysisType::Phase) {
+            for (int64_t rIdx = 0; rIdx < nRes; ++rIdx) {
+                GpuRes&      gr   = nodalRess_[rIdx];
+                const double pn1  = read_nx(gr.posIdx) - read_nx(gr.negIdx);
+                const double bRes = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gr.pn2;
+                b_[gr.curIdx]     = bRes;
+                gr.pn2            = pn1;
+                gr.pn1            = pn1;
+                const double jRes = gr.g * bRes;
+                if (gr.posIdx >= 0) { nodalB_[gr.posIdx] += jRes; }
+                if (gr.negIdx >= 0) { nodalB_[gr.negIdx] -= jRes; }
+            }
+        }
+
+        // Inductors (Voltage mode)
+        if (atyp_ == AnalysisType::Voltage) {
+            const double h = stepSize_;
+            for (int64_t lIdx = 0; lIdx < nInd; ++lIdx) {
+                GpuInd&      gi    = nodalInds_[lIdx];
+                const double iPrev = (gi.g > 0.0) ? x_[gi.curIdx] : nodalX_[gi.curIdx];
+                double       bVal  = -(2.0 * gi.L / h) * iPrev + (gi.L / (2.0 * h)) * gi.In2;
+                if (gi.g > 0.0) {
+                    b_[gi.curIdx]     = bVal;
+                    const double jInd = gi.g * bVal;
+                    if (gi.posIdx >= 0) { nodalB_[gi.posIdx] += jInd; }
+                    if (gi.negIdx >= 0) { nodalB_[gi.negIdx] -= jInd; }
+                } else {
+                    for (int32_t m = gi.mutStart; m < gi.mutStart + gi.mutCount; ++m) {
+                        const GpuMut& gm    = nodalMuts_[m];
+                        const GpuInd& other = nodalInds_[gm.targetIndIdx];
+                        const double  oPrev = (other.g > 0.0) ? x_[other.curIdx] : nodalX_[other.curIdx];
+                        bVal               += -(2.0 * gm.M / h) * oPrev + (gm.M / (2.0 * h)) * other.In2;
+                    }
+                    nodalB_[gi.curIdx] = bVal;
+                }
+            }
+            for (int64_t lIdx = 0; lIdx < nInd; ++lIdx) {
+                GpuInd& gi = nodalInds_[lIdx];
+                gi.In4     = gi.In3;
+                gi.In3     = gi.In2;
+                gi.In2     = (gi.g > 0.0) ? x_[gi.curIdx] : nodalX_[gi.curIdx];
+            }
+        }
+
+        // Capacitors
+        for (int64_t cIdx = 0; cIdx < nCap; ++cIdx) {
+            GpuCap&      gc   = nodalCaps_[cIdx];
+            const double pn1  = read_nx(gc.posIdx) - read_nx(gc.negIdx);
+            double       bCap = 0.0;
+            if (atyp_ == AnalysisType::Voltage) {
+                bCap = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gc.pn2;
+            } else {
+                bCap = (8.0 / 3.0) * pn1 - (22.0 / 9.0) * gc.pn2 + (8.0 / 9.0) * gc.pn3 - (1.0 / 9.0) * gc.pn4;
+                gc.pn4 = gc.pn3;
+                gc.pn3 = gc.pn2;
+            }
+            gc.pn2            = pn1;
+            gc.pn1            = pn1;
+            b_[gc.curIdx]     = bCap;
+            const double jCap = gc.g * bCap;
+            if (gc.posIdx >= 0) { nodalB_[gc.posIdx] += jCap; }
+            if (gc.negIdx >= 0) { nodalB_[gc.negIdx] -= jCap; }
+        }
+
+        // Current Sources
+        for (int64_t cIdx = 0; cIdx < nCS; ++cIdx) {
+            const GpuCS& cs     = nodalCSs_[cIdx];
+            const double srcVal = mObj.sourcegen[cs.srcIdx].value(step);
+            if (cs.posIdx >= 0) { nodalB_[cs.posIdx] -= srcVal; }
+            if (cs.negIdx >= 0) { nodalB_[cs.negIdx] += srcVal; }
+        }
+
+        // Voltage Sources
+        for (int64_t vIdx = 0; vIdx < nVS; ++vIdx) {
+            GpuVS&       vs     = nodalVSs_[vIdx];
+            const double srcVal = mObj.sourcegen[vs.srcIdx].value(step);
+            if (atyp_ == AnalysisType::Voltage) {
+                nodalB_[vs.curIdx] = srcVal;
+            } else {
+                const double pn1   = read_nx(vs.posIdx) - read_nx(vs.negIdx);
+                nodalB_[vs.curIdx] = ((2.0 * stepSize_) / (3.0 * Constants::SIGMA)) * srcVal
+                                     + (4.0 / 3.0) * pn1 - (1.0 / 3.0) * vs.pn2;
+                vs.pn2 = pn1;
+                vs.pn1 = pn1;
+            }
+        }
+
+        // Phase Sources
+        for (int64_t pIdx = 0; pIdx < nPS; ++pIdx) {
+            const GpuPS& ps = nodalPSs_[pIdx];
+            const double s0 = mObj.sourcegen[ps.srcIdx].value(step);
+            if (atyp_ == AnalysisType::Phase) {
+                nodalB_[ps.curIdx] = s0;
+            } else {
+                if (i == 0) {
+                    nodalB_[ps.curIdx] = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0);
+                } else if (i == 1) {
+                    const double s1    = mObj.sourcegen[ps.srcIdx].value(0.0);
+                    nodalB_[ps.curIdx] = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0 - 2.0 * s1);
+                } else {
+                    const double s1    = mObj.sourcegen[ps.srcIdx].value((i - 1) * stepSize_);
+                    const double s2    = mObj.sourcegen[ps.srcIdx].value((i - 2) * stepSize_);
+                    nodalB_[ps.curIdx] = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0 - 2.0 * s1 + 0.5 * s2);
+                }
+            }
+        }
+
+        // CCVS & VCCS (Phase mode)
+        if (atyp_ == AnalysisType::Phase) {
+            for (int64_t idx = 0; idx < nCC; ++idx) {
+                GpuCCVS&     cc    = nodalCCVSs_[idx];
+                const double pn1   = read_nx(cc.posIdx) - read_nx(cc.negIdx);
+                nodalB_[cc.curIdx] = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * cc.pn2;
+                cc.pn2             = pn1;
+                cc.pn1             = pn1;
+            }
+            for (int64_t idx = 0; idx < nVC; ++idx) {
+                GpuVCCS&     vc    = nodalVCCSs_[idx];
+                const double pn1   = read_nx(vc.posIdx2) - read_nx(vc.negIdx2);
+                nodalB_[vc.curIdx] = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * vc.pn2;
+                vc.pn2             = pn1;
+                vc.pn1             = pn1;
+            }
+        }
+
+        // Transmission Lines
+        for (int64_t thIdx = 0; thIdx < nTH; ++thIdx) {
+            const GpuTxHalf& th      = nodalTxHalves_[thIdx];
+            const auto&      tx      = txlines_[th.txIdx];
+            const double     Z       = tx.netlistInfo.value_;
+            const int64_t    k       = tx.timestepDelay_;
+            const int64_t    hSize   = tx.histSize_;
+            const double     cZPhi   = (Z / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0);
+            const auto&      hist    = tx.hist_;
+            const double     alpha   = tx.fracDelay_;
+            const double     oma     = 1.0 - alpha;
+            const int64_t    effStep = tx.loadedSteps_ + i;
+            double           rem     = 0.0;
+            if (effStep >= k) {
+                const int64_t m = effStep - k;
+                if (alpha > 0.0) {
+                    auto interp_v1 = [&](int64_t idx) -> double {
+                        if (idx < 0) { return 0.0; }
+                        const double s0 = hist[idx % hSize].v1;
+                        const double s1 = (idx >= 1) ? hist[(idx - 1) % hSize].v1 : 0.0;
+                        return oma * s0 + alpha * s1;
+                    };
+                    auto interp_v2 = [&](int64_t idx) -> double {
+                        if (idx < 0) { return 0.0; }
+                        const double s0 = hist[idx % hSize].v2;
+                        const double s1 = (idx >= 1) ? hist[(idx - 1) % hSize].v2 : 0.0;
+                        return oma * s0 + alpha * s1;
+                    };
+                    auto interp_i1 = [&](int64_t idx) -> double {
+                        if (idx < 0) { return 0.0; }
+                        const double s0 = hist[idx % hSize].i1;
+                        const double s1 = (idx >= 1) ? hist[(idx - 1) % hSize].i1 : 0.0;
+                        return oma * s0 + alpha * s1;
+                    };
+                    auto interp_i2 = [&](int64_t idx) -> double {
+                        if (idx < 0) { return 0.0; }
+                        const double s0 = hist[idx % hSize].i2;
+                        const double s1 = (idx >= 1) ? hist[(idx - 1) % hSize].i2 : 0.0;
+                        return oma * s0 + alpha * s1;
+                    };
+                    if (th.isPort2 == 0) {
+                        const double nk_2 = interp_v2(m);
+                        const double I2nk = interp_i2(m);
+                        if (atyp_ == AnalysisType::Voltage) {
+                            rem = Z * I2nk + nk_2;
+                        } else {
+                            rem = cZPhi * I2nk + nk_2 - (4.0 / 3.0) * interp_v2(m - 1)
+                                  + (1.0 / 3.0) * interp_v2(m - 2);
+                        }
+                    } else {
+                        const double nk_1 = interp_v1(m);
+                        const double I1nk = interp_i1(m);
+                        if (atyp_ == AnalysisType::Voltage) {
+                            rem = Z * I1nk + nk_1;
+                        } else {
+                            rem = cZPhi * I1nk + nk_1 - (4.0 / 3.0) * interp_v1(m - 1)
+                                  + (1.0 / 3.0) * interp_v1(m - 2);
+                        }
+                    }
+                } else {
+                    const auto& h_k = hist[m % hSize];
+                    if (th.isPort2 == 0) {
+                        if (atyp_ == AnalysisType::Voltage) {
+                            rem = Z * h_k.i2 + h_k.v2;
+                        } else if (effStep == k) {
+                            rem = cZPhi * h_k.i2 + h_k.v2;
+                        } else if (effStep == k + 1) {
+                            rem = cZPhi * h_k.i2 + h_k.v2 - (4.0 / 3.0) * hist[(m - 1) % hSize].v2;
+                        } else {
+                            rem = cZPhi * h_k.i2 + h_k.v2 - (4.0 / 3.0) * hist[(m - 1) % hSize].v2
+                                  + (1.0 / 3.0) * hist[(m - 2) % hSize].v2;
+                        }
+                    } else {
+                        if (atyp_ == AnalysisType::Voltage) {
+                            rem = Z * h_k.i1 + h_k.v1;
+                        } else if (effStep == k) {
+                            rem = cZPhi * h_k.i1 + h_k.v1;
+                        } else if (effStep == k + 1) {
+                            rem = cZPhi * h_k.i1 + h_k.v1 - (4.0 / 3.0) * hist[(m - 1) % hSize].v1;
+                        } else {
+                            rem = cZPhi * h_k.i1 + h_k.v1 - (4.0 / 3.0) * hist[(m - 1) % hSize].v1
+                                  + (1.0 / 3.0) * hist[(m - 2) % hSize].v1;
+                        }
+                    }
+                }
+            }
+            double bTx = rem;
+            if (atyp_ == AnalysisType::Phase) { bTx += (4.0 / 3.0) * th.n1 - (1.0 / 3.0) * th.n2; }
+            b_[th.curIdx]    = bTx;
+            const double jTx = th.g * bTx;
+            if (th.posIdx >= 0) { nodalB_[th.posIdx] += jTx; }
+            if (th.negIdx >= 0) { nodalB_[th.negIdx] -= jTx; }
+        }
+
+        // Solve reduced system A_red * x_red = b_red
+        std::copy(nodalB_.begin(), nodalB_.end(), nodalX_.begin());
+        simOK_ = klu_l_tsolve(SymbolicRed_, NumericRed_, nodalNRed_, 1, nodalX_.data(), &CommonRed_);
+        if (!simOK_) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+
+        // Reconstruct eliminated uncoupled inductor currents in Voltage mode
+        if (atyp_ == AnalysisType::Voltage) {
+            for (int64_t lIdx = 0; lIdx < nInd; ++lIdx) {
+                const GpuInd& gi = nodalInds_[lIdx];
+                if (gi.g > 0.0) {
+                    const double vDiff = read_nx(gi.posIdx) - read_nx(gi.negIdx);
+                    x_[gi.curIdx]      = gi.g * (vDiff - b_[gi.curIdx]);
+                }
+            }
+        }
+
+        // Record transmission line history and update port state
+        for (int64_t thIdx = 0; thIdx < nTH; ++thIdx) {
+            GpuTxHalf&    th    = nodalTxHalves_[thIdx];
+            auto&         tx    = txlines_[th.txIdx];
+            const double  vPort = read_nx(th.posIdx) - read_nx(th.negIdx);
+            const double  iPort = th.g * (vPort - b_[th.curIdx]);
+            const int64_t slot  = (tx.loadedSteps_ + i) % tx.histSize_;
+            if (th.isPort2 == 0) {
+                tx.hist_[slot].v1 = vPort;
+                tx.hist_[slot].i1 = iPort;
+            } else {
+                tx.hist_[slot].v2 = vPort;
+                tx.hist_[slot].i2 = iPort;
+            }
+            if (atyp_ == AnalysisType::Phase) {
+                th.n2 = th.n1;
+                th.n1 = vPort;
+            }
+        }
+
+        // Store kept outputs
+        if (!useDecimation_ || keepStep_[i] != 0) {
+            for (size_t tIdx = 0; tIdx < nodalRelTraces_.size(); ++tIdx) {
+                if (!traceTargets[tIdx]) { continue; }
+                const GpuRelTrace& tr  = nodalRelTraces_[tIdx];
+                double             val = 0.0;
+                if (tr.traceType == 0) {
+                    val = (tr.localAbsIdx >= 0 && tr.localAbsIdx < nodalNRed_) ? nodalX_[tr.localAbsIdx] : 0.0;
+                } else {
+                    const double vDiff = read_nx(tr.posIdx) - read_nx(tr.negIdx);
+                    if (tr.traceType == 1) {
+                        const GpuJJ& jj = nodalJJs_[tr.jjIdx];
+                        val             = jj.gVar * (vDiff - b_[jj.varIdx]);
+                    } else if (tr.traceType == 2) {
+                        const GpuJJ& jj   = nodalJJs_[tr.jjIdx];
+                        const double gCur = -1.0 / jj.curNzVal;
+                        const double gJ   = jj.gScale * gCur;
+                        const double jJJ  = (atyp_ == AnalysisType::Voltage)
+                                                    ? (gCur * b_[jj.curIdx])
+                                                    : (gCur * b_[jj.curIdx] + gJ * b_[jj.varIdx]);
+                        val               = gJ * vDiff - jJJ;
+                    } else if (tr.traceType == 3) {
+                        val = tr.gBranch * (vDiff - b_[tr.localAbsIdx]);
+                    }
+                }
+                traceTargets[tIdx]->emplace_back(val);
+            }
+            results.timeAxis.emplace_back(step);
+        }
+    }
+
+    if (!minOut_) {
+        bar.complete();
+        std::cout << "\n";
+    }
+#else
+    (void) mObj;
+#endif
+}
+
 void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
 #ifndef SLU
     results.timeAxis.clear();
@@ -3355,8 +4782,19 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
     std::vector<double> txRem1(static_cast<size_t>(std::max<int64_t>(1, numTx) * windowSize_), 0.0);
     std::vector<double> txRem2(static_cast<size_t>(std::max<int64_t>(1, numTx) * windowSize_), 0.0);
 
+    std::vector<std::vector<double>> partBLast;
+    std::vector<uint8_t>             partHasLast;
+    int64_t                          totalBypassedSolves = 0;
+    if (bypass_) {
+        partBLast.resize(static_cast<size_t>(nParts));
+        partHasLast.assign(static_cast<size_t>(nParts), 0);
+        for (int64_t p = 0; p < nParts; ++p) {
+            partBLast[p].assign(static_cast<size_t>(partitions_[p].n), 0.0);
+        }
+    }
+
 #ifdef _OPENMP
-    const int nThreads = std::min<int>(omp_get_max_threads(), static_cast<int>(nParts));
+    const int nThreads = std::min<int>(16, std::min<int>(omp_get_max_threads(), static_cast<int>(nParts)));
 #endif
 
     for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
@@ -3383,7 +4821,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
         // 2. Precompute delayed remote port contributions for all transmission lines across [i0, i1)
         if (numTx > 0) {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (numTx * w >= 256)
+#pragma omp parallel for schedule(static) num_threads(nThreads) if (numTx * w >= 4096)
 #endif
             for (int64_t txIdx = 0; txIdx < numTx; ++txIdx) {
                 const auto&   tx      = txlines_[txIdx];
@@ -3472,7 +4910,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
         bool windowNeedsTR = false;
         bool windowSingErr = false;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) reduction(|| : windowNeedsTR, windowSingErr)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) reduction(|| : windowNeedsTR, windowSingErr) reduction(+ : totalBypassedSolves)
 #endif
         for (int64_t p = 0; p < nParts; ++p) {
             auto& part = partitions_[p];
@@ -3480,6 +4918,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
                 if (windowNeedsTR || windowSingErr) { break; }
                 const int64_t i          = i0 + s;
                 const bool    checkPhase = (static_cast<double>(i) / static_cast<double>(simSize_) > 0.01);
+                double        maxJJV0    = 0.0;
 
                 for (int64_t globR : part.globalRows) { b_[globR] = 0.0; }
 
@@ -3505,6 +4944,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
                         }
                     }
                     const double v0 = (5.0 / 2.0) * temp.vn1_ - 2.0 * temp.vn2_ + (1.0 / 2.0) * temp.vn3_;
+                    maxJJV0         = std::max(maxJJV0, std::abs(v0));
                     temp.phi0_      = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_
                                  + ((1.0 / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0)) * v0;
                     if (checkPhase && std::abs(temp.phi0_ - temp.pn1_) > (0.20 * 2.0 * Constants::PI)) {
@@ -3590,6 +5030,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
                                                     &part.common);
                     }
                     part.needsLU = false;
+                    if (bypass_) { partHasLast[p] = 0; }
                 }
 
                 // Current Sources
@@ -3778,14 +5219,35 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
                     }
                 }
 
-                // Partition KLU Solve
-                for (int64_t r = 0; r < part.n; ++r) { part.xLocal[r] = b_[part.globalRows[r]]; }
-                int64_t ok = klu_l_tsolve(part.symbolic, part.numeric, part.n, 1, part.xLocal.data(), &part.common);
-                if (!ok) {
-                    windowSingErr = true;
-                    break;
+                // Partition KLU Solve (with optional non-accumulating quiescent bypass)
+                bool doSolve = true;
+                if (bypass_) {
+                    auto& bLastP = partBLast[p];
+                    bool  sameB  = (partHasLast[p] != 0 && i > 2 && maxJJV0 <= bypassTol_);
+                    for (int64_t r = 0; r < part.n; ++r) {
+                        const double bVal = b_[part.globalRows[r]];
+                        part.xLocal[r]    = bVal;
+                        if (sameB && std::abs(bVal - bLastP[r]) > bypassTol_) { sameB = false; }
+                    }
+                    if (sameB) {
+                        doSolve = false;
+                        ++totalBypassedSolves;
+                    } else {
+                        std::copy(part.xLocal.begin(), part.xLocal.end(), bLastP.begin());
+                        partHasLast[p] = 1;
+                    }
+                } else {
+                    for (int64_t r = 0; r < part.n; ++r) { part.xLocal[r] = b_[part.globalRows[r]]; }
                 }
-                for (int64_t r = 0; r < part.n; ++r) { x_[part.globalRows[r]] = part.xLocal[r]; }
+                if (doSolve) {
+                    int64_t ok = klu_l_tsolve(
+                            part.symbolic, part.numeric, part.n, 1, part.xLocal.data(), &part.common);
+                    if (!ok) {
+                        windowSingErr = true;
+                        break;
+                    }
+                    for (int64_t r = 0; r < part.n; ++r) { x_[part.globalRows[r]] = part.xLocal[r]; }
+                }
 
                 // Record completed step i into transmission line circular history and shift local port state
                 for (int64_t tIdx : part.txPort1Indices) {
@@ -3845,6 +5307,15 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
             }
             return;
         }
+    }
+
+    if (bypass_ && !minOut_) {
+        const double pct = (nParts * simSize_ > 0)
+                                   ? (100.0 * static_cast<double>(totalBypassedSolves)
+                                      / static_cast<double>(nParts * simSize_))
+                                   : 0.0;
+        std::cout << "JoSIM: Quiescent partition bypass skipped " << totalBypassedSolves << " / "
+                  << (nParts * simSize_) << " partition KLU solves (" << pct << "%)\n";
     }
 
     // Sync device states back to mObj.components.devices for callers that reuse mObj (e.g. IV)
@@ -3934,7 +5405,16 @@ void Simulation::trans_sim(Matrix& mObj) {
     }
 #ifdef JOSIM_CUDA
     if (gpu_) {
-        if (gpuMode_ == 3) {
+        if (gpuMode_ == 4) {
+            if (setup_gpu_nodal(mObj) && cudaSolver_) {
+                trans_sim_gpu_nodal(mObj);
+                return;
+            }
+            if (setup_cpu_nodal(mObj) && SymbolicRed_ && NumericRed_) {
+                trans_sim_nodal(mObj);
+                return;
+            }
+        } else if (gpuMode_ == 3) {
             if (setup_gpu_monolithic_full(mObj) && cudaSolver_) {
                 trans_sim_gpu_monolithic_full(mObj);
                 return;
@@ -3952,6 +5432,10 @@ void Simulation::trans_sim(Matrix& mObj) {
             const int64_t N      = static_cast<int64_t>(mObj.rp.size()) - 1;
             const int64_t luNnz  = (Numeric_ != nullptr) ? (Numeric_->lnz + Numeric_->unz) : 0;
             const bool    mesh2D = (N >= 10000 && luNnz >= 10 * N && luNnz >= 200000);
+            if (mesh2D && setup_gpu_nodal(mObj) && cudaSolver_) {
+                trans_sim_gpu_nodal(mObj);
+                return;
+            }
             if (mesh2D && setup_gpu_monolithic_full(mObj) && cudaSolver_) {
                 trans_sim_gpu_monolithic_full(mObj);
                 return;
@@ -3963,6 +5447,10 @@ void Simulation::trans_sim(Matrix& mObj) {
         }
     }
 #endif
+    if (nodal_ && setup_cpu_nodal(mObj) && SymbolicRed_ && NumericRed_) {
+        trans_sim_nodal(mObj);
+        return;
+    }
     if (parallel_ && usePartitions_ && windowSize_ >= 2 && partitions_.size() >= 2 && !hasJJThermalNoise_
         && !hasResistorThermalNoise_ && correctorIter_ == 0 && !saveStateFile_.has_value()) {
         trans_sim_omp_windowed(mObj);
@@ -4093,12 +5581,12 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
     const int64_t nInd = (atyp_ == AnalysisType::Voltage) ? static_cast<int64_t>(inductors_.size()) : 0;
     const int64_t nCap = static_cast<int64_t>(capacitors_.size());
     if (parallel_ && !hasJJThermalNoise_ && !hasResistorThermalNoise_ && factor == 1.0
-        && (nJJ + nRes + nInd * 4 + nCap >= 4096)) {
+        && (nJJ + nRes + nInd * 4 + nCap >= 32768)) {
         const int64_t bSize        = static_cast<int64_t>(b_.size());
         const bool    checkPhase   = (static_cast<double>(i) / static_cast<double>(simSize_) > 0.01);
         bool          localNeedsTR = false;
         bool          localNeedsLU = false;
-        const int     nThreads     = std::min<int>(16, omp_get_max_threads());
+        const int     nThreads     = std::min<int>(8, omp_get_max_threads());
 
 #pragma omp parallel num_threads(nThreads) reduction(|| : localNeedsTR, localNeedsLU)
         {

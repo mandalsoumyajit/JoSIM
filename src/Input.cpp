@@ -353,9 +353,29 @@ void Input::parse_options_and_state_controls() {
                     argGpu     = true;
                     argGpuMode = 3;
                     argPar     = true;
+                } else if (tok == "GPU=4" || tok == "GPUNODAL" || tok == "GPUNODAL=1" || tok == "GPUNODAL=TRUE") {
+                    argGpu     = true;
+                    argGpuMode = 4;
+                    argPar     = true;
+                    argNodal   = true;
                 } else if (tok == "GPU=0" || tok == "GPU=FALSE") {
                     argGpu     = false;
                     argGpuMode = 0;
+                } else if (tok == "NODAL" || tok == "NODAL=1" || tok == "NODAL=TRUE") {
+                    argNodal = true;
+                } else if (tok == "NODAL=0" || tok == "NODAL=FALSE") {
+                    argNodal = false;
+                } else if (tok == "BYPASS" || tok == "BYPASS=1" || tok == "BYPASS=TRUE" || tok == "LATENCY"
+                           || tok == "LATENCY=1") {
+                    argBypass = true;
+                } else if (tok == "BYPASS=0" || tok == "BYPASS=FALSE" || tok == "LATENCY=0") {
+                    argBypass = false;
+                } else if (tok.rfind("BYPASSTOL=", 0) == 0) {
+                    argBypass    = true;
+                    argBypassTol = std::abs(parse_param(tok.substr(10), parameters));
+                } else if (tok.rfind("LATENCY=", 0) == 0) {
+                    argBypass    = true;
+                    argBypassTol = std::abs(parse_param(tok.substr(8), parameters));
                 } else if (tok.rfind("MC=", 0) == 0) {
                     argMcRuns = std::max<int64_t>(1, static_cast<int64_t>(parse_param(tok.substr(3), parameters)));
                 } else if (tok.rfind("BATCH=", 0) == 0) {

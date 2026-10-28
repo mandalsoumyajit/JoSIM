@@ -38,6 +38,9 @@ class Input {
     bool                                                         argPar          = false;
     bool                                                         argGpu          = false;
     int64_t                                                      argGpuMode      = 1;
+    bool                                                         argNodal        = false;
+    bool                                                         argBypass       = false;
+    double                                                       argBypassTol    = 1e-6;
     bool                                                         argFixedStep    = false;
     bool                                                         argWarnStep     = false;
     bool                                                         argTxInterp     = false;
@@ -59,6 +62,7 @@ class Input {
         argPar                     = cli_options.parallel;
         argGpu                     = cli_options.gpu;
         argGpuMode                 = cli_options.gpuMode;
+        argNodal                   = cli_options.nodal;
         argFixedStep               = cli_options.fixedStep;
         argCorrector               = cli_options.corrector;
         argMcRuns                  = cli_options.batchRuns;

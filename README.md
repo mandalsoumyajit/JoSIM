@@ -89,11 +89,13 @@ arr = load_josim_npy("output.npy")       # Zero-copy memory-mapped structured ar
   ```spice
   .option kcutoff=1e-3
   ```
-- **CUDA GPU & Multi-Step Windowed PTL / Monolithic `cuSolverRF` Solver (`-g [1|2|3]` / `--gpu[=1|2|3]`, `.option gpu[=1|2|3]`, `.option gpumono`, `.option cusolverrf`, `-p` / `--parallel`)**:
+- **CUDA GPU & Multi-Step Windowed PTL / Monolithic `cuSolverRF` / Schur-Complement Nodal Solver (`-g [1|2|3|4]` / `--gpu[=1|2|3|4]`, `.option gpu[=1|2|3|4]`, `.option gpumono`, `.option gpunodal`, `.option cusolverrf`, `-n` / `--nodal`, `.option nodal`, `.option bypass`, `-p` / `--parallel`)**:
   Build with `-DUSING_CUDA=ON -DUSING_OPENMP=ON` (`CMAKE_CUDA_ARCHITECTURES` automatically defaults to `"native"` on CMake $\ge 3.24$ across Volta, Turing, Ampere, Ada, Hopper, and Blackwell GPUs) to enable CUDA GPU acceleration:
   - **`-g` or `-g 1` (`.option gpu`)**: Unified Auto-Dispatcher — selects **Tier 1 Windowed PTL Block-Parallel Solver** when $P \ge 2$ partitions exist, **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver** on 2D/3D monolithic meshes ($\text{nnz}(L+U) \ge 10N$), and **Hybrid Device-GPU + Host-KLU Solver** on 1D monolithic chains.
   - **`-g 2` (`--gpu=2`, `.option gpu=2`)**: Forces the Hybrid Device-GPU + Host-KLU Monolithic Solver.
   - **`-g 3` (`--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`)**: Forces the **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver** (zero per-timestep PCIe transfers, achieving **`2.45x–4.21x` GPU speedup** on 0-PTL monolithic 2D Josephson junction arrays up to `65,536` JJs / `393,730` MNA equations).
+  - **`-n` (`--nodal`, `.option nodal`) & `-g 4` (`--gpu=4`, `.option gpu=4`, `.option gpunodal`)**: **Tier 4 Exact Schur-Complement Nodal Admittance Solver** on CPU (`-n`, `-p -n`) and GPU (`-g 4`). Analytically eliminates all diagonal internal branch equations (`JJ` `variableIndex_` and `currentIndex_`, `R`/`C`/uncoupled `L`/`T` branch currents, and grounded Dirichlet `V`/`P` sources) into the reduced Nodal Admittance matrix $A_{\text{red}}$ of dimension $N_{\text{red}} \ll N$ (**1.9x–6.0x smaller matrix**), reconstructing requested `.print` branch currents on the fly. Achieves **`1.59x–2.47x` single-core speedup** on monolithic production netlists (`xadd4`, `r10f1n`, `r5cal`), **`3.36x–4.37x` CPU speedup** on 2D JJ grids (`14kJJ–64kJJ`), and **`1.98x` faster GPU `cuSolverRF` refactoring/solving than Tier 3 (`-g 3`)** on 64k-JJ switching grids.
+  - **`.option bypass` (`.option bypasstol=<val>`, `.option latency=<val>`)**: Activity-driven quiescent partition bypass in the OpenMP windowed PTL solver (`Simulation::trans_sim_omp_windowed`).
 - **Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>` / `--batch=<N>`, `.option mc=<N>`, `.spread ... runs=<N>`, `.option mcall`)**:
   Executes `N` independent fabrication-variation trials simultaneously in a single run (parse-once, symbolic-once) across OpenMP CPU threads (`-p -b <N>`) or in a coalesced thread-per-trial CUDA GPU kernel (`-g -b <N>`), outputting Welford ensemble `<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, and `<Trace>_MAX` statistics (plus `<Trace>_MC0..MC{N-1}` with `.option mcall`) and a stdout **Monte Carlo Robustness Summary** table.
 
@@ -161,7 +163,23 @@ Reproducible via [`scripts/benchmark_tier3_exxact.py`](scripts/benchmark_tier3_e
 | **`PTL-512x30JTL-Phase`** | 512-Block PTL Network (`15,360` JJs, $P=512$) | `2.180 s` | `0.681 s` | `0.922 s` | *Partitioned* | **`0.150 s`** | 2.37x | — | **14.49x** |
 | **`PTL-800x30JTL-Phase`** | 800-Block PTL Network (`24,000` JJs, $P=800$) | `4.170 s` | `0.664 s` | `1.460 s` | *Partitioned* | **`0.300 s`** | 2.86x | — | **13.89x** |
 
-#### E. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
+#### E. Tier 4 Exact Schur-Complement Nodal Admittance Solver (`-n` CPU & `-g 4` GPU) on Production `spec2si-seeqc` & 2D Monolithic Grids (`BNL exxact`)
+
+Evaluated across the 6 production `spec2si-seeqc` superconducting IC benchmarks (`xadd4`, `r5cal`, `r10f1n`, `coupler`, `dff`, `adder`) and 2D monolithic switching Josephson junction grids (`14kJJ`, `25kJJ`, `64kJJ`):
+
+| Circuit | Full MNA ($N$) | Nodal ($N_{\text{red}}$) | Partitions ($P$) | Serial MNA | **CPU Nodal (`-n`)** | **OpenMP (`-p`)** | **OMP Nodal (`-p -n`)** | **GPU Tier 4 (`-g 4`)** | **Best Speedup** |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **`r5cal` (`spec2si`)** | 64,400 | **33,578** (`1.92x`) | 1 ($W=1$) | `218.69 s` | **`88.49 s`** | `218.50 s` | **`88.49 s`** | — | **`2.47x` (`-n` / `-p -n`)** |
+| **`r10f1n` (`spec2si`)** | 89,806 | **46,994** (`1.91x`) | 2 ($W=1$) | `79.05 s` | **`37.01 s`** | `78.90 s` | **`37.01 s`** | — | **`2.14x` (`-n` / `-p -n`)** |
+| **`xadd4` (`spec2si`)** | 31,813 | **16,393** (`1.94x`) | 1 ($W=1$) | `25.44 s` | **`15.95 s`** | `25.43 s` | **`15.95 s`** | — | **`1.59x` (`-n` / `-p -n`)** |
+| **`coupler` (`spec2si`)** | 38,826 | **15,372** (`2.53x`) | 464 ($W=420$) | `35.44 s` | **`18.92 s`** (`1.87x`) | **`4.70 s`** | **`4.70 s`** | — | **`7.53x` (`-p`)** |
+| **`adder` (`spec2si`)** | 47,425 | **20,450** (`2.32x`) | 583 ($W=3$) | `84.24 s` | **`46.84 s`** (`1.80x`) | **`23.36 s`** | **`23.36 s`** | — | **`3.61x` (`-p`)** |
+| **`dff` (`spec2si`)** | 504 | **230** (`2.19x`) | 1 ($W=1$) | `0.231 s` | **`0.157 s`** | `0.231 s` | **`0.157 s`** | — | **`1.47x` (`-n` / `-p -n`)** |
+| **`Mono-2D-Grid-14kJJ`** | 86,163 | **14,401** (`5.98x`) | 1 ($W=1$) | `4.636 s` | **`1.106 s`** (`4.19x`) | `3.981 s` | **`1.060 s`** | **`3.089 s`** (`1.50x`) | **`4.37x` (`-p -n`)** |
+| **`Mono-2D-Grid-25kJJ`** | 153,283 | **25,601** (`5.99x`) | 1 ($W=1$) | `8.882 s` | **`2.836 s`** (`3.13x`) | `8.375 s` | **`2.214 s`** | **`3.820 s`** (`2.32x`) | **`4.01x` (`-p -n`)** |
+| **`Mono-2D-Grid-64kJJ`** | 392,707 | **65,537** (`5.99x`) | 1 ($W=1$) | `29.037 s` | **`9.289 s`** (`3.13x`) | `26.890 s` | **`8.646 s`** | **`17.223 s`** (`1.69x`, `1.98x` vs `-g 3`) | **`3.36x` (`-p -n`)** |
+
+#### F. Upstream `v2.7` vs. Enhanced Single/Multi-Thread CPU Benchmark (WSL)
 
 Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_medium_large_wsl.sh) in WSL (`-O3` Release build with Ninja, comparing upstream `v2.7` / `02a34ee` against this enhanced version):
 
@@ -203,6 +221,8 @@ Reproducible via [`scripts/benchmark_medium_large_wsl.sh`](scripts/benchmark_med
 
 ## Changelog
 ### v2.8
+- Implemented **Tier 4 Exact Schur-Complement Nodal Admittance Solver** on CPU (`-n` / `--nodal`, `.option nodal`, `-p -n`) and GPU (`-g 4` / `--gpu=4`, `.option gpu=4`, `.option gpunodal`), plus **Activity-Driven Quiescent Partition Bypass** (`.option bypass`, `.option bypasstol=<val>`, `.option latency=<val>`) and NUMA-aware OpenMP partition scaling (`adder -p` `3.61x`), reducing matrix dimensions by **1.9x–6.0x** and achieving **1.59x–2.47x speedup** on monolithic production netlists (`xadd4`, `r10f1n`, `r5cal`) and **3.36x–4.37x speedup** on 2D JJ grids.
+- Implemented **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3` / `.option gpu=3` / `.option gpumono` / `.option cusolverrf`) & Unified GPU Auto-Dispatcher (`-g`)**, keeping the entire simulation loop in GPU VRAM with zero per-timestep PCIe transfers and achieving **2.45x–4.21x GPU speedup** on 0-PTL monolithic 2D Josephson junction grids (`14kJJ–64kJJ`).
 - Implemented **Tier 2 Batched GPU (`-g`) & Multi-Core OpenMP (`-p`) Monte Carlo (`.spread`) Robustness Solver** (`-b <N>` / `--batch=<N>`, `.option mc=<N>`, `.spread ... runs=<N>`, `.option mcall`, `JOSIM_SEED`), with hardware-adaptive CUDA block sizing across all NVIDIA GPU architectures (`advance_mc_coalesced_kernel`) and Welford online ensemble statistics (`<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`), achieving up to **31.11x OpenMP speedup** and **19.54x CUDA GPU speedup**.
 - Implemented **Tier 1 Multi-Step Windowed PTL Block-Parallel Solver** ("Exact Waveform Relaxation") for both **CUDA GPU (`-g` / `--gpu`, `.option gpu`, `-DUSING_CUDA=ON`)** and **Multi-Core OpenMP CPU (`-p` / `--parallel`, `-DUSING_OPENMP=ON`)**, achieving up to **27.15x OpenMP speedup** and **21.47x CUDA GPU speedup** on 131k-JJ PTL-interconnected circuits.
 - Added high-speed binary output formats: `.bin` (column-major `JOSIMBIN` float64), `.npy` (NumPy structured array), and `.rawb` (SPICE3 binary raw), along with Python loader [`scripts/josim_io.py`](scripts/josim_io.py).

@@ -27,9 +27,447 @@
 
 using namespace JoSIM;
 
+namespace {
+struct StreamTraceDesc {
+    std::string   name;
+    char          type      = 'T';
+    int64_t       fileIndex = -1;
+    int           mode      = 0; // 0 = time, 1 = diff(v1 - v2), 2 = direct(v1), 3 = bdf2_volt(v1 - v2), 4 = isrc
+    const double* v1        = nullptr;
+    const double* v2        = nullptr;
+    int64_t       srcIdx    = -1;
+};
+
+void eval_stream_col_range(const StreamTraceDesc& col,
+                           const int64_t*         resIdx,
+                           const double*          tPtr,
+                           double                 cBDF2,
+                           Matrix&                mObj,
+                           size_t                 rStart,
+                           size_t                 count,
+                           double*                out,
+                           size_t                 outStride) {
+    if (col.mode == 0) {
+        for (size_t r = 0; r < count; ++r) { out[r * outStride] = tPtr[resIdx[rStart + r]]; }
+    } else if (col.mode == 1) {
+        const double* p1 = col.v1;
+        const double* p2 = col.v2;
+        if (p1 && !p2) {
+            for (size_t r = 0; r < count; ++r) { out[r * outStride] = p1[resIdx[rStart + r]]; }
+        } else if (p1 && p2) {
+            for (size_t r = 0; r < count; ++r) {
+                const int64_t j    = resIdx[rStart + r];
+                out[r * outStride] = p1[j] - p2[j];
+            }
+        } else if (!p1 && p2) {
+            for (size_t r = 0; r < count; ++r) { out[r * outStride] = -p2[resIdx[rStart + r]]; }
+        } else {
+            for (size_t r = 0; r < count; ++r) { out[r * outStride] = 0.0; }
+        }
+    } else if (col.mode == 2) {
+        const double* p1 = col.v1;
+        if (p1) {
+            for (size_t r = 0; r < count; ++r) { out[r * outStride] = p1[resIdx[rStart + r]]; }
+        } else {
+            for (size_t r = 0; r < count; ++r) { out[r * outStride] = 0.0; }
+        }
+    } else if (col.mode == 3) {
+        const double* p1 = col.v1;
+        const double* p2 = col.v2;
+        if (p1 && !p2) {
+            for (size_t r = 0; r < count; ++r) {
+                const int64_t j  = resIdx[rStart + r];
+                const double  d0 = p1[j];
+                double        d1, d2;
+                if (j >= 2) {
+                    d1 = p1[j - 1];
+                    d2 = p1[j - 2];
+                } else if (j == 1) {
+                    d2 = d1 = p1[0];
+                } else {
+                    d2 = d1 = d0;
+                }
+                out[r * outStride] = cBDF2 * (d0 - (4.0 / 3.0) * d1 + (1.0 / 3.0) * d2);
+            }
+        } else {
+            for (size_t r = 0; r < count; ++r) {
+                const int64_t j      = resIdx[rStart + r];
+                const double  valin1 = p1 ? p1[j] : 0.0;
+                const double  valin2 = p2 ? p2[j] : 0.0;
+                double        valin1n1, valin1n2, valin2n1, valin2n2;
+                if (j >= 2) {
+                    valin1n2 = p1 ? p1[j - 2] : 0.0;
+                    valin1n1 = p1 ? p1[j - 1] : 0.0;
+                    valin2n2 = p2 ? p2[j - 2] : 0.0;
+                    valin2n1 = p2 ? p2[j - 1] : 0.0;
+                } else if (j == 1) {
+                    valin1n2 = valin1n1 = p1 ? p1[0] : 0.0;
+                    valin2n2 = valin2n1 = p2 ? p2[0] : 0.0;
+                } else {
+                    valin1n2 = valin1n1 = valin1;
+                    valin2n2 = valin2n1 = valin2;
+                }
+                out[r * outStride] = cBDF2
+                                     * ((valin1 - valin2) - (4.0 / 3.0) * (valin1n1 - valin2n1)
+                                        + (1.0 / 3.0) * (valin1n2 - valin2n2));
+            }
+        }
+    } else if (col.mode == 4) {
+        Function localSrc = mObj.sourcegen.at(col.srcIdx);
+        for (size_t r = 0; r < count; ++r) { out[r * outStride] = localSrc.value(tPtr[resIdx[rStart + r]]); }
+    }
+}
+
+void write_streamed_row_major(std::ofstream&                        outfile,
+                              const std::vector<StreamTraceDesc>&   cols,
+                              const std::vector<int64_t>&           tIndices,
+                              const std::vector<int64_t>&           result_indices,
+                              const std::vector<double>&            t,
+                              double                                cBDF2,
+                              Matrix&                               mObj,
+                              bool                                  useOpenMP) {
+    const size_t numCols = tIndices.size();
+    const size_t numRows = result_indices.size();
+    if (numCols == 0 || numRows == 0) { return; }
+
+    constexpr size_t R_TILE             = 64;
+    constexpr size_t C_TILE             = 8;
+    const size_t     targetChunkDoubles = 3 * 1024 * 1024; // ~24 MB chunk buffer
+    const size_t     rawRowsPerChunk    = std::max<size_t>(R_TILE, targetChunkDoubles / std::max<size_t>(1, numCols));
+    const size_t     rowsPerChunk       = std::min<size_t>(1024, ((rawRowsPerChunk + R_TILE - 1) / R_TILE) * R_TILE);
+    std::vector<double> chunkBuf(rowsPerChunk * numCols);
+
+    for (size_t rowStart = 0; rowStart < numRows; rowStart += rowsPerChunk) {
+        const size_t rowEnd  = std::min(numRows, rowStart + rowsPerChunk);
+        const size_t count   = rowEnd - rowStart;
+        const size_t nRTiles = (count + R_TILE - 1) / R_TILE;
+        const size_t nCTiles = (numCols + C_TILE - 1) / C_TILE;
+
+#ifdef _OPENMP
+        if (useOpenMP && count * numCols >= 32768) {
+            const int nThreads = std::min<int>(16, omp_get_max_threads());
+#pragma omp parallel for schedule(static) num_threads(nThreads)
+            for (int64_t rtIdx = 0; rtIdx < static_cast<int64_t>(nRTiles); ++rtIdx) {
+                const size_t rt   = static_cast<size_t>(rtIdx);
+                const size_t r0   = rt * R_TILE;
+                const size_t rCnt = std::min(R_TILE, count - r0);
+                double       tile[R_TILE * C_TILE];
+                for (size_t ct = 0; ct < nCTiles; ++ct) {
+                    const size_t c0   = ct * C_TILE;
+                    const size_t cCnt = std::min(C_TILE, numCols - c0);
+                    for (size_t dc = 0; dc < cCnt; ++dc) {
+                        eval_stream_col_range(cols[tIndices[c0 + dc]],
+                                              result_indices.data(),
+                                              t.data(),
+                                              cBDF2,
+                                              mObj,
+                                              rowStart + r0,
+                                              rCnt,
+                                              tile + dc,
+                                              C_TILE);
+                    }
+                    for (size_t r = 0; r < rCnt; ++r) {
+                        std::copy_n(&tile[r * C_TILE], cCnt, &chunkBuf[(r0 + r) * numCols + c0]);
+                    }
+                }
+            }
+        } else
+#endif
+        {
+            double tile[R_TILE * C_TILE];
+            for (size_t rt = 0; rt < nRTiles; ++rt) {
+                const size_t r0   = rt * R_TILE;
+                const size_t rCnt = std::min(R_TILE, count - r0);
+                for (size_t ct = 0; ct < nCTiles; ++ct) {
+                    const size_t c0   = ct * C_TILE;
+                    const size_t cCnt = std::min(C_TILE, numCols - c0);
+                    for (size_t dc = 0; dc < cCnt; ++dc) {
+                        eval_stream_col_range(cols[tIndices[c0 + dc]],
+                                              result_indices.data(),
+                                              t.data(),
+                                              cBDF2,
+                                              mObj,
+                                              rowStart + r0,
+                                              rCnt,
+                                              tile + dc,
+                                              C_TILE);
+                    }
+                    for (size_t r = 0; r < rCnt; ++r) {
+                        std::copy_n(&tile[r * C_TILE], cCnt, &chunkBuf[(r0 + r) * numCols + c0]);
+                    }
+                }
+            }
+        }
+
+        outfile.write(reinterpret_cast<const char*>(chunkBuf.data()),
+                      static_cast<std::streamsize>(count * numCols * sizeof(double)));
+    }
+}
+} // namespace
+
 Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
+    bool allBinaryFiles = (iObj.cli_output_file.has_value() || !iObj.output_files.empty());
+    auto is_bin_type    = [](FileOutputType ft) {
+        return ft == FileOutputType::Npy || ft == FileOutputType::Bin || ft == FileOutputType::RawBin;
+    };
+    if (iObj.cli_output_file && !is_bin_type(iObj.cli_output_file->type())) { allBinaryFiles = false; }
+    for (auto& f : iObj.output_files) {
+        if (!is_bin_type(f.type())) { allBinaryFiles = false; }
+    }
+
+    bool canStreamDirect = allBinaryFiles && (sObj.results.mcRuns <= 1) && (iObj.transSim.prfirwindow() <= 0.0)
+                           && !sObj.results.timeAxis.empty();
+    if (canStreamDirect && !mObj.relevantTraces.empty()) {
+        const size_t tSize = sObj.results.timeAxis.size();
+        for (const auto& tr : mObj.relevantTraces) {
+            const bool isJJ = (tr.deviceLabel.has_value() && tr.deviceLabel->size() > 3 && tr.deviceLabel->at(3) == 'B'
+                               && tr.variableIndex.has_value());
+            if (iObj.argAnal == AnalysisType::Voltage && tr.storageType == StorageType::Phase && !isJJ) {
+                canStreamDirect = false;
+                break;
+            }
+            if (tr.index1 && (!sObj.results.xVector[*tr.index1] || sObj.results.xVector[*tr.index1]->size() < tSize)) {
+                canStreamDirect = false;
+                break;
+            }
+            if (tr.index2 && (!sObj.results.xVector[*tr.index2] || sObj.results.xVector[*tr.index2]->size() < tSize)) {
+                canStreamDirect = false;
+                break;
+            }
+            if (tr.variableIndex
+                && (!sObj.results.xVector[*tr.variableIndex]
+                    || sObj.results.xVector[*tr.variableIndex]->size() < tSize)) {
+                canStreamDirect = false;
+                break;
+            }
+        }
+    }
+
+    if (canStreamDirect) {
+        const auto&          x    = sObj.results.xVector;
+        const auto&          t    = sObj.results.timeAxis;
+        const auto&          tran = iObj.transSim;
+        std::vector<int64_t> result_indices;
+        if (!sObj.results.printIndices.empty()) {
+            result_indices = sObj.results.printIndices;
+        } else {
+            for (size_t i = 0; i < t.size(); ++i) {
+                if (t[i] >= tran.prstart()) {
+                    result_indices.emplace_back(static_cast<int64_t>(i));
+                    break;
+                }
+            }
+            double next_print_point = tran.prstart() + tran.prstep();
+            if (!result_indices.empty()) {
+                for (size_t i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
+                    if (t[i] >= next_print_point) {
+                        result_indices.emplace_back(static_cast<int64_t>(i));
+                        next_print_point += tran.prstep();
+                    }
+                }
+            }
+        }
+
+        std::vector<StreamTraceDesc> cols;
+        cols.reserve(1 + (!mObj.relevantTraces.empty() ? mObj.relevantTraces.size() : mObj.nm.size()));
+        cols.push_back({"time", 'T', -1, 0, nullptr, nullptr, -1});
+        traces.emplace_back("time");
+        traces.back().type_ = 'T';
+
+        if (!mObj.relevantTraces.empty()) {
+            for (const auto& i : mObj.relevantTraces) {
+                StreamTraceDesc d;
+                d.name      = i.deviceLabel.value();
+                d.fileIndex = i.fIndex;
+                d.v1        = i.index1 ? x[*i.index1]->data() : nullptr;
+                d.v2        = i.index2 ? x[*i.index2]->data() : nullptr;
+                const double* vv = i.variableIndex ? x[*i.variableIndex]->data() : nullptr;
+                const bool    isJJ = (d.name.size() > 3 && d.name[3] == 'B' && vv != nullptr);
+                if (i.storageType == StorageType::Voltage) {
+                    d.type = 'V';
+                    if (iObj.argAnal == AnalysisType::Voltage) {
+                        d.mode = 1;
+                    } else if (isJJ) {
+                        d.mode = 2;
+                        d.v1   = vv;
+                    } else {
+                        d.mode = 3;
+                    }
+                } else if (i.storageType == StorageType::Phase) {
+                    d.type = 'P';
+                    if (iObj.argAnal == AnalysisType::Phase) {
+                        d.mode = 1;
+                    } else {
+                        d.mode = 2;
+                        d.v1   = vv;
+                    }
+                } else {
+                    d.type = 'I';
+                    if (d.name.size() > 3 && d.name[3] == 'I') {
+                        d.mode   = 4;
+                        d.srcIdx = i.sourceIndex.value();
+                    } else {
+                        d.mode = 2;
+                    }
+                }
+                cols.push_back(d);
+                traces.emplace_back(d.name);
+                traces.back().type_     = d.type;
+                traces.back().fileIndex = d.fileIndex;
+            }
+        } else {
+            for (const auto& nmEntry : mObj.nm) {
+                StreamTraceDesc d;
+                d.name      = (iObj.argAnal == AnalysisType::Voltage ? "V(" : "P(") + nmEntry.first + ")";
+                d.type      = (iObj.argAnal == AnalysisType::Voltage) ? 'V' : 'P';
+                d.fileIndex = -1;
+                d.mode      = 2;
+                d.v1        = x[nmEntry.second] ? x[nmEntry.second]->data() : nullptr;
+                cols.push_back(d);
+                traces.emplace_back(d.name);
+                traces.back().type_ = d.type;
+            }
+        }
+
+        const double cBDF2     = (3.0 * Constants::SIGMA) / (2.0 * tran.tstep());
+        const bool   useOpenMP = (iObj.argPar || iObj.argGpu);
+
+        auto stream_one_file = [&](const std::string& filename, FileOutputType outType, int64_t fIndex) {
+            std::vector<int64_t> tIndices = {0};
+            for (size_t i = 1; i < cols.size(); ++i) {
+                if (cols[i].fileIndex == fIndex || fIndex == -1) { tIndices.emplace_back(static_cast<int64_t>(i)); }
+            }
+            std::ofstream     outfile(filename, std::ios::out | std::ios::binary);
+            std::vector<char> ioBuf(4 * 1024 * 1024);
+            outfile.rdbuf()->pubsetbuf(ioBuf.data(), static_cast<std::streamsize>(ioBuf.size()));
+            if (!outfile.is_open()) {
+                Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
+                return;
+            }
+            if (cols.empty()) {
+                Errors::output_errors(OutputErrors::NOTHING_SPECIFIED);
+                return;
+            }
+            const size_t numCols = tIndices.size();
+            const size_t numRows = result_indices.size();
+
+            if (outType == FileOutputType::Npy) {
+                std::string dict = "{'descr': [";
+                for (size_t c = 0; c < numCols; ++c) {
+                    std::string name = cols[tIndices[c]].name;
+                    if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+                        name = name.substr(1, name.size() - 2);
+                    }
+                    std::string escaped;
+                    escaped.reserve(name.size());
+                    for (char ch : name) {
+                        if (ch == '\'' || ch == '\\') { escaped.push_back('\\'); }
+                        escaped.push_back(ch);
+                    }
+                    dict += "('" + escaped + "', '<f8')";
+                    if (c + 1 < numCols) { dict += ", "; }
+                }
+                dict += "], 'fortran_order': False, 'shape': (" + std::to_string(numRows) + ",), }";
+
+                const bool   useV2     = (10 + dict.size() + 1 > 65535);
+                const size_t prefixLen = useV2 ? 12 : 10;
+                const size_t rem       = (prefixLen + dict.size() + 1) % 64;
+                const size_t padLen    = (rem == 0) ? 0 : (64 - rem);
+                dict.append(padLen, ' ');
+                dict.push_back('\n');
+
+                const char magic[6] = {'\x93', 'N', 'U', 'M', 'P', 'Y'};
+                outfile.write(magic, 6);
+                if (!useV2) {
+                    const char     ver[2]  = {'\x01', '\x00'};
+                    const uint16_t hdrSize = static_cast<uint16_t>(dict.size());
+                    outfile.write(ver, 2);
+                    outfile.write(reinterpret_cast<const char*>(&hdrSize), sizeof(uint16_t));
+                } else {
+                    const char     ver[2]  = {'\x02', '\x00'};
+                    const uint32_t hdrSize = static_cast<uint32_t>(dict.size());
+                    outfile.write(ver, 2);
+                    outfile.write(reinterpret_cast<const char*>(&hdrSize), sizeof(uint32_t));
+                }
+                outfile.write(dict.data(), static_cast<std::streamsize>(dict.size()));
+
+                write_streamed_row_major(outfile, cols, tIndices, result_indices, t, cBDF2, mObj, useOpenMP);
+            } else if (outType == FileOutputType::RawBin) {
+                outfile << "Title: " << std::filesystem::path(filename).stem().string() << "\n";
+                std::time_t result = std::time(nullptr);
+                outfile << "Date: " << std::asctime(std::localtime(&result));
+                outfile << "Plotname: Transient Analysis\n";
+                outfile << "Flags: real\n";
+                outfile << "No. Variables: " << numCols << "\n";
+                outfile << "No. Points: " << numRows << "\n";
+                outfile << "Command: JoSIM v" << VERSION << "\n";
+                outfile << "Variables:\n";
+                outfile << " 0 time Seconds\n";
+                for (size_t i = 1; i < numCols; ++i) {
+                    std::string name = cols[tIndices[i]].name;
+                    name.erase(std::remove(name.begin(), name.end(), '\"'), name.end());
+                    const char tc = cols[tIndices[i]].type;
+                    if (tc == 'V') {
+                        outfile << " " << i << " " << name << " Voltage\n";
+                    } else if (tc == 'P') {
+                        outfile << " " << i << " " << name << " Phase\n";
+                    } else if (tc == 'I') {
+                        std::replace(name.begin(), name.end(), '|', '.');
+                        if (name.size() > 3) { name = name.substr(2, name.size() - 3); }
+                        outfile << " " << i << " " << name << "#branch Current\n";
+                    }
+                }
+                outfile << "Binary:\n";
+
+                write_streamed_row_major(outfile, cols, tIndices, result_indices, t, cBDF2, mObj, useOpenMP);
+            } else if (outType == FileOutputType::Bin) {
+                const uint64_t nC       = static_cast<uint64_t>(numCols);
+                const uint64_t nR       = static_cast<uint64_t>(numRows);
+                const uint32_t version  = 1;
+                const uint32_t flags    = 0;
+                const char     magic[8] = {'J', 'O', 'S', 'I', 'M', 'B', 'I', 'N'};
+
+                outfile.write(magic, 8);
+                outfile.write(reinterpret_cast<const char*>(&version), sizeof(uint32_t));
+                outfile.write(reinterpret_cast<const char*>(&flags), sizeof(uint32_t));
+                outfile.write(reinterpret_cast<const char*>(&nC), sizeof(uint64_t));
+                outfile.write(reinterpret_cast<const char*>(&nR), sizeof(uint64_t));
+
+                for (size_t c = 0; c < numCols; ++c) {
+                    const auto&    tr      = cols[tIndices[c]];
+                    const uint32_t nameLen = static_cast<uint32_t>(tr.name.size());
+                    outfile.write(reinterpret_cast<const char*>(&nameLen), sizeof(uint32_t));
+                    outfile.write(tr.name.data(), nameLen);
+                    outfile.write(&tr.type, 1);
+                }
+
+                std::vector<double>   colBuf(numRows);
+                const std::streamsize colBytes = static_cast<std::streamsize>(numRows * sizeof(double));
+                for (size_t c = 0; c < numCols; ++c) {
+                    eval_stream_col_range(
+                            cols[tIndices[c]], result_indices.data(), t.data(), cBDF2, mObj, 0, numRows, colBuf.data(), 1);
+                    outfile.write(reinterpret_cast<const char*>(colBuf.data()), colBytes);
+                }
+            }
+        };
+
+        if (iObj.cli_output_file) {
+            stream_one_file(iObj.cli_output_file->name(), iObj.cli_output_file->type(), -1);
+        }
+        if (!iObj.output_files.empty()) {
+            for (size_t i = 0; i < iObj.output_files.size(); ++i) {
+                stream_one_file(iObj.output_files[i].name(), iObj.output_files[i].type(), static_cast<int64_t>(i));
+            }
+        }
+        sObj.results.xVector.clear();
+        sObj.results.xVector.shrink_to_fit();
+        return;
+    }
+
     // Write the output in type agnostic format
     write_output(iObj, mObj, sObj);
+    sObj.results.xVector.clear();
+    sObj.results.xVector.shrink_to_fit();
     // Format the output into the relevant type
     if (iObj.cli_output_file) {
         const auto outType = iObj.cli_output_file.value().type();
@@ -826,15 +1264,27 @@ void Output::format_npy(const std::string& filename, bool argmin, int64_t fIndex
     std::vector<const double*> colPtrs(numCols);
     for (size_t c = 0; c < numCols; ++c) { colPtrs[c] = traces[tIndices[c]].data_.data(); }
 
-    const size_t        rowsPerChunk = std::max<size_t>(1, 32768 / std::max<size_t>(1, numCols));
+    constexpr size_t    R_TILE       = 64;
+    constexpr size_t    C_TILE       = 8;
+    const size_t        rawRows      = std::max<size_t>(R_TILE, (2 * 1024 * 1024) / std::max<size_t>(1, numCols));
+    const size_t        rowsPerChunk = std::min<size_t>(1024, ((rawRows + R_TILE - 1) / R_TILE) * R_TILE);
     std::vector<double> chunkBuf(rowsPerChunk * numCols);
+    double              tile[R_TILE * C_TILE];
     for (size_t rowStart = 0; rowStart < numRows; rowStart += rowsPerChunk) {
         const size_t rowEnd = std::min(numRows, rowStart + rowsPerChunk);
         const size_t count  = rowEnd - rowStart;
-        for (size_t r = 0; r < count; ++r) {
-            double*       dst = &chunkBuf[r * numCols];
-            const size_t  j   = rowStart + r;
-            for (size_t c = 0; c < numCols; ++c) { dst[c] = colPtrs[c][j]; }
+        for (size_t r0 = 0; r0 < count; r0 += R_TILE) {
+            const size_t rCnt = std::min(R_TILE, count - r0);
+            for (size_t c0 = 0; c0 < numCols; c0 += C_TILE) {
+                const size_t cCnt = std::min(C_TILE, numCols - c0);
+                for (size_t dc = 0; dc < cCnt; ++dc) {
+                    const double* src = colPtrs[c0 + dc] + rowStart + r0;
+                    for (size_t r = 0; r < rCnt; ++r) { tile[r * C_TILE + dc] = src[r]; }
+                }
+                for (size_t r = 0; r < rCnt; ++r) {
+                    std::copy_n(&tile[r * C_TILE], cCnt, &chunkBuf[(r0 + r) * numCols + c0]);
+                }
+            }
         }
         outfile.write(reinterpret_cast<const char*>(chunkBuf.data()),
                       static_cast<std::streamsize>(count * numCols * sizeof(double)));
@@ -887,15 +1337,27 @@ void Output::format_raw_bin(const std::string& filename, bool argmin, int64_t fI
     std::vector<const double*> colPtrs(numCols);
     for (size_t c = 0; c < numCols; ++c) { colPtrs[c] = traces[tIndices[c]].data_.data(); }
 
-    const size_t        rowsPerChunk = std::max<size_t>(1, 32768 / std::max<size_t>(1, numCols));
+    constexpr size_t    R_TILE       = 64;
+    constexpr size_t    C_TILE       = 8;
+    const size_t        rawRows      = std::max<size_t>(R_TILE, (2 * 1024 * 1024) / std::max<size_t>(1, numCols));
+    const size_t        rowsPerChunk = std::min<size_t>(1024, ((rawRows + R_TILE - 1) / R_TILE) * R_TILE);
     std::vector<double> chunkBuf(rowsPerChunk * numCols);
+    double              tile[R_TILE * C_TILE];
     for (size_t rowStart = 0; rowStart < numRows; rowStart += rowsPerChunk) {
         const size_t rowEnd = std::min(numRows, rowStart + rowsPerChunk);
         const size_t count  = rowEnd - rowStart;
-        for (size_t r = 0; r < count; ++r) {
-            double*       dst = &chunkBuf[r * numCols];
-            const size_t  j   = rowStart + r;
-            for (size_t c = 0; c < numCols; ++c) { dst[c] = colPtrs[c][j]; }
+        for (size_t r0 = 0; r0 < count; r0 += R_TILE) {
+            const size_t rCnt = std::min(R_TILE, count - r0);
+            for (size_t c0 = 0; c0 < numCols; c0 += C_TILE) {
+                const size_t cCnt = std::min(C_TILE, numCols - c0);
+                for (size_t dc = 0; dc < cCnt; ++dc) {
+                    const double* src = colPtrs[c0 + dc] + rowStart + r0;
+                    for (size_t r = 0; r < rCnt; ++r) { tile[r * C_TILE + dc] = src[r]; }
+                }
+                for (size_t r = 0; r < rCnt; ++r) {
+                    std::copy_n(&tile[r * C_TILE], cCnt, &chunkBuf[(r0 + r) * numCols + c0]);
+                }
+            }
         }
         outfile.write(reinterpret_cast<const char*>(chunkBuf.data()),
                       static_cast<std::streamsize>(count * numCols * sizeof(double)));

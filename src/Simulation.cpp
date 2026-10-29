@@ -231,11 +231,9 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
         results.xVector.resize(mObj.branchIndex);
         for (const auto& i : mObj.relevantIndices) {
             results.xVector.at(i).emplace();
-            results.xVector.at(i)->reserve(reserveSteps);
         }
     } else {
         results.xVector.resize(mObj.branchIndex, std::vector<double>(0));
-        for (auto& v : results.xVector) { v->reserve(reserveSteps); }
     }
 
     setup_partitions(mObj);
@@ -2468,6 +2466,69 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
     }
 
     if (!mObj.relevantTraces.empty()) {
+        if (!gpu_ && mcRuns_ <= 1) {
+            std::vector<int32_t> refCount(static_cast<size_t>(N), 0);
+            std::vector<int64_t> partner12(static_cast<size_t>(N), -1);
+            std::vector<int32_t> pairMatches(static_cast<size_t>(N), 0);
+            for (const auto& tr : mObj.relevantTraces) {
+                if (tr.index1 && *tr.index1 >= 0 && *tr.index1 < N) { ++refCount[*tr.index1]; }
+                if (tr.index2 && *tr.index2 >= 0 && *tr.index2 < N) { ++refCount[*tr.index2]; }
+                if (tr.variableIndex && *tr.variableIndex >= 0 && *tr.variableIndex < N) {
+                    ++refCount[*tr.variableIndex];
+                }
+                if (tr.index1 && tr.index2 && !tr.variableIndex) {
+                    const int64_t n1 = *tr.index1;
+                    const int64_t n2 = *tr.index2;
+                    if (n1 >= 0 && n1 < N && n2 >= 0 && n2 < N && n1 != n2) {
+                        if (partner12[n1] == -1) {
+                            partner12[n1]   = n2;
+                            pairMatches[n1] = 1;
+                        } else if (partner12[n1] == n2) {
+                            ++pairMatches[n1];
+                        } else {
+                            partner12[n1] = -2;
+                        }
+                    }
+                }
+            }
+            std::vector<uint8_t> foldedDiff(static_cast<size_t>(N), 0);
+            bool                 anyFolded = false;
+            for (int64_t n1 : mObj.relevantIndices) {
+                if (n1 < 0 || n1 >= N) { continue; }
+                const int64_t n2 = partner12[n1];
+                if (n2 < 0 || n2 >= N || refCount[n1] != pairMatches[n1] || refCount[n2] != pairMatches[n1]) {
+                    continue;
+                }
+                GpuRelTrace& rt1 = traceDescByOrigRow[n1];
+                GpuRelTrace& rt2 = traceDescByOrigRow[n2];
+                if (rt1.traceType != 0 || rt2.traceType != 0) { continue; }
+                const int32_t r1 = rt1.localAbsIdx;
+                const int32_t r2 = rt2.localAbsIdx;
+                if (r1 < 0 || r1 >= nodalNRed_ || r2 < 0 || r2 >= nodalNRed_) { continue; }
+                if (nodalIsDirichletRed_[r1] || nodalIsDirichletRed_[r2]) { continue; }
+                bool connected = false;
+                for (int64_t k = nodalRp_[r1]; k < nodalRp_[r1 + 1]; ++k) {
+                    if (nodalCi_[k] == r2) {
+                        connected = true;
+                        break;
+                    }
+                }
+                if (!connected) { continue; }
+                rt1.traceType    = 4;
+                rt1.posIdx       = r1;
+                rt1.negIdx       = r2;
+                foldedDiff[n1]   = 1;
+                anyFolded        = true;
+                results.xVector[n2].reset();
+            }
+            if (anyFolded) {
+                for (auto& tr : mObj.relevantTraces) {
+                    if (tr.index1 && *tr.index1 >= 0 && *tr.index1 < N && foldedDiff[*tr.index1]) {
+                        tr.index2.reset();
+                    }
+                }
+            }
+        }
         for (int64_t globR : mObj.relevantIndices) {
             if (globR >= 0 && globR < N) {
                 GpuRelTrace grt = traceDescByOrigRow[globR];
@@ -5065,7 +5126,10 @@ void Simulation::trans_sim_gpu_nodal(Matrix& mObj) {
 void Simulation::trans_sim_nodal(Matrix& mObj) {
 #ifndef SLU
     results.timeAxis.clear();
-    results.timeAxis.reserve(useDecimation_ ? results.printIndices.size() * 3 : simSize_);
+    results.timeAxis.reserve(static_cast<size_t>(numKeptSteps_));
+    for (int64_t i = 0; i < simSize_; ++i) {
+        if (keptSlot_[i] >= 0) { results.timeAxis.push_back(i * stepSize_); }
+    }
     ProgressBar bar;
     if (!minOut_) {
         bar.create_thread();
@@ -5088,6 +5152,13 @@ void Simulation::trans_sim_nodal(Matrix& mObj) {
     } else {
         for (int64_t globR = 0; globR < N; ++globR) {
             traceTargets.push_back(results.xVector[globR] ? &(*results.xVector[globR]) : nullptr);
+        }
+    }
+    std::vector<double*> tracePtrs(nodalRelTraces_.size(), nullptr);
+    for (size_t tIdx = 0; tIdx < nodalRelTraces_.size(); ++tIdx) {
+        if (traceTargets[tIdx]) {
+            traceTargets[tIdx]->resize(static_cast<size_t>(numKeptSteps_), 0.0);
+            tracePtrs[tIdx] = traceTargets[tIdx]->data();
         }
     }
 
@@ -5593,9 +5664,11 @@ void Simulation::trans_sim_nodal(Matrix& mObj) {
         }
 
         // Store kept outputs
-        if (!useDecimation_ || keepStep_[i] != 0) {
+        const int32_t kSlot = keptSlot_[i];
+        if (kSlot >= 0) {
             for (size_t tIdx = 0; tIdx < nodalRelTraces_.size(); ++tIdx) {
-                if (!traceTargets[tIdx]) { continue; }
+                double* dst = tracePtrs[tIdx];
+                if (!dst) { continue; }
                 const GpuRelTrace& tr  = nodalRelTraces_[tIdx];
                 double             val = 0.0;
                 if (tr.traceType == 0) {
@@ -5615,11 +5688,12 @@ void Simulation::trans_sim_nodal(Matrix& mObj) {
                         val               = gJ * vDiff - jJJ;
                     } else if (tr.traceType == 3) {
                         val = tr.gBranch * (vDiff - b_[tr.localAbsIdx]);
+                    } else if (tr.traceType == 4) {
+                        val = vDiff;
                     }
                 }
-                traceTargets[tIdx]->emplace_back(val);
+                dst[kSlot] = val;
             }
-            results.timeAxis.emplace_back(step);
         }
     }
 
@@ -5638,11 +5712,6 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
     results.timeAxis.reserve(static_cast<size_t>(numKeptSteps_));
     for (int64_t i = 0; i < simSize_; ++i) {
         if (keptSlot_[i] >= 0) { results.timeAxis.push_back(i * stepSize_); }
-    }
-    for (const auto& part : nodalPartitions_) {
-        for (int64_t globR : part.traceGlobalRows) {
-            results.xVector[globR]->resize(static_cast<size_t>(numKeptSteps_), 0.0);
-        }
     }
 
     ProgressBar bar;
@@ -5721,6 +5790,14 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
 #pragma omp parallel num_threads(nThreads) if (parallel_)
 #endif
     {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t p = 0; p < nParts; ++p) {
+            for (int64_t globR : nodalPartitions_[p].traceGlobalRows) {
+                results.xVector[globR]->resize(static_cast<size_t>(numKeptSteps_), 0.0);
+            }
+        }
         for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
             const int64_t i1 = std::min<int64_t>(simSize_, i0 + windowSize_);
             const int64_t w  = i1 - i0;
@@ -6131,6 +6208,8 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
                                 val               = gJ * vDiff - jJJ;
                             } else if (tr.traceType == 3) {
                                 val = tr.gBranch * (vDiff - b_[tr.localAbsIdx]);
+                            } else if (tr.traceType == 4) {
+                                val = vDiff;
                             }
                         }
                         (*results.xVector[globR])[kSlot] = val;
@@ -6167,8 +6246,13 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
     for (int64_t i = 0; i < simSize_; ++i) {
         if (keptSlot_[i] >= 0) { results.timeAxis.push_back(i * stepSize_); }
     }
-    for (const auto& part : partitions_) {
-        for (int64_t globR : part.traceGlobalRows) {
+    const int64_t nParts = static_cast<int64_t>(partitions_.size());
+#ifdef _OPENMP
+    const int nThreads = std::min<int>(16, std::min<int>(omp_get_max_threads(), static_cast<int>(nParts)));
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads)
+#endif
+    for (int64_t p = 0; p < nParts; ++p) {
+        for (int64_t globR : partitions_[p].traceGlobalRows) {
             results.xVector[globR]->resize(static_cast<size_t>(numKeptSteps_), 0.0);
         }
     }
@@ -6185,7 +6269,6 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
 
     b_.assign(std::max(mObj.rp.size(), x_.size()), 0.0);
 
-    const int64_t       nParts = static_cast<int64_t>(partitions_.size());
     const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
     std::vector<double> srcWin(static_cast<size_t>((windowSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
 
@@ -6246,10 +6329,6 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
             partBLast[p].assign(static_cast<size_t>(partitions_[p].n), 0.0);
         }
     }
-
-#ifdef _OPENMP
-    const int nThreads = std::min<int>(16, std::min<int>(omp_get_max_threads(), static_cast<int>(nParts)));
-#endif
 
     for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
         if (!minOut_) { bar.update(static_cast<float>(i0)); }
@@ -6831,7 +6910,16 @@ void Simulation::trans_sim(Matrix& mObj) {
 #endif
     // Ensure time axis is cleared and pre-allocated
     results.timeAxis.clear();
-    results.timeAxis.reserve(useDecimation_ ? results.printIndices.size() * 3 : simSize_);
+    results.timeAxis.reserve(static_cast<size_t>(numKeptSteps_));
+    if (!mObj.relevantTraces.empty()) {
+        for (const auto& i : mObj.relevantIndices) {
+            if (results.xVector[i]) { results.xVector[i]->reserve(static_cast<size_t>(numKeptSteps_)); }
+        }
+    } else {
+        for (auto& v : results.xVector) {
+            if (v) { v->reserve(static_cast<size_t>(numKeptSteps_)); }
+        }
+    }
     ProgressBar bar;
     if (!minOut_) {
         bar.create_thread();

@@ -3,6 +3,7 @@
 
 #include "JoSIM/RelevantTrace.hpp"
 
+#include "JoSIM/AnalysisType.hpp"
 #include "JoSIM/Input.hpp"
 #include "JoSIM/Matrix.hpp"
 
@@ -124,8 +125,18 @@ void JoSIM::find_relevant_traces(Input& iObj, Matrix& mObj) {
             fIndex++;
         }
     }
-    // Store the indices of the identified traces
-    for (const auto& i : mObj.relevantTraces) {
+    // Store the indices of the identified traces (dropping unused JJ node/variable indices)
+    for (auto& i : mObj.relevantTraces) {
+        if (i.variableIndex) {
+            const bool useVarIdx = (iObj.argAnal == AnalysisType::Phase && i.storageType == StorageType::Voltage)
+                                   || (iObj.argAnal == AnalysisType::Voltage && i.storageType == StorageType::Phase);
+            if (useVarIdx) {
+                i.index1.reset();
+                i.index2.reset();
+            } else {
+                i.variableIndex.reset();
+            }
+        }
         if (i.index1) { mObj.relevantIndices.emplace_back(i.index1.value()); }
         if (i.index2) { mObj.relevantIndices.emplace_back(i.index2.value()); }
         if (i.variableIndex) { mObj.relevantIndices.emplace_back(i.variableIndex.value()); }

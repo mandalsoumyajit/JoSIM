@@ -49,6 +49,9 @@ class Input {
     double                                                       argKCutoff      = 0.0;
     int64_t                                                      argMcRuns       = 1;
     bool                                                         argMcAll        = false;
+    bool                                                         argLumpPtl      = true;
+    double                                                       argMinPtl       = 0.0;
+    bool                                                         ptlLumpedDone   = false;
     std::optional<std::pair<std::string, std::optional<double>>> saveStateFile;
     std::optional<std::string>                                   loadStateFile;
 

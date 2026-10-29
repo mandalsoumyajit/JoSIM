@@ -53,14 +53,13 @@ double Spread::spread_value(double value, int64_t type, double spread) const {
             case JJ: spread = bspread_; break;
         }
     }
-    if (spread == 1.0 && gspread_ != 1.0) { spread = gspread_; }
-    if (spread == 1.0 && gspread_ == 1.0) {
+    if (spread <= 0.0 || (spread == 1.0 && gspread_ == 1.0)) {
         return value;
-    } else {
-        const double sigma = (std::abs(value) * spread) / 3.0; // (max-min)/6
-        return Rng::normal_spread(value, sigma);
+    } else if (spread == 1.0 && gspread_ != 1.0) {
+        spread = gspread_;
     }
-    return value;
+    const double sigma = (std::abs(value) * spread) / 3.0; // (max-min)/6
+    return Rng::normal_spread(value, sigma);
 }
 
 double Spread::spread_value_rng(

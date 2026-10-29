@@ -377,6 +377,94 @@ void Simulation::setup_partitions(Matrix& mObj) {
         }
     }
 
+    if (parallel_ && !gpu_ && mcRuns_ <= 1 && !txlines_.empty()) {
+        std::vector<int64_t> compSize(static_cast<size_t>(N), 0);
+        std::vector<int64_t> compJJs(static_cast<size_t>(N), 0);
+        int64_t              numActiveComps = 0;
+        for (int64_t r = 0; r < N; ++r) {
+            if (rowToRailIdx[r] >= 0) { continue; }
+            const int64_t rt = find_root(r);
+            if (compSize[rt] == 0) { ++numActiveComps; }
+            ++compSize[rt];
+        }
+        for (const auto& jj : jjs_) {
+            const int64_t cRow = jj.indexInfo.currentIndex_.value();
+            if (cRow >= 0 && cRow < N && rowToRailIdx[cRow] < 0) { ++compJJs[find_root(cRow)]; }
+        }
+        std::vector<size_t> txOrder(txlines_.size());
+        for (size_t idx = 0; idx < txlines_.size(); ++idx) { txOrder[idx] = idx; }
+        std::sort(txOrder.begin(), txOrder.end(), [&](size_t a, size_t b) {
+            return txlines_[a].timestepDelay_ < txlines_[b].timestepDelay_;
+        });
+        int64_t maxInitComp = 0;
+        for (int64_t r = 0; r < N; ++r) {
+            if (rowToRailIdx[r] < 0 && parent[r] == r) {
+                maxInitComp = std::max<int64_t>(maxInitComp, compSize[r]);
+            }
+        }
+        // Pass 1: Absorb passive 0-JJ PTL-via / stub islands across shortest PTLs
+        for (size_t txIdx : txOrder) {
+            const int64_t u1 = txlines_[txIdx].indexInfo.currentIndex_.value();
+            const int64_t u2 = txlines_[txIdx].currentIndex2_;
+            const int64_t r1 = find_root(u1);
+            const int64_t r2 = find_root(u2);
+            if (r1 == r2 || numActiveComps <= 2) { continue; }
+            if ((compJJs[r1] == 0 && compSize[r1] <= 16) || (compJJs[r2] == 0 && compSize[r2] <= 16)) {
+                parent[r2]    = r1;
+                compSize[r1] += compSize[r2];
+                compJJs[r1]  += compJJs[r2];
+                --numActiveComps;
+            }
+        }
+        // Pass 2: Transactional level-by-level short-PTL coarsening for k < 4 within 2x initial max block size
+        const int64_t minTargetParts = 32;
+        const int64_t maxAllowedComp = maxInitComp * 2;
+        size_t        ordIdx         = 0;
+        while (ordIdx < txOrder.size()) {
+            const int64_t curK = txlines_[txOrder[ordIdx]].timestepDelay_;
+            if (curK >= 4) { break; }
+            size_t nextOrd = ordIdx;
+            while (nextOrd < txOrder.size() && txlines_[txOrder[nextOrd]].timestepDelay_ == curK) { ++nextOrd; }
+            bool hasInterAtK = false;
+            for (size_t m = ordIdx; m < nextOrd; ++m) {
+                const auto& tx = txlines_[txOrder[m]];
+                if (find_root(tx.indexInfo.currentIndex_.value()) != find_root(tx.currentIndex2_)) {
+                    hasInterAtK = true;
+                    break;
+                }
+            }
+            if (hasInterAtK) {
+                auto    savedParent = parent;
+                auto    savedSize   = compSize;
+                auto    savedJJs    = compJJs;
+                int64_t savedActive = numActiveComps;
+                bool    levelOk     = true;
+                for (size_t m = ordIdx; m < nextOrd; ++m) {
+                    const auto&   tx = txlines_[txOrder[m]];
+                    const int64_t r1 = find_root(tx.indexInfo.currentIndex_.value());
+                    const int64_t r2 = find_root(tx.currentIndex2_);
+                    if (r1 == r2) { continue; }
+                    if (numActiveComps <= minTargetParts || compSize[r1] + compSize[r2] > maxAllowedComp) {
+                        levelOk = false;
+                        break;
+                    }
+                    parent[r2]    = r1;
+                    compSize[r1] += compSize[r2];
+                    compJJs[r1]  += compJJs[r2];
+                    --numActiveComps;
+                }
+                if (!levelOk) {
+                    parent         = std::move(savedParent);
+                    compSize       = std::move(savedSize);
+                    compJJs        = std::move(savedJJs);
+                    numActiveComps = savedActive;
+                    break;
+                }
+            }
+            ordIdx = nextOrd;
+        }
+    }
+
     std::unordered_map<int64_t, int64_t> rootToPart;
     std::vector<int64_t>                 rowPart(N, -1);
     for (int64_t r = 0; r < N; ++r) {
@@ -631,11 +719,30 @@ void Simulation::setup_partitions(Matrix& mObj) {
         remap_node(tx.indexInfo.negIndex_, p1);
         remap_node(tx.posIndex2_, p2);
         remap_node(tx.negIndex2_, p2);
-        kMin = std::min<int64_t>(kMin, tx.timestepDelay_);
+        if (p1 != p2 || gpu_ || mcRuns_ > 1) {
+            kMin = std::min<int64_t>(kMin, tx.timestepDelay_);
+        }
         partitions_[p1].txPort1Indices.push_back(static_cast<int64_t>(idx));
         partitions_[p2].txPort2Indices.push_back(static_cast<int64_t>(idx));
     }
     windowSize_ = (kMin >= 1) ? std::min<int64_t>(kMin, std::max<int64_t>(1, simSize_)) : 0;
+    if (windowSize_ >= 1) {
+        for (auto& tx : txlines_) {
+            const int64_t reqHist = std::max<int64_t>(tx.histSize_, tx.timestepDelay_ + windowSize_ + 4);
+            if (reqHist > tx.histSize_) {
+                std::vector<TransmissionLine::TxHistEntry> newHist(
+                        static_cast<size_t>(reqHist), TransmissionLine::TxHistEntry{});
+                if (tx.loadedSteps_ > 0 && !tx.hist_.empty()) {
+                    const int64_t startStep = std::max<int64_t>(0, tx.loadedSteps_ - tx.histSize_);
+                    for (int64_t st = startStep; st < tx.loadedSteps_; ++st) {
+                        newHist[st % reqHist] = tx.hist_[st % tx.histSize_];
+                    }
+                }
+                tx.hist_     = std::move(newHist);
+                tx.histSize_ = reqHist;
+            }
+        }
+    }
 
     if (!mObj.relevantTraces.empty()) {
         for (const auto& globR : mObj.relevantIndices) {
@@ -1937,11 +2044,9 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
         const int64_t u = (e1.posNode == m) ? e1.negNode : e1.posNode;
         const int64_t v = (e2.posNode == m) ? e2.negNode : e2.posNode;
         if (u == v) { continue; }
-        // Do not collapse pure L+L pairs in Phase mode (zero RHS gain) or
-        // bridge two mutually-coupled inductor nodes across a multi-inductor chain
-        // (which increases KLU AMD fill-in on coupled-inductor macro blocks).
-        if (e1.resIdx < 0 && e2.resIdx < 0) { continue; }
-        if (e1.indIdx >= 0 && e2.indIdx >= 0 && nodeHasCoupledInd[u] && nodeHasCoupledInd[v]) { continue; }
+        // Do not bridge a coupled inductor node across a pure L+L pair (which
+        // increases KLU AMD fill-in on coupled-inductor macro blocks).
+        if (e1.resIdx < 0 && e2.resIdx < 0 && (nodeHasCoupledInd[u] || nodeHasCoupledInd[v])) { continue; }
         // Do not merge across m if either incident branch's current is directly requested by .print
         if (e1.resIdx >= 0 && isRelevantRow[resistors_[e1.resIdx].indexInfo.currentIndex_.value()]) { continue; }
         if (e2.resIdx >= 0 && isRelevantRow[resistors_[e2.resIdx].indexInfo.currentIndex_.value()]) { continue; }
@@ -2395,10 +2500,6 @@ bool Simulation::setup_nodal_partitions(Matrix& mObj) {
     nodalPartitions_.clear();
 
     if (txlines_.empty() || nodalNRed_ < 32) { return false; }
-    int64_t kMin = 8192;
-    for (const auto& tx : txlines_) { kMin = std::min<int64_t>(kMin, tx.timestepDelay_); }
-    windowSize_ = (kMin >= 1) ? std::min<int64_t>(kMin, std::max<int64_t>(1, simSize_)) : 0;
-    if (windowSize_ < 2) { return false; }
 
     std::vector<int32_t> parent(static_cast<size_t>(nodalNRed_));
     for (int32_t i = 0; i < nodalNRed_; ++i) { parent[i] = i; }
@@ -2452,6 +2553,136 @@ bool Simulation::setup_nodal_partitions(Matrix& mObj) {
     }
     for (const auto& th : nodalTxHalves_) { unite(th.posIdx, th.negIdx); }
     for (const auto& rt : nodalRelTraces_) { unite(rt.posIdx, rt.negIdx); }
+
+    std::vector<int32_t> txNode1(txlines_.size(), -1);
+    std::vector<int32_t> txNode2(txlines_.size(), -1);
+    for (const auto& th : nodalTxHalves_) {
+        const int32_t u = (th.posIdx >= 0) ? th.posIdx : ((th.negIdx >= 0) ? th.negIdx : -1);
+        if (th.isPort2 == 0) {
+            txNode1[th.txIdx] = u;
+        } else {
+            txNode2[th.txIdx] = u;
+        }
+    }
+
+    if (parallel_) {
+        std::vector<int32_t> compSize(static_cast<size_t>(nodalNRed_), 0);
+        std::vector<int32_t> compJJs(static_cast<size_t>(nodalNRed_), 0);
+        int32_t              numActiveComps = 0;
+        for (int32_t r = 0; r < nodalNRed_; ++r) {
+            if (nodalIsDirichletRed_[r]) { continue; }
+            const int32_t rt = find_root(r);
+            if (compSize[rt] == 0) { ++numActiveComps; }
+            ++compSize[rt];
+        }
+        for (const auto& gj : nodalJJs_) {
+            const int32_t u = (gj.posIdx >= 0) ? gj.posIdx : ((gj.negIdx >= 0) ? gj.negIdx : -1);
+            if (u >= 0) { ++compJJs[find_root(u)]; }
+        }
+        std::vector<size_t> txOrder(txlines_.size());
+        for (size_t idx = 0; idx < txlines_.size(); ++idx) { txOrder[idx] = idx; }
+        std::sort(txOrder.begin(), txOrder.end(), [&](size_t a, size_t b) {
+            return txlines_[a].timestepDelay_ < txlines_[b].timestepDelay_;
+        });
+        int32_t maxInitComp = 0;
+        for (int32_t r = 0; r < nodalNRed_; ++r) {
+            if (!nodalIsDirichletRed_[r] && parent[r] == r) {
+                maxInitComp = std::max<int32_t>(maxInitComp, compSize[r]);
+            }
+        }
+
+        // Pass 1: Absorb passive 0-JJ PTL-via / stub islands across shortest PTLs
+        for (size_t txIdx : txOrder) {
+            const int32_t u1 = txNode1[txIdx];
+            const int32_t u2 = txNode2[txIdx];
+            if (u1 < 0 || u2 < 0) { continue; }
+            const int32_t r1 = find_root(u1);
+            const int32_t r2 = find_root(u2);
+            if (r1 == r2 || numActiveComps <= 2) { continue; }
+            if ((compJJs[r1] == 0 && compSize[r1] <= 8) || (compJJs[r2] == 0 && compSize[r2] <= 8)) {
+                parent[r2]    = r1;
+                compSize[r1] += compSize[r2];
+                compJJs[r1]  += compJJs[r2];
+                --numActiveComps;
+            }
+        }
+
+        // Pass 2: Transactional level-by-level short-PTL coarsening for k < 4 within 2x initial max block size
+        const int32_t minTargetParts = 32;
+        const int32_t maxAllowedComp = maxInitComp * 2;
+        size_t        ordIdx         = 0;
+        while (ordIdx < txOrder.size()) {
+            const int64_t curK = txlines_[txOrder[ordIdx]].timestepDelay_;
+            if (curK >= 4) { break; }
+            size_t nextOrd = ordIdx;
+            while (nextOrd < txOrder.size() && txlines_[txOrder[nextOrd]].timestepDelay_ == curK) { ++nextOrd; }
+            bool hasInterAtK = false;
+            for (size_t m = ordIdx; m < nextOrd; ++m) {
+                const int32_t u1 = txNode1[txOrder[m]];
+                const int32_t u2 = txNode2[txOrder[m]];
+                if (u1 >= 0 && u2 >= 0 && find_root(u1) != find_root(u2)) {
+                    hasInterAtK = true;
+                    break;
+                }
+            }
+            if (hasInterAtK) {
+                auto    savedParent = parent;
+                auto    savedSize   = compSize;
+                auto    savedJJs    = compJJs;
+                int32_t savedActive = numActiveComps;
+                bool    levelOk     = true;
+                for (size_t m = ordIdx; m < nextOrd; ++m) {
+                    const int32_t u1 = txNode1[txOrder[m]];
+                    const int32_t u2 = txNode2[txOrder[m]];
+                    if (u1 < 0 || u2 < 0) { continue; }
+                    const int32_t r1 = find_root(u1);
+                    const int32_t r2 = find_root(u2);
+                    if (r1 == r2) { continue; }
+                    if (numActiveComps <= minTargetParts || compSize[r1] + compSize[r2] > maxAllowedComp) {
+                        levelOk = false;
+                        break;
+                    }
+                    parent[r2]    = r1;
+                    compSize[r1] += compSize[r2];
+                    compJJs[r1]  += compJJs[r2];
+                    --numActiveComps;
+                }
+                if (!levelOk) {
+                    parent         = std::move(savedParent);
+                    compSize       = std::move(savedSize);
+                    compJJs        = std::move(savedJJs);
+                    numActiveComps = savedActive;
+                    break;
+                }
+            }
+            ordIdx = nextOrd;
+        }
+    }
+
+    int64_t kMin = 8192;
+    for (size_t txIdx = 0; txIdx < txlines_.size(); ++txIdx) {
+        const int32_t u1 = txNode1[txIdx];
+        const int32_t u2 = txNode2[txIdx];
+        if (u1 >= 0 && u2 >= 0 && find_root(u1) == find_root(u2)) { continue; }
+        kMin = std::min<int64_t>(kMin, txlines_[txIdx].timestepDelay_);
+    }
+    windowSize_ = (kMin >= 1) ? std::min<int64_t>(kMin, std::max<int64_t>(1, simSize_)) : 0;
+    if (windowSize_ < (parallel_ ? 2 : 32)) { return false; }
+    for (auto& tx : txlines_) {
+        const int64_t reqHist = std::max<int64_t>(tx.histSize_, tx.timestepDelay_ + windowSize_ + 4);
+        if (reqHist > tx.histSize_) {
+            std::vector<TransmissionLine::TxHistEntry> newHist(
+                    static_cast<size_t>(reqHist), TransmissionLine::TxHistEntry{});
+            if (tx.loadedSteps_ > 0 && !tx.hist_.empty()) {
+                const int64_t startStep = std::max<int64_t>(0, tx.loadedSteps_ - tx.histSize_);
+                for (int64_t st = startStep; st < tx.loadedSteps_; ++st) {
+                    newHist[st % reqHist] = tx.hist_[st % tx.histSize_];
+                }
+            }
+            tx.hist_     = std::move(newHist);
+            tx.histSize_ = reqHist;
+        }
+    }
 
     std::unordered_map<int32_t, int32_t> rootToPart;
     std::vector<int32_t>                 rowPart(static_cast<size_t>(nodalNRed_), -1);
@@ -5428,174 +5659,141 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
 
     const int64_t       nParts = static_cast<int64_t>(nodalPartitions_.size());
     const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
-    const int64_t       numTx  = static_cast<int64_t>(txlines_.size());
     std::vector<double> srcWin(static_cast<size_t>((windowSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
-    std::vector<double> txRem1(static_cast<size_t>(std::max<int64_t>(1, numTx) * windowSize_), 0.0);
-    std::vector<double> txRem2(static_cast<size_t>(std::max<int64_t>(1, numTx) * windowSize_), 0.0);
     std::vector<double> dirichletB(static_cast<size_t>(std::max<int32_t>(1, nodalNRed_) * windowSize_), 0.0);
+
+    auto eval_tx_rem = [&](const TransmissionLine& tx, int64_t effStep, bool isPort2) -> double {
+        const int64_t k = tx.timestepDelay_;
+        if (effStep < k) { return 0.0; }
+        const double  Z     = tx.netlistInfo.value_;
+        const int64_t hSize = tx.histSize_;
+        const double  cZPhi = (Z / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0);
+        const auto&   hist  = tx.hist_;
+        const double  alpha = tx.fracDelay_;
+        const double  oma   = 1.0 - alpha;
+        const int64_t m     = effStep - k;
+        if (alpha > 0.0) {
+            auto interp_rem_v = [&](int64_t idx) -> double {
+                if (idx < 0) { return 0.0; }
+                const auto&  h0 = hist[idx % hSize];
+                const double s0 = isPort2 ? h0.v1 : h0.v2;
+                if (idx < 1) { return oma * s0; }
+                const auto&  h1 = hist[(idx - 1) % hSize];
+                const double s1 = isPort2 ? h1.v1 : h1.v2;
+                return oma * s0 + alpha * s1;
+            };
+            auto interp_rem_i = [&](int64_t idx) -> double {
+                if (idx < 0) { return 0.0; }
+                const auto&  h0 = hist[idx % hSize];
+                const double s0 = isPort2 ? h0.i1 : h0.i2;
+                if (idx < 1) { return oma * s0; }
+                const auto&  h1 = hist[(idx - 1) % hSize];
+                const double s1 = isPort2 ? h1.i1 : h1.i2;
+                return oma * s0 + alpha * s1;
+            };
+            const double v_nk = interp_rem_v(m);
+            const double i_nk = interp_rem_i(m);
+            if (atyp_ == AnalysisType::Voltage) { return Z * i_nk + v_nk; }
+            return cZPhi * i_nk + v_nk - (4.0 / 3.0) * interp_rem_v(m - 1) + (1.0 / 3.0) * interp_rem_v(m - 2);
+        }
+        const auto&  h_k = hist[m % hSize];
+        const double v_k = isPort2 ? h_k.v1 : h_k.v2;
+        const double i_k = isPort2 ? h_k.i1 : h_k.i2;
+        if (atyp_ == AnalysisType::Voltage) { return Z * i_k + v_k; }
+        if (effStep == k) { return cZPhi * i_k + v_k; }
+        const auto&  h_k1 = hist[(m - 1) % hSize];
+        const double v_k1 = isPort2 ? h_k1.v1 : h_k1.v2;
+        if (effStep == k + 1) { return cZPhi * i_k + v_k - (4.0 / 3.0) * v_k1; }
+        const auto&  h_k2 = hist[(m - 2) % hSize];
+        const double v_k2 = isPort2 ? h_k2.v1 : h_k2.v2;
+        return cZPhi * i_k + v_k - (4.0 / 3.0) * v_k1 + (1.0 / 3.0) * v_k2;
+    };
 
 #ifdef _OPENMP
     const int nThreads
             = parallel_ ? std::min<int>(16, std::min<int>(omp_get_max_threads(), static_cast<int>(nParts))) : 1;
 #endif
 
-    for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
-        if (!minOut_) { bar.update(static_cast<float>(i0)); }
-        const int64_t i1 = std::min<int64_t>(simSize_, i0 + windowSize_);
-        const int64_t w  = i1 - i0;
+    bool windowNeedsTR = false;
+    bool windowSingErr = false;
 
-        // 1. Pre-evaluate sources for the window [i0 - 2, i1)
-        if (numSrc > 0) {
-            for (int64_t s = -2; s < w; ++s) {
-                const int64_t stepIdx = i0 + s;
-                const double  t       = (stepIdx >= 0) ? (stepIdx * stepSize_) : 0.0;
-                double*       row     = srcWin.data() + (s + 2) * numSrc;
-                if (stepIdx >= 0) {
-                    for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) {
-                        row[srcIdx] = mObj.sourcegen[srcIdx].value(t);
-                    }
-                } else {
-                    std::fill(row, row + numSrc, 0.0);
-                }
-            }
-        }
-
-        // 2. Pre-evaluate Dirichlet VS and PS RHS values across [i0, i1)
-        for (auto& vs : nodalVSs_) {
-            if (!nodalIsDirichletRed_[vs.curIdx]) { continue; }
-            const int32_t dRed = vs.curIdx;
-            for (int64_t s = 0; s < w; ++s) {
-                const double srcVal = srcWin[(s + 2) * numSrc + vs.srcIdx];
-                double       bVal   = 0.0;
-                if (atyp_ == AnalysisType::Voltage) {
-                    bVal = srcVal;
-                } else {
-                    bVal   = ((2.0 * stepSize_) / (3.0 * Constants::SIGMA)) * srcVal + (4.0 / 3.0) * vs.pn1
-                             - (1.0 / 3.0) * vs.pn2;
-                    vs.pn2 = vs.pn1;
-                    vs.pn1 = bVal;
-                }
-                dirichletB[static_cast<size_t>(dRed) * windowSize_ + s] = bVal;
-            }
-        }
-        for (const auto& ps : nodalPSs_) {
-            if (!nodalIsDirichletRed_[ps.curIdx]) { continue; }
-            const int32_t dRed = ps.curIdx;
-            for (int64_t s = 0; s < w; ++s) {
-                const int64_t i    = i0 + s;
-                const double  s0   = srcWin[(s + 2) * numSrc + ps.srcIdx];
-                double        bVal = 0.0;
-                if (atyp_ == AnalysisType::Phase) {
-                    bVal = s0;
-                } else if (i == 0) {
-                    bVal = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0);
-                } else if (i == 1) {
-                    const double s1 = srcWin[(s + 1) * numSrc + ps.srcIdx];
-                    bVal            = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0 - 2.0 * s1);
-                } else {
-                    const double s1 = srcWin[(s + 1) * numSrc + ps.srcIdx];
-                    const double s2 = srcWin[s * numSrc + ps.srcIdx];
-                    bVal = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0 - 2.0 * s1 + 0.5 * s2);
-                }
-                dirichletB[static_cast<size_t>(dRed) * windowSize_ + s] = bVal;
-            }
-        }
-
-        // 3. Precompute delayed remote port contributions for all transmission lines across [i0, i1)
-        if (numTx > 0) {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(nThreads) if (parallel_ && numTx * w >= 4096)
+#pragma omp parallel num_threads(nThreads) if (parallel_)
 #endif
-            for (int64_t txIdx = 0; txIdx < numTx; ++txIdx) {
-                const auto&   tx    = txlines_[txIdx];
-                const double  Z     = tx.netlistInfo.value_;
-                const int64_t k     = tx.timestepDelay_;
-                const int64_t hSize = tx.histSize_;
-                const double  cZPhi = (Z / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0);
-                const auto&   hist  = tx.hist_;
-                const double  alpha = tx.fracDelay_;
-                const double  oma   = 1.0 - alpha;
+    {
+        for (int64_t i0 = 0; i0 < simSize_; i0 += windowSize_) {
+            const int64_t i1 = std::min<int64_t>(simSize_, i0 + windowSize_);
+            const int64_t w  = i1 - i0;
 
-                auto interp_v1 = [&](int64_t m) -> double {
-                    if (m < 0) { return 0.0; }
-                    const double s0 = hist[m % hSize].v1;
-                    const double s1 = (m >= 1) ? hist[(m - 1) % hSize].v1 : 0.0;
-                    return oma * s0 + alpha * s1;
-                };
-                auto interp_v2 = [&](int64_t m) -> double {
-                    if (m < 0) { return 0.0; }
-                    const double s0 = hist[m % hSize].v2;
-                    const double s1 = (m >= 1) ? hist[(m - 1) % hSize].v2 : 0.0;
-                    return oma * s0 + alpha * s1;
-                };
-                auto interp_i1 = [&](int64_t m) -> double {
-                    if (m < 0) { return 0.0; }
-                    const double s0 = hist[m % hSize].i1;
-                    const double s1 = (m >= 1) ? hist[(m - 1) % hSize].i1 : 0.0;
-                    return oma * s0 + alpha * s1;
-                };
-                auto interp_i2 = [&](int64_t m) -> double {
-                    if (m < 0) { return 0.0; }
-                    const double s0 = hist[m % hSize].i2;
-                    const double s1 = (m >= 1) ? hist[(m - 1) % hSize].i2 : 0.0;
-                    return oma * s0 + alpha * s1;
-                };
+#ifdef _OPENMP
+#pragma omp single
+#endif
+            {
+                if (!minOut_) { bar.update(static_cast<float>(i0)); }
 
-                for (int64_t s = 0; s < w; ++s) {
-                    const int64_t effStep = tx.loadedSteps_ + i0 + s;
-                    double        rem1    = 0.0;
-                    double        rem2    = 0.0;
-                    if (effStep >= k) {
-                        const int64_t m = effStep - k;
-                        if (alpha > 0.0) {
-                            const double nk_1 = interp_v1(m);
-                            const double nk_2 = interp_v2(m);
-                            const double I1nk = interp_i1(m);
-                            const double I2nk = interp_i2(m);
-                            if (atyp_ == AnalysisType::Voltage) {
-                                rem1 = Z * I2nk + nk_2;
-                                rem2 = Z * I1nk + nk_1;
-                            } else {
-                                rem1 = cZPhi * I2nk + nk_2 - (4.0 / 3.0) * interp_v2(m - 1)
-                                       + (1.0 / 3.0) * interp_v2(m - 2);
-                                rem2 = cZPhi * I1nk + nk_1 - (4.0 / 3.0) * interp_v1(m - 1)
-                                       + (1.0 / 3.0) * interp_v1(m - 2);
+                // 1. Pre-evaluate sources for the window [i0 - 2, i1)
+                if (numSrc > 0) {
+                    for (int64_t s = -2; s < w; ++s) {
+                        const int64_t stepIdx = i0 + s;
+                        const double  t       = (stepIdx >= 0) ? (stepIdx * stepSize_) : 0.0;
+                        double*       row     = srcWin.data() + (s + 2) * numSrc;
+                        if (stepIdx >= 0) {
+                            for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) {
+                                row[srcIdx] = mObj.sourcegen[srcIdx].value(t);
                             }
                         } else {
-                            const auto& h_k = hist[m % hSize];
-                            if (atyp_ == AnalysisType::Voltage) {
-                                rem1 = Z * h_k.i2 + h_k.v2;
-                                rem2 = Z * h_k.i1 + h_k.v1;
-                            } else if (effStep == k) {
-                                rem1 = cZPhi * h_k.i2 + h_k.v2;
-                                rem2 = cZPhi * h_k.i1 + h_k.v1;
-                            } else if (effStep == k + 1) {
-                                const auto& h_k1 = hist[(m - 1) % hSize];
-                                rem1             = cZPhi * h_k.i2 + h_k.v2 - (4.0 / 3.0) * h_k1.v2;
-                                rem2             = cZPhi * h_k.i1 + h_k.v1 - (4.0 / 3.0) * h_k1.v1;
-                            } else {
-                                const auto& h_k1 = hist[(m - 1) % hSize];
-                                const auto& h_k2 = hist[(m - 2) % hSize];
-                                rem1             = cZPhi * h_k.i2 + h_k.v2 - (4.0 / 3.0) * h_k1.v2
-                                       + (1.0 / 3.0) * h_k2.v2;
-                                rem2 = cZPhi * h_k.i1 + h_k.v1 - (4.0 / 3.0) * h_k1.v1
-                                       + (1.0 / 3.0) * h_k2.v1;
-                            }
+                            std::fill(row, row + numSrc, 0.0);
                         }
                     }
-                    txRem1[txIdx * w + s] = rem1;
-                    txRem2[txIdx * w + s] = rem2;
+                }
+
+                // 2. Pre-evaluate Dirichlet VS and PS RHS values across [i0, i1)
+                for (auto& vs : nodalVSs_) {
+                    if (!nodalIsDirichletRed_[vs.curIdx]) { continue; }
+                    const int32_t dRed = vs.curIdx;
+                    for (int64_t s = 0; s < w; ++s) {
+                        const double srcVal = srcWin[(s + 2) * numSrc + vs.srcIdx];
+                        double       bVal   = 0.0;
+                        if (atyp_ == AnalysisType::Voltage) {
+                            bVal = srcVal;
+                        } else {
+                            bVal   = ((2.0 * stepSize_) / (3.0 * Constants::SIGMA)) * srcVal + (4.0 / 3.0) * vs.pn1
+                                     - (1.0 / 3.0) * vs.pn2;
+                            vs.pn2 = vs.pn1;
+                            vs.pn1 = bVal;
+                        }
+                        dirichletB[static_cast<size_t>(dRed) * windowSize_ + s] = bVal;
+                    }
+                }
+                for (const auto& ps : nodalPSs_) {
+                    if (!nodalIsDirichletRed_[ps.curIdx]) { continue; }
+                    const int32_t dRed = ps.curIdx;
+                    for (int64_t s = 0; s < w; ++s) {
+                        const int64_t i    = i0 + s;
+                        const double  s0   = srcWin[(s + 2) * numSrc + ps.srcIdx];
+                        double        bVal = 0.0;
+                        if (atyp_ == AnalysisType::Phase) {
+                            bVal = s0;
+                        } else if (i == 0) {
+                            bVal = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0);
+                        } else if (i == 1) {
+                            const double s1 = srcWin[(s + 1) * numSrc + ps.srcIdx];
+                            bVal            = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0 - 2.0 * s1);
+                        } else {
+                            const double s1 = srcWin[(s + 1) * numSrc + ps.srcIdx];
+                            const double s2 = srcWin[s * numSrc + ps.srcIdx];
+                            bVal = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0 - 2.0 * s1 + 0.5 * s2);
+                        }
+                        dirichletB[static_cast<size_t>(dRed) * windowSize_ + s] = bVal;
+                    }
                 }
             }
-        }
 
-        // 4. Advance all PTL-decoupled NodalPartitions in parallel across the w-step window
-        bool windowNeedsTR = false;
-        bool windowSingErr = false;
+            // 3. Advance all PTL-decoupled NodalPartitions in parallel across the w-step window
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) if (parallel_) reduction(|| : windowNeedsTR, windowSingErr)
+#pragma omp for schedule(dynamic, 1)
 #endif
-        for (int64_t p = 0; p < nParts; ++p) {
+            for (int64_t p = 0; p < nParts; ++p) {
             auto& part = nodalPartitions_[p];
             auto  read_pnx = [&](int32_t idx) -> double {
                 if (idx >= 0) { return part.xLocal[idx]; }
@@ -5646,6 +5844,9 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
                                         + ((1.0 / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0)) * v0;
                     gj.phi0 = phi0;
                     if (checkPhase && std::abs(phi0 - pn1) > (0.20 * 2.0 * Constants::PI)) {
+#ifdef _OPENMP
+#pragma omp atomic write
+#endif
                         windowNeedsTR = true;
                         break;
                     }
@@ -5853,7 +6054,8 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
                 // Transmission Lines
                 for (size_t thIdx = 0; thIdx < nTH; ++thIdx) {
                     const GpuTxHalf& th  = part.txHalves[thIdx];
-                    const double     rem = (th.isPort2 == 0) ? txRem1[th.txIdx * w + s] : txRem2[th.txIdx * w + s];
+                    const auto&      tx  = txlines_[th.txIdx];
+                    const double     rem = eval_tx_rem(tx, tx.loadedSteps_ + i, th.isPort2 != 0);
                     double           bTx = rem;
                     if (atyp_ == AnalysisType::Phase) { bTx += (4.0 / 3.0) * th.n1 - (1.0 / 3.0) * th.n2; }
                     b_[th.curIdx]    = bTx;
@@ -5867,6 +6069,9 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
                 int64_t ok = klu_l_tsolve(
                         part.symbolic, part.numeric, part.n, 1, part.xLocal.data(), &part.common);
                 if (!ok) {
+#ifdef _OPENMP
+#pragma omp atomic write
+#endif
                     windowSingErr = true;
                     break;
                 }
@@ -5933,15 +6138,17 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
                 }
             }
         }
-        if (windowSingErr) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
-        if (windowNeedsTR) {
-            needsTR_ = true;
-            if (!minOut_) {
-                bar.complete();
-                std::cout << "\n";
-            }
-            return;
+        if (windowNeedsTR || windowSingErr) { break; }
         }
+    }
+    if (windowSingErr) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+    if (windowNeedsTR) {
+        needsTR_ = true;
+        if (!minOut_) {
+            bar.complete();
+            std::cout << "\n";
+        }
+        return;
     }
 
     if (!minOut_) {
@@ -5978,12 +6185,56 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
 
     b_.assign(std::max(mObj.rp.size(), x_.size()), 0.0);
 
-    const int64_t       nParts   = static_cast<int64_t>(partitions_.size());
-    const int64_t       numSrc   = static_cast<int64_t>(mObj.sourcegen.size());
-    const int64_t       numTx    = static_cast<int64_t>(txlines_.size());
+    const int64_t       nParts = static_cast<int64_t>(partitions_.size());
+    const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
     std::vector<double> srcWin(static_cast<size_t>((windowSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
-    std::vector<double> txRem1(static_cast<size_t>(std::max<int64_t>(1, numTx) * windowSize_), 0.0);
-    std::vector<double> txRem2(static_cast<size_t>(std::max<int64_t>(1, numTx) * windowSize_), 0.0);
+
+    auto eval_tx_rem = [&](const TransmissionLine& tx, int64_t effStep, bool isPort2) -> double {
+        const int64_t k = tx.timestepDelay_;
+        if (effStep < k) { return 0.0; }
+        const double  Z     = tx.netlistInfo.value_;
+        const int64_t hSize = tx.histSize_;
+        const double  cZPhi = (Z / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0);
+        const auto&   hist  = tx.hist_;
+        const double  alpha = tx.fracDelay_;
+        const double  oma   = 1.0 - alpha;
+        const int64_t m     = effStep - k;
+        if (alpha > 0.0) {
+            auto interp_rem_v = [&](int64_t idx) -> double {
+                if (idx < 0) { return 0.0; }
+                const auto&  h0 = hist[idx % hSize];
+                const double s0 = isPort2 ? h0.v1 : h0.v2;
+                if (idx < 1) { return oma * s0; }
+                const auto&  h1 = hist[(idx - 1) % hSize];
+                const double s1 = isPort2 ? h1.v1 : h1.v2;
+                return oma * s0 + alpha * s1;
+            };
+            auto interp_rem_i = [&](int64_t idx) -> double {
+                if (idx < 0) { return 0.0; }
+                const auto&  h0 = hist[idx % hSize];
+                const double s0 = isPort2 ? h0.i1 : h0.i2;
+                if (idx < 1) { return oma * s0; }
+                const auto&  h1 = hist[(idx - 1) % hSize];
+                const double s1 = isPort2 ? h1.i1 : h1.i2;
+                return oma * s0 + alpha * s1;
+            };
+            const double v_nk = interp_rem_v(m);
+            const double i_nk = interp_rem_i(m);
+            if (atyp_ == AnalysisType::Voltage) { return Z * i_nk + v_nk; }
+            return cZPhi * i_nk + v_nk - (4.0 / 3.0) * interp_rem_v(m - 1) + (1.0 / 3.0) * interp_rem_v(m - 2);
+        }
+        const auto&  h_k = hist[m % hSize];
+        const double v_k = isPort2 ? h_k.v1 : h_k.v2;
+        const double i_k = isPort2 ? h_k.i1 : h_k.i2;
+        if (atyp_ == AnalysisType::Voltage) { return Z * i_k + v_k; }
+        if (effStep == k) { return cZPhi * i_k + v_k; }
+        const auto&  h_k1 = hist[(m - 1) % hSize];
+        const double v_k1 = isPort2 ? h_k1.v1 : h_k1.v2;
+        if (effStep == k + 1) { return cZPhi * i_k + v_k - (4.0 / 3.0) * v_k1; }
+        const auto&  h_k2 = hist[(m - 2) % hSize];
+        const double v_k2 = isPort2 ? h_k2.v1 : h_k2.v2;
+        return cZPhi * i_k + v_k - (4.0 / 3.0) * v_k1 + (1.0 / 3.0) * v_k2;
+    };
 
     std::vector<std::vector<double>> partBLast;
     std::vector<uint8_t>             partHasLast;
@@ -6021,95 +6272,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
             }
         }
 
-        // 2. Precompute delayed remote port contributions for all transmission lines across [i0, i1)
-        if (numTx > 0) {
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(nThreads) if (numTx * w >= 4096)
-#endif
-            for (int64_t txIdx = 0; txIdx < numTx; ++txIdx) {
-                const auto&   tx      = txlines_[txIdx];
-                const double  Z       = tx.netlistInfo.value_;
-                const int64_t k       = tx.timestepDelay_;
-                const int64_t hSize   = tx.histSize_;
-                const double  cZPhi   = (Z / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0);
-                const auto&   hist    = tx.hist_;
-                const double  alpha   = tx.fracDelay_;
-                const double  oma     = 1.0 - alpha;
-
-                auto interp_v1 = [&](int64_t m) -> double {
-                    if (m < 0) { return 0.0; }
-                    const double s0 = hist[m % hSize].v1;
-                    const double s1 = (m >= 1) ? hist[(m - 1) % hSize].v1 : 0.0;
-                    return oma * s0 + alpha * s1;
-                };
-                auto interp_v2 = [&](int64_t m) -> double {
-                    if (m < 0) { return 0.0; }
-                    const double s0 = hist[m % hSize].v2;
-                    const double s1 = (m >= 1) ? hist[(m - 1) % hSize].v2 : 0.0;
-                    return oma * s0 + alpha * s1;
-                };
-                auto interp_i1 = [&](int64_t m) -> double {
-                    if (m < 0) { return 0.0; }
-                    const double s0 = hist[m % hSize].i1;
-                    const double s1 = (m >= 1) ? hist[(m - 1) % hSize].i1 : 0.0;
-                    return oma * s0 + alpha * s1;
-                };
-                auto interp_i2 = [&](int64_t m) -> double {
-                    if (m < 0) { return 0.0; }
-                    const double s0 = hist[m % hSize].i2;
-                    const double s1 = (m >= 1) ? hist[(m - 1) % hSize].i2 : 0.0;
-                    return oma * s0 + alpha * s1;
-                };
-
-                for (int64_t s = 0; s < w; ++s) {
-                    const int64_t effStep = tx.loadedSteps_ + i0 + s;
-                    double        rem1    = 0.0;
-                    double        rem2    = 0.0;
-                    if (effStep >= k) {
-                        const int64_t m = effStep - k;
-                        if (alpha > 0.0) {
-                            const double nk_1 = interp_v1(m);
-                            const double nk_2 = interp_v2(m);
-                            const double I1nk = interp_i1(m);
-                            const double I2nk = interp_i2(m);
-                            if (atyp_ == AnalysisType::Voltage) {
-                                rem1 = Z * I2nk + nk_2;
-                                rem2 = Z * I1nk + nk_1;
-                            } else {
-                                rem1 = cZPhi * I2nk + nk_2 - (4.0 / 3.0) * interp_v2(m - 1)
-                                       + (1.0 / 3.0) * interp_v2(m - 2);
-                                rem2 = cZPhi * I1nk + nk_1 - (4.0 / 3.0) * interp_v1(m - 1)
-                                       + (1.0 / 3.0) * interp_v1(m - 2);
-                            }
-                        } else {
-                            const auto& h_k = hist[m % hSize];
-                            if (atyp_ == AnalysisType::Voltage) {
-                                rem1 = Z * h_k.i2 + h_k.v2;
-                                rem2 = Z * h_k.i1 + h_k.v1;
-                            } else if (effStep == k) {
-                                rem1 = cZPhi * h_k.i2 + h_k.v2;
-                                rem2 = cZPhi * h_k.i1 + h_k.v1;
-                            } else if (effStep == k + 1) {
-                                const auto& h_k1 = hist[(m - 1) % hSize];
-                                rem1             = cZPhi * h_k.i2 + h_k.v2 - (4.0 / 3.0) * h_k1.v2;
-                                rem2             = cZPhi * h_k.i1 + h_k.v1 - (4.0 / 3.0) * h_k1.v1;
-                            } else {
-                                const auto& h_k1 = hist[(m - 1) % hSize];
-                                const auto& h_k2 = hist[(m - 2) % hSize];
-                                rem1             = cZPhi * h_k.i2 + h_k.v2 - (4.0 / 3.0) * h_k1.v2
-                                       + (1.0 / 3.0) * h_k2.v2;
-                                rem2 = cZPhi * h_k.i1 + h_k.v1 - (4.0 / 3.0) * h_k1.v1
-                                       + (1.0 / 3.0) * h_k2.v1;
-                            }
-                        }
-                    }
-                    txRem1[txIdx * w + s] = rem1;
-                    txRem2[txIdx * w + s] = rem2;
-                }
-            }
-        }
-
-        // 3. Advance all PTL-decoupled partitions in parallel across the entire w-step window
+        // 2. Advance all PTL-decoupled partitions in parallel across the entire w-step window
         bool windowNeedsTR = false;
         bool windowSingErr = false;
 #ifdef _OPENMP
@@ -6404,7 +6567,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
                 // Transmission Line Port Halves (RHS setup)
                 for (int64_t tIdx : part.txPort1Indices) {
                     auto&        tx  = txlines_[tIdx];
-                    const double rem = txRem1[tIdx * w + s];
+                    const double rem = eval_tx_rem(tx, tx.loadedSteps_ + i, false);
                     if (atyp_ == AnalysisType::Voltage) {
                         b_[tx.indexInfo.currentIndex_.value()] = rem;
                     } else {
@@ -6414,7 +6577,7 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
                 }
                 for (int64_t tIdx : part.txPort2Indices) {
                     auto&        tx  = txlines_[tIdx];
-                    const double rem = txRem2[tIdx * w + s];
+                    const double rem = eval_tx_rem(tx, tx.loadedSteps_ + i, true);
                     if (atyp_ == AnalysisType::Voltage) {
                         b_[tx.currentIndex2_] = rem;
                     } else {

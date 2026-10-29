@@ -17,18 +17,21 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
 1. **Tier 4 + Phase 5 Schur-Complement Nodal & Series $R+L$ Chain Elimination (`-n` CPU & `-g 4` GPU):**
    - Analytically eliminates internal branch rows (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) *plus* internal degree-2 nodes along series $R+L$, $R+R$, and $L+L$ damping/bias chains into a **2.25x–5.16x smaller** nodal matrix $A_{\text{red}}$ ($N_{\text{red}} \ll N$) and reconstructs requested `.print` branch currents on the fly.
    - Delivers **2.2x–3.2x additional single-thread speedup** on production macros (`r5cal`, `r10f1n`, `r10forig`, `xadd4`, `adder`, `coupler`) and **3.1x–4.4x speedup** on 2D JJ grids.
-2. **Tier 1 + Phase 5 Per-Partition Nodal PTL Block-Parallel Solver (`-p -n` OpenMP & `-g` CUDA GPU):**
-   - Combines Nodal matrix reduction (`-n`) with PTL block-parallel windowing (`-p`): partitions the reduced matrix $A_{\text{red}}$ across transmission lines (`T`) and shared Dirichlet supply rails (`VS`/`PS`) into $P$ tiny independent KLU blocks (`47,425 -> 9,195` eqns across `583` blocks on `adder`, max block `85` eqns; `38,826 -> 9,870` eqns across `464` blocks on `coupler`, max block `30` eqns) and advances all $P$ blocks in parallel across the causal delay window $W = \min(T_d / \Delta t)$ steps in L1/L2 cache (`-p -n`, **up to `27.1x` CPU speedup**) or in GPU shared memory (`-g`, **up to `21.5x` GPU speedup**).
+2. **Tier 1 + Phase 5 Per-Partition Nodal PTL Block-Parallel Solver & Short-PTL Coarsening (`-p -n` OpenMP & `-g` CUDA GPU):**
+   - Combines Nodal matrix reduction (`-n`) with PTL block-parallel windowing (`-p`): automatically coarsens 0-JJ passive PTL-via islands and ultra-short PTLs ($k < 4$) while partitioning the reduced matrix $A_{\text{red}}$ across transmission lines (`T`) and shared Dirichlet supply rails (`VS`/`PS`) into $P$ tiny independent KLU blocks (`47,425 -> 9,195` eqns coarsened from `583` to `126` blocks on `adder`, $W = 3 \to 5$, max block `164` eqns; `38,826 -> 9,870` eqns across `464` blocks on `coupler`, max block `30` eqns) and advances all $P$ blocks in parallel across the causal delay window $W = \min_{p_1 \neq p_2}(T_d / \Delta t)$ steps in L1/L2 cache (`-p -n`, **up to `47.8x` CPU speedup**) or in GPU shared memory (`-g`, **up to `21.5x` GPU speedup**).
    - Includes **activity-driven quiescent partition bypass** (`.option bypass`) and NUMA-aware thread capping (`16` threads).
-3. **Tier 2 Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>`, `.option mc=<N>`, `.option mcall`):**
+3. **Sub-Timestep PTL Lumped $\pi$-Replacement (`.option lumpptl`, `.option minptl`):**
+   - Automatically replaces any lossless transmission line (`T`) whose propagation delay $T_d$ is smaller than a timestep ($T_d < 0.5\Delta t$ by default, or $T_d < \text{minptl}$ via `.option minptl=<td_min>`) with its exact matched lumped $L$-$C$ $\pi$-equivalent ($L_{\text{eq}} = Z_0 T_d$ in series, $C_{\text{port}} = T_d / (2 Z_0)$ shunting each port) prior to step-size clamping.
+   - Eliminates artificial $40\times$ global timestep crushing from `1 fs` PTL via/pad stubs (e.g. `r10forig` drops from `1,904 s` in `v2.6.5` / `257 s` in `v2.7` / `41.6 s` previously to **`3.39 s` wall / `2.81 s` transient** — **`561.7x` faster than `v2.6.5` and `75.8x` faster than `v2.7`** with `0.000 fs` event shift).
+4. **Tier 2 Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>`, `.option mc=<N>`, `.option mcall`):**
    - Parses and symbolically analyzes the netlist **once**, then executes $B = 32\text{–}4,096$ perturbed fabrication-yield trials simultaneously across OpenMP threads (`-p -b <N>`, **up to `31.1x` speedup**) or in a coalesced CUDA kernel (`-g -b <N>`, **up to `19.7x` speedup**).
    - Computes Welford online ensemble statistics (`<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`) and prints a **Monte Carlo Robustness Summary** table. Fixed an upstream bug in `JJ.cpp` where default `area=1.0` junctions ignored `.spread`.
-4. **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`, `.option gpu=3`):**
+5. **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`, `.option gpu=3`):**
    - Keeps the entire transient loop in GPU VRAM with zero per-timestep PCIe transfers (**`2.5x–4.2x` GPU speedup** on 2D JJ arrays up to `65,536` JJs).
-5. **Single-Core Engine & Memory Footprint Optimizations:**
+6. **Single-Core Engine & Memory Footprint Optimizations:**
    - $O(1)$ hash-map lookups (`deviceMap`, `csMap`) for mutual inductances (`K`) and `.print` traces; in-place CSR updates and `klu_l_refactor` on `RTYPE=1` switching; pre-reserved subcircuit flattening; linear token scanning; cached `PWL`/`PWS` segments; pre-computed `CUS` splines; and homogeneous device arrays (**1.5x–3.4x faster single-thread MNA** over `v2.6.5`/`v2.7`).
    - Replaced full-history PTL `results.xVector` forcing with compact circular ring buffers (`hist_`) of length $k+4$ and added in-loop `PRSTART`/`PRSTEP` decimation (**reducing peak RAM by 2x–17.6x**).
-6. **High-Speed Binary Output (`.npy`, `.bin`, `.rawb`) & New Controls:**
+7. **High-Speed Binary Output (`.npy`, `.bin`, `.rawb`) & New Controls:**
    - `.npy` (NumPy structured array, **2.4x–2.5x faster end-to-end runtime** on 2.5k–3k trace decks and **23x faster Python load**), `.bin` (`JOSIMBIN` column-major float64, **~37x faster write than CSV**), `.rawb` (SPICE3 binary raw), and Python loader [`scripts/josim_io.py`](../scripts/josim_io.py).
    - State checkpointing (`.savestate` / `.loadstate`), fractional PTL delay interpolation (`.option txinterp` / `interp=1`), mutual inductance cutoff (`.option kcutoff=<val>`), implicit JJ predictor-corrector (`-c [N]` / `.option corrector=<N>`), and fixed-step / step-halving diagnostics (`-f` / `.option fixedstep` / `.option warnstep`).
 
@@ -101,6 +104,8 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 | Netlist Directive | Origin | CLI Equivalent & Description |
 | :--- | :--- | :--- |
 | **`.option nodal`** | **New (`v2.8`)** | Same as `-n`. Enables Schur-complement nodal reduction ($A_{\text{red}}$). |
+| **`.option lumpptl[=0\|1]`** | **New (`v2.8`)** | Enables/disables automatic lumped $L$-$C$ $\pi$-replacement of sub-step PTLs (default `1`; disable via `.option nolumpptl`). |
+| **`.option minptl=<val>`** | **New (`v2.8`)** | Custom delay threshold $T_{d,\min}$ (seconds) below which lossless PTLs are replaced by $\pi$-equivalents (default $0.5\Delta t$). |
 | **`.option gpu[=1\|2\|3\|4]`** | **New (`v2.8`)** | Same as `-g [1\|2\|3\|4]` (aliases: `.option gpumono`, `.option gpunodal`, `.option cusolverrf`). |
 | **`.option bypass`** | **New (`v2.8`)** | Skips `klu_l_tsolve` on quiescent PTL partitions in `-p` mode (alias: `.option latency`). |
 | **`.option bypasstol=<val>`** | **New (`v2.8`)** | Activity threshold for `.option bypass` (default `1e-12`). |
@@ -128,9 +133,9 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5` 
 | :--- | ---: | ---: | ---: | ---: | ---: | :---: |
 | **`r5cal`** (3.5k JJs, $P=1$) | 762 s (0.29 GB) | 385 s | 212.6 s (0.28 GB) | **82.8 s** | **82.8 s** | **9.2x** (4.6x) |
 | **`r10f1n`** (10k JJs, $P=2$) | 337 s (1.31 GB) | 173 s (0.73 GB) | 80.9 s (**0.21 GB**) | **35.5 s** | **35.5 s** | **9.5x** (4.9x) |
-| **`r10forig`** (10k JJs, 1 fs PTL) | 1,904 s (6.0 GB) | 257 s (0.87 GB) | 131.5 s (**0.34 GB**) | **41.6 s** | **41.6 s** | **45.8x** (6.2x) |
-| **`adder`** (5.5k JJs, $P=583$) | 542 s (26.5 GB) | 325 s (15.2 GB) | 91.9 s (**8.0 GB**) | **36.3 s** | **18.96 s** | **28.6x** (17.1x) |
-| **`coupler`** (2.1k JJs, $P=464$) | 156 s (7.4 GB) | 126 s | 39.5 s (**4.3 GB**) | **15.3 s** | **5.73 s** | **27.2x** (22.0x) |
+| **`r10forig`** (10k JJs, 1 fs PTL) | 1,904 s (6.0 GB) | 257 s (0.87 GB) | 9.46 s (**0.20 GB**) | **3.39 s** | **3.39 s** | **561.7x** (75.8x) |
+| **`adder`** (5.5k JJs, $P=583\to126$) | 542 s (26.5 GB) | 325 s (15.2 GB) | 91.9 s (**8.0 GB**) | **36.3 s** | **11.33 s** | **47.8x** (28.7x) |
+| **`coupler`** (2.1k JJs, $P=464$) | 156 s (7.4 GB) | 126 s | 39.5 s (**4.3 GB**) | **15.3 s** | **5.58 s** | **28.0x** (22.6x) |
 | **`xadd4`** (3.5k JJs, $P=1$) | 85 s (0.42 GB) | 39 s | 24.6 s (**0.32 GB**) | **9.77 s** | **9.77 s** | **8.7x** (4.0x) |
 | **`dff`** (33 JJs, $P=1$) | 0.82 s | 0.46 s | 0.29 s | **0.20 s** | **0.20 s** | **4.1x** (2.3x) |
 
@@ -139,11 +144,11 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5` 
 | Deck | Full MNA ($N$) | Nodal ($N_{\text{red}}$) | Serial MNA Solve | **1T Nodal (`-n`) Solve** | **OpenMP (`-p -n`) Solve** | **Best Solve Speedup** |
 | :--- | ---: | ---: | ---: | ---: | ---: | :---: |
 | **`r5cal`** ($P=1, W=1$) | 64,400 | **29,622** (`2.17x`) | 212.10 s | **82.04 s** | **82.04 s** | **2.59x** (`-n`) |
-| **`r10f1n`** ($P=2, W=1$) | 89,806 | **41,262** (`2.18x`) | 80.29 s | **34.90 s** | **34.90 s** | **2.30x** (`-n`) |
-| **`r10forig`** ($P=2, W=1$) | 89,808 | **41,264** (`2.18x`) | 130.63 s | **41.06 s** | **40.76 s** | **3.20x** (`-n`) |
-| **`xadd4`** ($P=1, W=1$) | 31,813 | **8,565** (`3.71x`) | 24.06 s | **9.18 s** | **9.18 s** | **2.62x** (`-n`) |
+| **`r10f1n`** ($P=2, W=1$) | 89,806 | **39,976** (`2.25x`) | 80.29 s | **34.90 s** | **34.90 s** | **2.30x** (`-n`) |
+| **`r10forig`** ($P=2, W=1$) | 89,810 | **39,978** (`2.25x`) | 130.63 s (`8.89 s` lumped) | **2.81 s** | **2.81 s** | **46.49x** (`-n`) |
+| **`xadd4`** ($P=1, W=1$) | 31,813 | **9,041** (`3.52x`) | 24.06 s | **9.18 s** | **9.18 s** | **2.62x** (`-n`) |
 | **`coupler`** ($P=464, W=420$) | 38,826 | **9,870** (`3.93x`) | 36.19 s | **12.14 s** (`2.98x`) | **2.71 s** | **13.38x** (`-p -n`) |
-| **`adder`** ($P=583, W=3$) | 47,425 | **9,195** (`5.16x`) | 83.34 s | **28.06 s** (`2.97x`) | **12.53 s** | **6.65x** (`-p -n`) |
+| **`adder`** ($P=583\to126, W=3\to5$) | 47,425 | **9,195** (`5.16x`) | 83.34 s | **28.06 s** (`2.97x`) | **5.47 s** | **15.24x** (`-p -n`) |
 | **`dff`** ($P=1, W=1$) | 504 | **174** (`2.90x`) | 0.234 s | **0.141 s** | **0.141 s** | **1.66x** (`-n`) |
 
 ---

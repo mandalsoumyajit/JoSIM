@@ -386,6 +386,13 @@ void Input::parse_options_and_state_controls() {
                     argMcAll = true;
                 } else if (tok == "MCALL=0" || tok == "MCALL=FALSE") {
                     argMcAll = false;
+                } else if (tok == "LUMPPTL" || tok == "LUMPPTL=1" || tok == "LUMPPTL=TRUE") {
+                    argLumpPtl = true;
+                } else if (tok == "LUMPPTL=0" || tok == "LUMPPTL=FALSE" || tok == "NOLUMPPTL") {
+                    argLumpPtl = false;
+                } else if (tok.rfind("MINPTL=", 0) == 0) {
+                    argLumpPtl = true;
+                    argMinPtl  = std::abs(parse_param(tok.substr(7), parameters));
                 }
             }
         }

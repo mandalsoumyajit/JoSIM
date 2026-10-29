@@ -12,12 +12,96 @@
 #include "JoSIM/Rng.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <iostream>
 #include <string>
+#include <unordered_set>
 
 using namespace JoSIM;
 
 void Matrix::create_matrix(Input& iObj) {
+    if (!iObj.ptlLumpedDone) {
+        iObj.ptlLumpedDone = true;
+        if (iObj.argLumpPtl && iObj.transSim.tstep() > 0.0) {
+            const double h0    = iObj.transSim.tstep();
+            const double minTd = std::max(iObj.argMinPtl, iObj.argTxInterp ? (h0 * (1.0 - 1e-12)) : (0.5 * h0));
+            std::unordered_set<std::string> printedTokens;
+            for (const auto& ctrl : iObj.controls) {
+                if (!ctrl.empty() && (ctrl.front() == "PRINT" || ctrl.front() == "PLOT" || ctrl.front() == "SAVE")) {
+                    for (size_t k = 1; k < ctrl.size(); ++k) {
+                        printedTokens.insert(ctrl[k]);
+                        const auto p1 = ctrl[k].find('(');
+                        const auto p2 = ctrl[k].find(')');
+                        if (p1 != std::string::npos && p2 != std::string::npos && p2 > p1 + 1) {
+                            printedTokens.insert(ctrl[k].substr(p1 + 1, p2 - p1 - 1));
+                        }
+                    }
+                }
+            }
+            auto is_gnd_node = [](const std::string& n) {
+                return n == "0" || n.find("GND") != std::string::npos;
+            };
+            std::vector<std::pair<tokens_t, string_o>> extraCaps;
+            int64_t                                    lumpedCount = 0;
+            for (auto& line : iObj.netlist.expNetlist) {
+                if (line.first.empty() || line.first.front().at(0) != 'T' || line.first.size() < 6) { continue; }
+                expand_inline_parameters(line, iObj.parameters);
+                const std::string& tLabel = line.first.at(0);
+                if (printedTokens.count(tLabel) != 0) { continue; }
+                const std::string& n1Pos = line.first.at(1);
+                const std::string& n1Neg = line.first.at(2);
+                const std::string& n2Pos = line.first.at(3);
+                const std::string& n2Neg = line.first.at(4);
+                const bool         sameRef = (is_gnd_node(n1Neg) && is_gnd_node(n2Neg)) || (n1Neg == n2Neg);
+                if (!sameRef || n1Pos == n2Pos) { continue; }
+
+                double rawTd = 0.0;
+                double z0    = 0.0;
+                bool   hasTd = false;
+                bool   hasZ0 = false;
+                for (size_t k = 5; k < line.first.size(); ++k) {
+                    const std::string& tok = line.first.at(k);
+                    if (tok.size() >= 4 && ::memcmp(tok.c_str(), "Z0=", 3) == 0) {
+                        z0    = parse_param(tok.substr(3), iObj.parameters, line.second);
+                        hasZ0 = true;
+                    } else if (tok.size() >= 4 && ::memcmp(tok.c_str(), "TD=", 3) == 0) {
+                        rawTd = parse_param(tok.substr(3), iObj.parameters, line.second);
+                        hasTd = true;
+                    }
+                }
+                if (hasTd && hasZ0 && z0 > 0.0 && rawTd > 0.0 && rawTd < minTd) {
+                    const double lEq   = z0 * rawTd;
+                    const double cPort = rawTd / (2.0 * z0);
+                    const std::string origLabel = tLabel;
+                    const std::string p1Pos     = n1Pos;
+                    const std::string p1Neg     = n1Neg;
+                    const std::string p2Pos     = n2Pos;
+                    const std::string p2Neg     = n2Neg;
+                    line.first = tokens_t{"L$ptl$" + origLabel, p1Pos, p2Pos, Misc::precise_to_string(lEq), "SPREAD=0"};
+                    if (cPort > 0.0) {
+                        if (p1Pos != p1Neg) {
+                            extraCaps.emplace_back(
+                                    tokens_t{"C$ptl1$" + origLabel, p1Pos, p1Neg, Misc::precise_to_string(cPort), "SPREAD=0"},
+                                    line.second);
+                        }
+                        if (p2Pos != p2Neg) {
+                            extraCaps.emplace_back(
+                                    tokens_t{"C$ptl2$" + origLabel, p2Pos, p2Neg, Misc::precise_to_string(cPort), "SPREAD=0"},
+                                    line.second);
+                        }
+                    }
+                    ++lumpedCount;
+                }
+            }
+            if (!extraCaps.empty()) {
+                iObj.netlist.expNetlist.insert(iObj.netlist.expNetlist.end(), extraCaps.begin(), extraCaps.end());
+            }
+            if (lumpedCount > 0 && iObj.argVerb >= 1) {
+                std::cout << "JoSIM: Replaced " << lumpedCount << " sub-timestep transmission line(s) (TD < " << minTd
+                          << " s) with lumped L-C pi equivalents\n";
+            }
+        }
+    }
     while (needsTR_) {
         // Rewind RNG
         Rng::rewind();

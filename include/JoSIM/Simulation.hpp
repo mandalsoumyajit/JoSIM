@@ -327,6 +327,85 @@ struct NodalPartition {
     std::vector<int64_t>     traceGlobalRows;
 };
 
+struct NodalRLEdgeStamp {
+    double  zR0         = 0.0;
+    double  zL0         = 0.0;
+    int32_t nzIdxPP     = -1;
+    int32_t nzIdxQQ     = -1;
+    int32_t nzIdxPQ     = -1;
+    int32_t nzIdxQP     = -1;
+    int32_t nodalResIdx = -1;
+    int32_t nodalIndIdx = -1;
+};
+
+struct Nodal2TermStamp {
+    double  g0      = 0.0;
+    int32_t nzIdxPP = -1;
+    int32_t nzIdxQQ = -1;
+    int32_t nzIdxPQ = -1;
+    int32_t nzIdxQP = -1;
+};
+
+struct NodalRelTraceRef {
+    int32_t devKind = 0; // 0 = none, 1 = res, 2 = ind, 3 = cap, 4 = txHalf
+    int32_t devIdx  = -1;
+};
+
+struct MnaJJState {
+    int64_t state     = 0;
+    double  pn1       = 0.0, pn2 = 0.0, pn3 = 0.0, pn4 = 0.0, phi0 = 0.0;
+    double  vn1       = 0.0, vn2 = 0.0, vn3 = 0.0, vn4 = 0.0, vn5 = 0.0, vn6 = 0.0;
+    double  it        = 0.0, cTerm = 0.0, curNzBack = 0.0;
+};
+
+struct MnaP4State {
+    double pn1 = 0.0, pn2 = 0.0, pn3 = 0.0, pn4 = 0.0;
+};
+
+struct MnaCapState {
+    double pn1 = 0.0, pn2 = 0.0, pn3 = 0.0, pn4 = 0.0, pn5 = 0.0, pn6 = 0.0, pn7 = 0.0;
+};
+
+struct MnaIndState {
+    double In2 = 0.0, In3 = 0.0, In4 = 0.0;
+};
+
+struct TxScalarState {
+    double n1_1 = 0.0, n2_1 = 0.0, n1_2 = 0.0, n2_2 = 0.0;
+    double nk_1 = 0.0, nk_2 = 0.0, nk1_1 = 0.0, nk1_2 = 0.0, nk2_1 = 0.0, nk2_2 = 0.0;
+};
+
+struct RollingCheckpoint {
+    bool                            valid     = false;
+    int64_t                         stepIdx   = -1;
+    int64_t                         subSteps  = 1;
+    double                          stepSize  = 0.0;
+    size_t                          keptCount = 0;
+    std::vector<double>             x;
+    std::vector<double>             b;
+    std::vector<double>             nodalX;
+    std::vector<double>             nodalB;
+    std::vector<double>             nodalNz;
+    std::vector<GpuJJ>              nodalJJs;
+    std::vector<GpuRes>             nodalRess;
+    std::vector<GpuInd>             nodalInds;
+    std::vector<GpuCap>             nodalCaps;
+    std::vector<GpuVS>              nodalVSs;
+    std::vector<GpuCCVS>            nodalCCVSs;
+    std::vector<GpuVCCS>            nodalVCCSs;
+    std::vector<GpuTxHalf>          nodalTxHalves;
+    std::vector<MnaJJState>         mnaJJs;
+    std::vector<MnaP4State>         mnaRess;
+    std::vector<MnaIndState>        mnaInds;
+    std::vector<MnaCapState>        mnaCaps;
+    std::vector<MnaP4State>         mnaVSs;
+    std::vector<MnaP4State>         mnaCCVSs;
+    std::vector<MnaP4State>         mnaVCCSs;
+    std::vector<TxScalarState>                 txScalars;
+    std::vector<TransmissionLine::TxHistEntry> txHistFlat;
+    std::vector<InLoopEventTracker>            eventTrackers;
+};
+
 class Simulation {
   private:
     bool                SLU = false;
@@ -342,6 +421,7 @@ class Simulation {
     double              bypassTol_               = 1e-6;
     bool                fixedStep_               = false;
     bool                warnStep_                = false;
+    int64_t             rollbackMode_            = 1;
     int64_t             verb_                    = 0;
     int64_t             mcRuns_                  = 1;
     int64_t             correctorIter_           = 0;
@@ -355,7 +435,10 @@ class Simulation {
     bool                needsLU_;
     bool                needsTR_ = true;
     bool                startup_;
-    double              stepSize_, prstep_, prstart_;
+    double              stepSize_, baseStepSize_ = 0.0, prstep_, prstart_;
+    int                 subSteps_                = 1;
+    int                 subStepIdx_              = 0;
+    RollingCheckpoint   ckpt_[2];
 
     // In-loop print windowing & decimation schedule
     bool                 useDecimation_ = false;
@@ -419,6 +502,13 @@ class Simulation {
     std::vector<GpuRelTrace>             nodalRelTraces_;
     std::vector<uint8_t>                 nodalIsDirichletRed_;
     std::vector<double>                  nodalDirichletSign_;
+    std::vector<double>                  nodalFixedNz_;
+    std::vector<std::pair<int32_t, double>> nodalScaleH_;
+    std::vector<std::pair<int32_t, double>> nodalScaleInvH_;
+    std::vector<NodalRLEdgeStamp>        nodalRLEdges_;
+    std::vector<Nodal2TermStamp>         nodalCapStamps_;
+    std::vector<Nodal2TermStamp>         nodalTxStamps_;
+    std::vector<NodalRelTraceRef>        nodalRelTraceRefs_;
     bool                                 useNodalPartitions_ = false;
     std::vector<NodalPartition>          nodalPartitions_;
 #ifdef JOSIM_CUDA
@@ -427,6 +517,12 @@ class Simulation {
 #endif
 
     void setup(Input& iObj, Matrix& mObj);
+    void save_nodal_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx);
+    void restore_nodal_checkpoint(const RollingCheckpoint& ckpt);
+    void rescale_nodal_timestep(double oldH, double newH, bool hasPrevStep);
+    void save_mna_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx);
+    void restore_mna_checkpoint(Matrix& mObj, const RollingCheckpoint& ckpt);
+    void rescale_mna_timestep(Matrix& mObj, double oldH, double newH, bool hasPrevStep);
     void init_event_trackers(const Matrix& mObj);
     void finalize_event_trackers();
     inline void record_inloop_event(int64_t globR, int32_t kSlot, double rawVal) {

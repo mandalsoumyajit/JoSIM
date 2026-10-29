@@ -48,12 +48,11 @@ namespace JoSIM {
 */
 
 class JJ : public BasicComponent {
-  private:
+  public:
     int64_t hDepPos_ = 0;
     int64_t state_   = 0;
     double  h_       = 0.0;
 
-  public:
     int64_t                 variableIndex_ = 0;
     int64_t                 nzBackIndex_   = 0;
     double                  area_          = 1.0;

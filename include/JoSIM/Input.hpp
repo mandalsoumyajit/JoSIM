@@ -56,6 +56,7 @@ class Input {
     double                                                       argBypassTol    = 1e-6;
     bool                                                         argFixedStep    = false;
     bool                                                         argWarnStep     = false;
+    int64_t                                                      argRollback     = 1;
     bool                                                         argTxInterp     = false;
     int64_t                                                      argCorrector    = 0;
     double                                                       argCorrectorTol = 1e-3;

@@ -439,17 +439,31 @@ void Input::parse_options_and_state_controls() {
                     argEvents     = false;
                     argEventsOnly = false;
                 } else if (tok.rfind("EVENTS=", 0) == 0) {
-                    argEvents  = true;
-                    eventsFile = resolve_path(tok.substr(7));
+                    argEvents              = true;
+                    const std::string val  = tok.substr(7);
+                    const uint32_t    mTry = parse_event_metrics(val, EVENT_METRIC_NONE);
+                    if (mTry != EVENT_METRIC_NONE && val.find('.') == std::string::npos
+                        && val.find('/') == std::string::npos && val.find('\\') == std::string::npos) {
+                        argEventMetrics = parse_event_metrics(val, argEventMetrics);
+                    } else {
+                        eventsFile = resolve_path(val);
+                    }
                 } else if (tok == "EVENTSONLY" || tok == "EVENTSONLY=1" || tok == "EVENTSONLY=TRUE") {
                     argEvents     = true;
                     argEventsOnly = true;
                 } else if (tok == "EVENTSONLY=0" || tok == "EVENTSONLY=FALSE") {
                     argEventsOnly = false;
                 } else if (tok.rfind("EVENTSONLY=", 0) == 0) {
-                    argEvents     = true;
-                    argEventsOnly = true;
-                    eventsFile    = resolve_path(tok.substr(11));
+                    argEvents              = true;
+                    argEventsOnly          = true;
+                    const std::string val  = tok.substr(11);
+                    const uint32_t    mTry = parse_event_metrics(val, EVENT_METRIC_NONE);
+                    if (mTry != EVENT_METRIC_NONE && val.find('.') == std::string::npos
+                        && val.find('/') == std::string::npos && val.find('\\') == std::string::npos) {
+                        argEventMetrics = parse_event_metrics(val, argEventMetrics);
+                    } else {
+                        eventsFile = resolve_path(val);
+                    }
                 } else if (tok == "EVENTMETRICS" || tok == "EVENTPULSE" || tok == "EVENTPULSE=1"
                            || tok == "EVENTPULSE=TRUE") {
                     argEvents       = true;
@@ -463,6 +477,13 @@ void Input::parse_options_and_state_controls() {
                 } else if (tok.rfind("EVENTPULSE=", 0) == 0) {
                     argEvents       = true;
                     argEventMetrics = parse_event_metrics(tok.substr(11), argEventMetrics);
+                } else if (tok == "ROLLBACK" || tok == "ROLLBACK=1" || tok == "ROLLBACK=TRUE"
+                           || tok == "ROLLBACK=WINDOW") {
+                    argRollback = 1;
+                } else if (tok == "ROLLBACK=2" || tok == "ROLLBACK=STAY") {
+                    argRollback = 2;
+                } else if (tok == "NOROLLBACK" || tok == "ROLLBACK=0" || tok == "ROLLBACK=FALSE") {
+                    argRollback = 0;
                 }
             }
         }

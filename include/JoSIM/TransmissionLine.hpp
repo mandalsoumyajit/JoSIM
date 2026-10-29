@@ -50,11 +50,10 @@ namespace JoSIM {
 */
 
 class TransmissionLine : public BasicComponent {
-  private:
+  public:
     int64_t             hDepPos_ = 0;
     JoSIM::AnalysisType at_;
 
-  public:
     NodeConfig nodeConfig2_;
     int_o      posIndex2_, negIndex2_;
     int64_t    currentIndex2_ = 0;

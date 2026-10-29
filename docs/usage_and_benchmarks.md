@@ -32,12 +32,13 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
    - Computes Welford online ensemble statistics (`<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`) and prints a **Monte Carlo Robustness Summary** table. Fixed an upstream bug in `JJ.cpp` where default `area=1.0` junctions ignored `.spread`.
 6. **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`, `.option gpu=3`):**
    - Keeps the entire transient loop in GPU VRAM with zero per-timestep PCIe transfers (**`2.5x–4.2x` GPU speedup** on 2D JJ arrays up to `65,536` JJs).
-7. **Single-Core Engine & Memory Footprint Optimizations:**
+7. **Single-Core Engine, Memory Footprint & Local Rollback Optimizations:**
    - $O(1)$ hash-map lookups (`deviceMap`, `csMap`) for mutual inductances (`K`) and `.print` traces; in-place CSR updates and `klu_l_refactor` on `RTYPE=1` switching; pre-reserved subcircuit flattening; linear token scanning; cached `PWL`/`PWS` segments; pre-computed `CUS` splines; and homogeneous device arrays (**1.5x–3.4x faster single-thread MNA** over `v2.6.5`/`v2.7`).
    - Replaced full-history PTL `results.xVector` forcing with compact circular ring buffers (`hist_`) of length $k+4$ and added in-loop `PRSTART`/`PRSTEP` decimation (**reducing peak RAM by 2x–17.6x**).
+   - **In-Memory Rolling Checkpoints for Local Step-Halving Rollback (`.option rollback[=1|2|window|stay]`, `.option norollback`):** Maintains a double-buffered 128-step rolling checkpoint (`ckpt_[2]`, `<2 MB`) in both Standard MNA and CPU Nodal (`-n`). When a junction phase jump exceeds $0.4\pi$ (`needsTR_`), JoSIM rolls back only $32\text{–}256$ base steps to the nearest safe checkpoint, rescales BDF2 two-step history ($h_{\text{old}} \to h_{\text{new}}$) and matrix diagonal entries in place (`klu_l_refactor`), and sub-steps locally ($M = 2, 4, 8, 16$) instead of restarting from $t = 0$ (**2.02x–3.93x faster** across Phase & Voltage modes).
 8. **High-Speed Binary Output (`.npy`, `.bin`, `.rawb`) & New Controls:**
    - `.npy` (NumPy structured array, **2.4x–2.5x faster end-to-end runtime** on 2.5k–3k trace decks and **23x faster Python load**), `.bin` (`JOSIMBIN` column-major float64, **~37x faster write than CSV**), `.rawb` (SPICE3 binary raw), and Python loader [`scripts/josim_io.py`](../scripts/josim_io.py).
-   - State checkpointing (`.savestate` / `.loadstate`), fractional PTL delay interpolation (`.option txinterp` / `interp=1`), mutual inductance cutoff (`.option kcutoff=<val>`), implicit JJ predictor-corrector (`-c [N]` / `.option corrector=<N>`), and fixed-step / step-halving diagnostics (`-f` / `.option fixedstep` / `.option warnstep`).
+   - State checkpointing (`.savestate` / `.loadstate`), local step-halving rollback (`.option rollback[=1|2|window|stay]` / `.option norollback`), fractional PTL delay interpolation (`.option txinterp` / `interp=1`), mutual inductance cutoff (`.option kcutoff=<val>`), implicit JJ predictor-corrector (`-c [N]` / `.option corrector=<N>`), and fixed-step / step-halving diagnostics (`-f` / `.option fixedstep` / `.option warnstep`).
 
 ---
 
@@ -126,6 +127,7 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 | **`.option corrector=<N>`** | **New (`v2.8`)** | Same as `-c <N>`. Enables up to `N` implicit JJ predictor-corrector iterations. |
 | **`.option correctortol=<v>`** | **New (`v2.8`)** | Phase convergence threshold for `corrector` (default `1e-3` rad). |
 | **`.option fixedstep`** | **New (`v2.8`)** | Same as `-f`. Disables automatic timestep halving. |
+| **`.option rollback[=m]`** | **New (`v2.8`)** | Controls in-memory rolling checkpoint rollback on $>0.4\pi$ phase jumps: `1` or `window` (default: local rollback + adaptive sub-step window), `2` or `stay` (local rollback + keep sub-step rate for remainder of run), `0` (disable; alias: `.option norollback`, full restart from $t=0$). |
 | **`.option warnstep`** | **New (`v2.8`)** | Prints diagnostic warning naming the JJ and time that triggered step halving. |
 | `.option seed=<uint64>` | Enhanced (`v2.8`) | Deterministic RNG seed for noise and `.spread` (also settable via `JOSIM_SEED` env var). |
 
@@ -169,6 +171,16 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5` 
 | **`r10f1n`** (`4` events) | 27.36 s (0.28 GB) | **27.04 s** (**0.29 GB**) | **27.02 s** (**0.29 GB**) | `10.0 MB` $\to$ **`0.3 KB`** (`0.6 KB`) | $\|V_{\text{peak}}\|=0.319\text{ mV}$, $\text{FWHM}=4.01\text{ ps}$, $\Delta t_\pi=11.25\text{ ps}$, $\|\text{area}\|=2.33\text{ fV}\cdot\text{s}$ |
 | **`r10forig`** (`4` events) | 3.18 s (0.28 GB) | **3.18 s** (**0.29 GB**) | **3.18 s** (**0.29 GB**) | `1.0 MB` $\to$ **`0.3 KB`** (`0.6 KB`) | $\|V_{\text{peak}}\|=0.319\text{ mV}$, $\text{FWHM}=4.01\text{ ps}$, $\Delta t_\pi=11.25\text{ ps}$, $\|\text{area}\|=2.33\text{ fV}\cdot\text{s}$ |
 | **`dff`** (`9` events) | 0.21 s (0.13 GB) | **0.20 s** (**0.13 GB**) | **0.20 s** (**0.13 GB**) | `1.7 MB` $\to$ **`0.5 KB`** (`1.0 KB`) | $\|V_{\text{peak}}\|=0.277\text{ mV}$, $\text{FWHM}=4.69\text{ ps}$, $\Delta t_\pi=6.78\text{ ps}$, $\|\text{area}\|=2.09\text{ fV}\cdot\text{s}$ |
+
+#### In-Memory Rolling Checkpoints & Local Step-Halving Rollback (`.option rollback`) (`BNL exxact`)
+
+When a Josephson junction exceeds the $0.4\pi$ per-step phase-jump threshold (`needsTR_`), upstream JoSIM discards all computed work and restarts the entire transient simulation from $t = 0$ (`.option norollback`). With **in-memory rolling checkpoints** (`.option rollback=1` [`window`, default] or `.option rollback=2` [`stay`]), JoSIM rolls back only $32\text{–}256$ base steps to the nearest 128-step rolling checkpoint and sub-steps locally ($M = 2, 4, 8, 16$):
+
+| Circuit & Step-Halving Scenario | Solver Mode | `.option norollback` (Restart from $t=0$) | **`.option rollback=1` (`window`, default)** | **`.option rollback=2` (`stay`)** | **Best Speedup (Final $\Phi$ Error)** |
+| :--- | :--- | ---: | ---: | ---: | :---: |
+| **166-JJ MIT-LL DCSFQ + 80-JTL Chain**<br>(`tstop=2000ps`, `tstep=1.0ps`, 3 halvings $\to 0.125\text{ ps}$) | Standard MNA (Phase)<br>Standard MNA (Voltage)<br>CPU Nodal (`-n`, Phase)<br>CPU Nodal (`-n`, Voltage)<br>Events-Only (`-n`, `eventsonly=peak,pulse`) | 1,077.2 ms<br>1,168.2 ms<br>501.4 ms<br>654.8 ms<br>493.3 ms | **387.6 ms (`2.78x`)**<br>**401.3 ms (`2.91x`)**<br>231.2 ms (`2.17x`)<br>**264.1 ms (`2.48x`)**<br>228.6 ms (`2.16x`) | 411.7 ms (`2.62x`)<br>443.9 ms (`2.63x`)<br>**227.5 ms (`2.20x`)**<br>280.9 ms (`2.33x`)<br>**223.4 ms (`2.21x`)** | **`2.78x`** (`0.0000 rad`)<br>**`2.91x`** (`0.0000 rad`)<br>**`2.20x`** (`0.0000 rad`)<br>**`2.48x`** (`0.0000 rad`)<br>**`2.21x`** (`8/8` events) |
+| **2,006-JJ MIT-LL DCSFQ + 1,000-JTL Chain**<br>(`tstop=2000ps`, `tstep=0.5ps`, burst at $1600\text{ ps}$) | CPU Nodal (`-n`, Phase)<br>CPU Nodal (`-n`, Voltage)<br>Standard MNA (Phase)<br>Standard MNA (Voltage) | 2,430.0 ms<br>3,280.9 ms<br>6,580.9 ms<br>12,422.1 ms | 1,204.5 ms (`2.02x`)<br>**1,539.9 ms (`2.13x`)**<br>**2,912.3 ms (`2.26x`)**<br>4,947.2 ms (`2.51x`) | **1,192.9 ms (`2.04x`)**<br>1,563.2 ms (`2.10x`)<br>3,100.5 ms (`2.12x`)<br>**4,840.3 ms (`2.57x`)** | **`2.04x`** (`0.0000 rad`)<br>**`2.13x`** (`0.0000 rad`)<br>**`2.26x`** (`0.0000 rad`)<br>**`2.57x`** (`0.0000 rad`) |
+| **2,006-JJ MIT-LL DCSFQ + 1,000-JTL Chain**<br>(`tstop=2000ps`, `tstep=1.0ps`, 2 halvings $\to 0.25\text{ ps}$) | CPU Nodal (`-n`, Phase)<br>CPU Nodal (`-n`, Voltage)<br>Standard MNA (Phase)<br>Standard MNA (Voltage) | 2,631.5 ms<br>3,460.5 ms<br>6,591.5 ms<br>13,128.2 ms | 1,201.8 ms (`2.19x`)<br>1,591.2 ms (`2.17x`)<br>3,152.3 ms (`2.09x`)<br>5,584.9 ms (`2.35x`) | **1,197.1 ms (`2.20x`)**<br>**1,558.3 ms (`2.22x`)**<br>**3,003.1 ms (`2.19x`)**<br>**3,336.8 ms (`3.93x`)** | **`2.20x`** (`0.0000 rad`)<br>**`2.22x`** (`0.0000 rad`)<br>**`2.19x`** (`0.0000 rad`)<br>**`3.93x`** (`0.0000 rad`) |
 
 ---
 

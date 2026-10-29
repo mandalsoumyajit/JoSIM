@@ -301,6 +301,46 @@ void Input::syntax_check_controls(std::vector<tokens_t>& controls) {
     }
 }
 
+uint32_t Input::parse_event_metrics(const std::string& spec, uint32_t currentMask) {
+    uint32_t    mask = currentMask;
+    std::string s    = spec;
+    std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t next = s.find_first_of(",+;:", pos);
+        if (next == std::string::npos) { next = s.size(); }
+        std::string item = s.substr(pos, next - pos);
+        Misc::ltrim(item);
+        Misc::rtrim(item);
+        if (!item.empty()) {
+            if (item == "0" || item == "FALSE" || item == "NONE") {
+                mask = EVENT_METRIC_NONE;
+            } else if (item == "1" || item == "TRUE" || item == "PULSE" || item == "DEFAULT") {
+                mask |= EVENT_METRIC_PULSE;
+            } else if (item == "ALL" || item == "FULL") {
+                mask |= EVENT_METRIC_ALL;
+            } else if (item == "T_PEAK" || item == "TPEAK") {
+                mask |= EVENT_METRIC_T_PEAK;
+            } else if (item == "V_PEAK" || item == "VPEAK" || item == "PEAK" || item == "HEIGHT") {
+                mask |= EVENT_METRIC_V_PEAK;
+            } else if (item == "FWHM" || item == "WIDTH") {
+                mask |= EVENT_METRIC_FWHM;
+            } else if (item == "DT_PI" || item == "DTPI") {
+                mask |= EVENT_METRIC_DT_PI;
+            } else if (item == "AREA" || item == "FLUX") {
+                mask |= EVENT_METRIC_AREA;
+            } else if (item == "TIME=PEAK" || item == "TIME=T_PEAK" || item == "TIME=TPEAK" || item == "TIME=V_PEAK"
+                       || item == "TIME=VPEAK" || item == "TIMEPEAK") {
+                mask |= EVENT_METRIC_TIME_PEAK;
+            } else if (item == "TIME=CROSS" || item == "TIME=TCROSS" || item == "TIMECROSS") {
+                mask &= ~static_cast<uint32_t>(EVENT_METRIC_TIME_PEAK);
+            }
+        }
+        pos = next + 1;
+    }
+    return mask;
+}
+
 void Input::parse_options_and_state_controls() {
     auto resolve_path = [&](const std::string& raw) -> std::string {
         auto p = std::filesystem::path(raw);
@@ -393,7 +433,64 @@ void Input::parse_options_and_state_controls() {
                 } else if (tok.rfind("MINPTL=", 0) == 0) {
                     argLumpPtl = true;
                     argMinPtl  = std::abs(parse_param(tok.substr(7), parameters));
+                } else if (tok == "EVENTS" || tok == "EVENTS=1" || tok == "EVENTS=TRUE") {
+                    argEvents = true;
+                } else if (tok == "EVENTS=0" || tok == "EVENTS=FALSE" || tok == "NOEVENTS") {
+                    argEvents     = false;
+                    argEventsOnly = false;
+                } else if (tok.rfind("EVENTS=", 0) == 0) {
+                    argEvents  = true;
+                    eventsFile = resolve_path(tok.substr(7));
+                } else if (tok == "EVENTSONLY" || tok == "EVENTSONLY=1" || tok == "EVENTSONLY=TRUE") {
+                    argEvents     = true;
+                    argEventsOnly = true;
+                } else if (tok == "EVENTSONLY=0" || tok == "EVENTSONLY=FALSE") {
+                    argEventsOnly = false;
+                } else if (tok.rfind("EVENTSONLY=", 0) == 0) {
+                    argEvents     = true;
+                    argEventsOnly = true;
+                    eventsFile    = resolve_path(tok.substr(11));
+                } else if (tok == "EVENTMETRICS" || tok == "EVENTPULSE" || tok == "EVENTPULSE=1"
+                           || tok == "EVENTPULSE=TRUE") {
+                    argEvents       = true;
+                    argEventMetrics = parse_event_metrics("PULSE", argEventMetrics);
+                } else if (tok == "EVENTMETRICS=0" || tok == "EVENTMETRICS=FALSE" || tok == "EVENTMETRICS=NONE"
+                           || tok == "EVENTPULSE=0" || tok == "EVENTPULSE=FALSE" || tok == "NOEVENTMETRICS") {
+                    argEventMetrics = EVENT_METRIC_NONE;
+                } else if (tok.rfind("EVENTMETRICS=", 0) == 0) {
+                    argEvents       = true;
+                    argEventMetrics = parse_event_metrics(tok.substr(13), argEventMetrics);
+                } else if (tok.rfind("EVENTPULSE=", 0) == 0) {
+                    argEvents       = true;
+                    argEventMetrics = parse_event_metrics(tok.substr(11), argEventMetrics);
                 }
+            }
+        }
+    }
+    if (argEvents) {
+        bool hasFileControl = false;
+        for (const auto& c : controls) {
+            if (!c.empty() && c.front() == "FILE") {
+                hasFileControl = true;
+                break;
+            }
+        }
+        if (!cli_output_file.has_value() && !hasFileControl) { argEventsOnly = true; }
+        if (!eventsFile.has_value()) {
+            if (cli_output_file.has_value()) {
+                if (argEventsOnly) {
+                    eventsFile = cli_output_file->name();
+                } else {
+                    std::filesystem::path p(cli_output_file->name());
+                    std::string           ext      = p.extension().string();
+                    std::string           extUpper = ext;
+                    std::transform(extUpper.begin(), extUpper.end(), extUpper.begin(), ::toupper);
+                    const std::string evExt = (extUpper == ".CSV" || extUpper == ".DAT") ? ext : ".npy";
+                    p.replace_extension(".events" + evExt);
+                    eventsFile = p.string();
+                }
+            } else {
+                eventsFile = std::filesystem::current_path().append("events.npy").string();
             }
         }
     }

@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -206,6 +207,11 @@ void write_streamed_row_major(std::ofstream&                        outfile,
 } // namespace
 
 Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
+    if (iObj.argEvents && iObj.eventsFile.has_value() && !iObj.eventsFile->empty()) {
+        write_events(iObj, mObj, sObj);
+        if (iObj.argEventsOnly) { return; }
+    }
+
     bool allBinaryFiles = (iObj.cli_output_file.has_value() || !iObj.output_files.empty());
     auto is_bin_type    = [](FileOutputType ft) {
         return ft == FileOutputType::Npy || ft == FileOutputType::Bin || ft == FileOutputType::RawBin;
@@ -1463,6 +1469,227 @@ void Output::format_cout(const bool& argMin) {
             }
             std::cout << std::setw(15) << std::scientific << std::setprecision(6)
                       << traces.at(traces.size() - 1).data_.at(j) << "\n";
+        }
+    }
+}
+
+void Output::write_events(const Input& iObj, Matrix& mObj, Simulation& sObj) {
+    const auto& x    = sObj.results.xVector;
+    const auto& t    = sObj.results.timeAxis;
+    const auto& tran = iObj.transSim;
+
+    std::vector<int64_t> result_indices;
+    if (!sObj.results.printIndices.empty()) {
+        result_indices = sObj.results.printIndices;
+    } else if (!t.empty()) {
+        for (size_t i = 0; i < t.size(); ++i) {
+            if (t[i] >= tran.prstart()) {
+                result_indices.emplace_back(static_cast<int64_t>(i));
+                break;
+            }
+        }
+        double next_print_point = tran.prstart() + tran.prstep();
+        if (!result_indices.empty()) {
+            for (size_t i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
+                if (t[i] >= next_print_point) {
+                    result_indices.emplace_back(static_cast<int64_t>(i));
+                    next_print_point += tran.prstep();
+                }
+            }
+        }
+    }
+
+    std::vector<RelevantTrace> fallbackTraces;
+    const auto*                traceListPtr = &mObj.relevantTraces;
+    if (mObj.relevantTraces.empty()) {
+        for (const auto& devVar : mObj.components.devices) {
+            if (std::holds_alternative<JJ>(devVar)) {
+                const auto&   jjDev = std::get<JJ>(devVar);
+                RelevantTrace temp;
+                temp.device      = true;
+                temp.storageType = StorageType::Phase;
+                temp.deviceLabel = "\"P(" + jjDev.netlistInfo.label_ + ")\"";
+                if (iObj.argAnal == AnalysisType::Voltage) {
+                    temp.variableIndex = jjDev.variableIndex_;
+                } else {
+                    temp.index1 = jjDev.indexInfo.posIndex_;
+                    temp.index2 = jjDev.indexInfo.negIndex_;
+                }
+                fallbackTraces.push_back(temp);
+            }
+        }
+        traceListPtr = &fallbackTraces;
+    }
+
+    std::vector<std::string> traceNames;
+    std::vector<SfqEvent>    allEvents;
+    size_t                   maxNameLen = 1;
+
+    for (size_t tIdx = 0; tIdx < traceListPtr->size(); ++tIdx) {
+        const auto& tr = (*traceListPtr)[tIdx];
+        if (tr.storageType != StorageType::Phase) { continue; }
+        std::string name = tr.deviceLabel.value_or("P");
+        name.erase(std::remove(name.begin(), name.end(), '\"'), name.end());
+        const int32_t phaseTraceId = static_cast<int32_t>(traceNames.size());
+        traceNames.push_back(name);
+        maxNameLen = std::max(maxNameLen, name.size());
+
+        int64_t singleRow = -1;
+        if (tr.variableIndex.has_value() && !tr.index1.has_value() && !tr.index2.has_value()) {
+            singleRow = *tr.variableIndex;
+        } else if (tr.index1.has_value() && !tr.index2.has_value() && !tr.variableIndex.has_value()) {
+            singleRow = *tr.index1;
+        } else if (!tr.index1.has_value() && tr.index2.has_value() && !tr.variableIndex.has_value()) {
+            singleRow = *tr.index2;
+        }
+
+        if (sObj.eventsOnly_ && singleRow >= 0 && singleRow < static_cast<int64_t>(sObj.useEventTracker_.size())
+            && sObj.useEventTracker_[singleRow]) {
+            const auto& evs = sObj.eventTrackers_[singleRow].events;
+            for (const auto& ev : evs) {
+                SfqEvent copyEv = ev;
+                copyEv.traceId  = phaseTraceId;
+                allEvents.push_back(copyEv);
+            }
+            continue;
+        }
+
+        const double* p1 = (tr.index1 && *tr.index1 >= 0 && *tr.index1 < static_cast<int64_t>(x.size()) && x[*tr.index1])
+                                   ? x[*tr.index1]->data()
+                                   : nullptr;
+        const double* p2 = (tr.index2 && *tr.index2 >= 0 && *tr.index2 < static_cast<int64_t>(x.size()) && x[*tr.index2])
+                                   ? x[*tr.index2]->data()
+                                   : nullptr;
+        const double* pv = (tr.variableIndex && *tr.variableIndex >= 0
+                            && *tr.variableIndex < static_cast<int64_t>(x.size()) && x[*tr.variableIndex])
+                                   ? x[*tr.variableIndex]->data()
+                                   : nullptr;
+
+        if (result_indices.empty()) { continue; }
+        InLoopEventTracker trk;
+        trk.traceId = phaseTraceId;
+        trk.sign    = 1;
+        trk.init_metrics(iObj.argEventMetrics);
+        for (size_t r = 0; r < result_indices.size(); ++r) {
+            const int64_t j   = result_indices[r];
+            double        phi = 0.0;
+            if (iObj.argAnal == AnalysisType::Voltage && pv != nullptr) {
+                phi = pv[j];
+            } else {
+                phi = (p1 ? p1[j] : 0.0) - (p2 ? p2[j] : 0.0);
+            }
+            trk.step(t[j], phi, iObj.argEventMetrics);
+        }
+        trk.finalize(iObj.argEventMetrics);
+        allEvents.insert(allEvents.end(), trk.events.begin(), trk.events.end());
+    }
+
+    std::stable_sort(allEvents.begin(), allEvents.end(), [](const SfqEvent& a, const SfqEvent& b) {
+        if (a.time != b.time) { return a.time < b.time; }
+        return a.traceId < b.traceId;
+    });
+
+    const uint32_t mMask     = iObj.argEventMetrics;
+    const bool     hasTPeak  = (mMask & EVENT_METRIC_T_PEAK) != 0u;
+    const bool     hasVPeak  = (mMask & EVENT_METRIC_V_PEAK) != 0u;
+    const bool     hasFwhm   = (mMask & EVENT_METRIC_FWHM) != 0u;
+    const bool     hasDtPi   = (mMask & EVENT_METRIC_DT_PI) != 0u;
+    const bool     hasArea   = (mMask & EVENT_METRIC_AREA) != 0u;
+    const size_t   extraCols = static_cast<size_t>(hasTPeak) + static_cast<size_t>(hasVPeak)
+                             + static_cast<size_t>(hasFwhm) + static_cast<size_t>(hasDtPi)
+                             + static_cast<size_t>(hasArea);
+
+    std::string ext = std::filesystem::path(*iObj.eventsFile).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    if (ext == ".npy") {
+        std::ofstream outfile(*iObj.eventsFile, std::ios::out | std::ios::binary);
+        if (!outfile.is_open()) { Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, *iObj.eventsFile); }
+
+        std::string extraDescr;
+        if (hasTPeak) { extraDescr += ", ('t_peak', '<f8')"; }
+        if (hasVPeak) { extraDescr += ", ('v_peak', '<f8')"; }
+        if (hasFwhm) { extraDescr += ", ('fwhm', '<f8')"; }
+        if (hasDtPi) { extraDescr += ", ('dt_pi', '<f8')"; }
+        if (hasArea) { extraDescr += ", ('area', '<f8')"; }
+
+        std::string dict = "{'descr': [('trace_id', '<i4'), ('trace', '|S" + std::to_string(maxNameLen)
+                           + "'), ('time', '<f8'), ('polarity', '<i4'), ('winding', '<i4'), ('phase', '<f8')"
+                           + extraDescr + "], 'fortran_order': False, 'shape': ("
+                           + std::to_string(allEvents.size()) + ",), }";
+        const size_t preambleLen = 10;
+        size_t       totalLen    = preambleLen + dict.size() + 1;
+        size_t       pad         = (64 - (totalLen % 64)) % 64;
+        dict.append(pad, ' ');
+        dict.push_back('\n');
+
+        const char     magic[]   = "\x93NUMPY";
+        const uint8_t  major     = 1;
+        const uint8_t  minor     = 0;
+        const uint16_t headerLen = static_cast<uint16_t>(dict.size());
+        outfile.write(magic, 6);
+        outfile.write(reinterpret_cast<const char*>(&major), 1);
+        outfile.write(reinterpret_cast<const char*>(&minor), 1);
+        outfile.write(reinterpret_cast<const char*>(&headerLen), 2);
+        outfile.write(dict.data(), static_cast<std::streamsize>(dict.size()));
+
+        const size_t      recSize = 4 + maxNameLen + 8 + 4 + 4 + 8 + 8 * extraCols;
+        std::vector<char> buf(allEvents.size() * recSize, 0);
+        for (size_t idx = 0; idx < allEvents.size(); ++idx) {
+            const auto&        ev   = allEvents[idx];
+            char*              dst  = buf.data() + idx * recSize;
+            const std::string& tStr = traceNames[ev.traceId];
+            std::memcpy(dst, &ev.traceId, 4);
+            std::memcpy(dst + 4, tStr.data(), std::min(maxNameLen, tStr.size()));
+            std::memcpy(dst + 4 + maxNameLen, &ev.time, 8);
+            std::memcpy(dst + 4 + maxNameLen + 8, &ev.polarity, 4);
+            std::memcpy(dst + 4 + maxNameLen + 12, &ev.winding, 4);
+            std::memcpy(dst + 4 + maxNameLen + 16, &ev.phase, 8);
+            size_t off = 4 + maxNameLen + 24;
+            if (hasTPeak) {
+                std::memcpy(dst + off, &ev.tPeak, 8);
+                off += 8;
+            }
+            if (hasVPeak) {
+                std::memcpy(dst + off, &ev.vPeak, 8);
+                off += 8;
+            }
+            if (hasFwhm) {
+                std::memcpy(dst + off, &ev.fwhm, 8);
+                off += 8;
+            }
+            if (hasDtPi) {
+                std::memcpy(dst + off, &ev.dtPi, 8);
+                off += 8;
+            }
+            if (hasArea) {
+                std::memcpy(dst + off, &ev.area, 8);
+                off += 8;
+            }
+        }
+        if (!buf.empty()) {
+            outfile.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+        }
+    } else {
+        std::ofstream outfile(*iObj.eventsFile);
+        if (!outfile.is_open()) { Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, *iObj.eventsFile); }
+        outfile << "trace_id,trace,time,polarity,winding,phase";
+        if (hasTPeak) { outfile << ",t_peak"; }
+        if (hasVPeak) { outfile << ",v_peak"; }
+        if (hasFwhm) { outfile << ",fwhm"; }
+        if (hasDtPi) { outfile << ",dt_pi"; }
+        if (hasArea) { outfile << ",area"; }
+        outfile << "\n";
+        outfile << std::scientific << std::setprecision(12);
+        for (const auto& ev : allEvents) {
+            outfile << ev.traceId << "," << traceNames[ev.traceId] << "," << ev.time << "," << ev.polarity << ","
+                    << ev.winding << "," << ev.phase;
+            if (hasTPeak) { outfile << "," << ev.tPeak; }
+            if (hasVPeak) { outfile << "," << ev.vPeak; }
+            if (hasFwhm) { outfile << "," << ev.fwhm; }
+            if (hasDtPi) { outfile << "," << ev.dtPi; }
+            if (hasArea) { outfile << "," << ev.area; }
+            outfile << "\n";
         }
     }
 }

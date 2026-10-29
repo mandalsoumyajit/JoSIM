@@ -37,34 +37,30 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
     vector_pair_t<char_o, string_o> ap;
     // Loop through the argument tokens
     for (auto t : tokens) {
-        // Ensure that the argument is not e.g. "--analysis=1"
-        tokens_t tempT = Misc::tokenize(t, "=", true, true);
-        if (tempT.size() > 2) {
-            // If there is more than one "=" in the argument this is invalid
-            Errors::cli_errors(CLIErrors::UNKNOWN_SWITCH, t);
-        }
-        // If the string is a switch, remove the --
-        if (tempT.at(0).at(0) == '-') {
-            // Remove all '-' chars, indicating a switch.
-            tempT.at(0).erase(std::remove(tempT.at(0).begin(), tempT.at(0).end(), '-'), tempT.at(0).end());
-            // Store the switch identifying char 'a' for "analysis"
-            string_o val = (tempT.size() > 1) ? string_o(tempT.at(1)) : std::nullopt;
-            ap.emplace_back(std::make_pair(tempT.at(0).at(0), val));
+        if (t.empty()) { continue; }
+        // If the string is a switch, remove leading '-' chars and split on the first '=' if present
+        if (t.at(0) == '-') {
+            size_t      eqPos = t.find('=');
+            std::string swStr = (eqPos != std::string::npos) ? t.substr(0, eqPos) : t;
+            string_o    val   = (eqPos != std::string::npos) ? string_o(t.substr(eqPos + 1)) : std::nullopt;
+            swStr.erase(std::remove(swStr.begin(), swStr.end(), '-'), swStr.end());
+            if (swStr.empty()) { Errors::cli_errors(CLIErrors::UNKNOWN_SWITCH, t); }
+            std::string swLower = swStr;
+            std::transform(swLower.begin(), swLower.end(), swLower.begin(), ::tolower);
+            char swChar = swStr.at(0);
+            if (swLower.rfind("eventmetric", 0) == 0 || swLower.rfind("eventpulse", 0) == 0) {
+                swChar = 'E';
+            }
+            ap.emplace_back(std::make_pair(swChar, val));
         } else {
-            // Argument to the switch in first token
-            if (tempT.size() > 1) { ap.back().second = tempT.at(1); }
-            // If the argument pairs aren't empty
-            if (ap.size() != 0) {
-                // If the previous switch was alone then this must be the argument
-                if (!ap.back().second) {
-                    ap.back().second = tempT.at(0);
-                    // If the last pair has a value then this must be file name
+            if (!ap.empty() && !ap.back().second) {
+                if (t.at(0) == '=' && t.size() > 1) {
+                    ap.back().second = t.substr(1);
                 } else {
-                    ap.emplace_back(std::make_pair(std::nullopt, tempT.at(0)));
+                    ap.back().second = t;
                 }
-                // Else if they are empty then this is the input file name
             } else {
-                ap.emplace_back(std::make_pair(std::nullopt, tempT.at(0)));
+                ap.emplace_back(std::make_pair(std::nullopt, t));
             }
         }
     }
@@ -78,7 +74,8 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
     }
     if (!hasInput && !ap.empty() && ap.back().first && ap.back().second) {
         const char sw = ap.back().first.value();
-        if (sw == 'p' || sw == 'g' || sw == 'n' || sw == 'f' || sw == 'w' || sw == 'm' || ap.size() == 1) {
+        if (sw == 'p' || sw == 'g' || sw == 'n' || sw == 'f' || sw == 'w' || sw == 'm' || sw == 'e' || sw == 'E'
+            || ap.size() == 1) {
             ap.emplace_back(std::make_pair(std::nullopt, ap.back().second));
             ap.at(ap.size() - 2).second = std::nullopt;
         }
@@ -130,6 +127,24 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                     } catch (const std::invalid_argument&) {
                         out.corrector = 1;
                     }
+                    break;
+                    // Extract SFQ switching events
+                case 'e':
+                    if (!i.second) {
+                        out.events = true;
+                    } else if (i.second.value() == "0" || i.second.value() == "false" || i.second.value() == "FALSE") {
+                        out.events = false;
+                    } else if (i.second.value() == "1" || i.second.value() == "true" || i.second.value() == "TRUE") {
+                        out.events = true;
+                    } else {
+                        out.events      = true;
+                        out.events_file = i.second.value();
+                    }
+                    break;
+                    // Select SFQ pulse metrics (t_peak, v_peak, fwhm, dt_pi, area, time=peak)
+                case 'E':
+                    out.events        = true;
+                    out.event_metrics = i.second.value_or("pulse");
                     break;
                     // Disable automatic step halving (fixed step)
                 case 'f':
@@ -279,6 +294,17 @@ void CliOptions::display_help() {
               << "Enables implicit predictor-corrector iterations for JJs." << std::endl;
     std::cout << std::setw(16) << std::left << "--corrector=" << std::setw(3) << std::left << "|"
               << "Specify max iterations per step (default 2 if -c is given without value)." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // SFQ switching events
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "-e" << std::setw(3) << std::left << "|"
+              << "Extracts 2*pi SFQ phase-slip switching events to a compact .npy or .csv file." << std::endl;
+    std::cout << std::setw(16) << std::left << "--events=" << std::setw(3) << std::left << "|"
+              << "When used without -o, runs in zero-allocation events-only mode." << std::endl;
+    std::cout << std::setw(16) << std::left << "-E" << std::setw(3) << std::left << "|"
+              << "Selects additional SFQ pulse metrics: pulse (default: t_peak,v_peak,fwhm,dt_pi)," << std::endl;
+    std::cout << std::setw(16) << std::left << "--event-metrics=" << std::setw(3) << std::left << "|"
+              << "all (+area), or comma-separated list including time=peak / time=cross." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Fixed timestep
     // ---------------------------------------------------------------------------

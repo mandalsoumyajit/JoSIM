@@ -125,6 +125,28 @@ void JoSIM::find_relevant_traces(Input& iObj, Matrix& mObj) {
             fIndex++;
         }
     }
+    if (iObj.argEventsOnly) {
+        mObj.relevantTraces.erase(
+                std::remove_if(mObj.relevantTraces.begin(),
+                               mObj.relevantTraces.end(),
+                               [](const RelevantTrace& rt) { return rt.storageType != StorageType::Phase; }),
+                mObj.relevantTraces.end());
+        if (mObj.relevantTraces.empty()) {
+            for (const auto& devVar : mObj.components.devices) {
+                if (std::holds_alternative<JJ>(devVar)) {
+                    const auto&   jjDev = std::get<JJ>(devVar);
+                    RelevantTrace temp;
+                    temp.device        = true;
+                    temp.storageType   = StorageType::Phase;
+                    temp.deviceLabel   = "\"P(" + jjDev.netlistInfo.label_ + ")\"";
+                    temp.index1        = jjDev.indexInfo.posIndex_;
+                    temp.index2        = jjDev.indexInfo.negIndex_;
+                    temp.variableIndex = jjDev.variableIndex_;
+                    mObj.relevantTraces.emplace_back(temp);
+                }
+            }
+        }
+    }
     // Store the indices of the identified traces (dropping unused JJ node/variable indices)
     for (auto& i : mObj.relevantTraces) {
         if (i.variableIndex) {

@@ -23,9 +23,10 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
 3. **Sub-Timestep PTL Lumped $\pi$-Replacement (`.option lumpptl`, `.option minptl`):**
    - Automatically replaces any lossless transmission line (`T`) whose propagation delay $T_d$ is smaller than a timestep ($T_d < 0.5\Delta t$ by default, or $T_d < \text{minptl}$ via `.option minptl=<td_min>`) with its exact matched lumped $L$-$C$ $\pi$-equivalent ($L_{\text{eq}} = Z_0 T_d$ in series, $C_{\text{port}} = T_d / (2 Z_0)$ shunting each port) prior to step-size clamping.
    - Eliminates artificial $40\times$ global timestep crushing from `1 fs` PTL via/pad stubs (e.g. `r10forig` drops from `1,904 s` in `v2.6.5` / `257 s` in `v2.7` / `41.6 s` previously to **`3.22 s` wall / `2.66 s` transient** — **`591.3x` faster than `v2.6.5` and `79.8x` faster than `v2.7`** with `0.000 fs` event shift).
-4. **Direct In-Loop Trace Recording & Zero-Allocation Streaming `.npy`/`.bin` Output:**
-   - Drops unused JJ `variableIndex_` trace vectors from `relevantIndices`, folds exclusive `V(n1, n2)` node-difference pairs into single difference vectors (`traceType = 4`), parallelizes NUMA trace allocation across OpenMP threads, and streams `.npy`/`.bin`/`.rawb` directly from `results.xVector` via a 64×8 L1 cache-tiled transpose without allocating `Output::traces`.
-   - Cuts `adder` peak RSS memory from **`26.5 GB` (`v2.6.5`) / `8.04 GB` to `1.72 GB` (`15.4x` lower vs `v2.6.5`, `4.67x` vs pre-Item 4)** and `coupler` peak RSS from **`7.4 GB` (`v2.6.5`) / `4.3 GB` to `1.42 GB`**.
+4. **Direct In-Loop Trace Recording, Zero-Allocation Streaming `.npy`/`.bin` Output & Built-In SFQ Event/Pulse Extractor (`-e`, `-E`):**
+   - Drops unused JJ `variableIndex_` trace vectors from `relevantIndices`, folds exclusive `V(n1, n2)` and `P(n1, n2)` node-difference pairs into single difference vectors (`traceType = 4`), parallelizes NUMA trace allocation across OpenMP threads, and streams `.npy`/`.bin`/`.rawb` directly from `results.xVector` via a 64×8 L1 cache-tiled transpose without allocating `Output::traces`.
+   - Cuts `adder` full-waveform peak RSS memory from **`26.5 GB` (`v2.6.5`) / `8.04 GB` to `1.72 GB` (`15.4x` lower vs `v2.6.5`, `4.67x` vs pre-Item 4)** and `coupler` peak RSS from **`7.4 GB` (`v2.6.5`) / `4.3 GB` to `1.42 GB`**.
+   - **Built-In SFQ Switching Event & Pulse Metric Extractor (`-e [file]`, `-E [spec]`, `.option events`, `.option eventmetrics`):** Detects $2\pi$ Josephson phase-slip crossings across $(2k-1)\pi$ barriers with sub-step linear interpolation (`time`, `polarity`, `winding`, `phase`) and user-selectable pulse metrics (`t_peak`, `v_peak`, `fwhm`, `dt_pi`, `area`, and `time=peak` vs `time=cross`). When invoked without `-o` (**Events-Only Mode**), tracks events in-loop without allocating `results.xVector`, cutting `adder -p -n -e` to **`4.63 s` wall / `195 MB` RSS / `606 KB` `.events.npy` (`5,250x` smaller than `.npy`, `117.1x` faster than `v2.6.5`)** and `coupler -p -n -e` to **`2.58 s` wall / `216 MB` RSS / `512 KB` `.events.npy` (`2,503x` smaller)**.
 5. **Tier 2 Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>`, `.option mc=<N>`, `.option mcall`):**
    - Parses and symbolically analyzes the netlist **once**, then executes $B = 32\text{–}4,096$ perturbed fabrication-yield trials simultaneously across OpenMP threads (`-p -b <N>`, **up to `31.1x` speedup**) or in a coalesced CUDA kernel (`-g -b <N>`, **up to `19.7x` speedup**).
    - Computes Welford online ensemble statistics (`<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`) and prints a **Monte Carlo Robustness Summary** table. Fixed an upstream bug in `JJ.cpp` where default `area=1.0` junctions ignored `.spread`.
@@ -94,6 +95,8 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 | **`-g [1\|2\|3\|4]` / `--gpu=`** | **New (`v2.8`)** | CUDA GPU solver: `1` = Auto, `2` = Hybrid, `3` = `cuSolverRF` MNA, `4` = `cuSolverRF` Nodal. |
 | **`-b <N>` / `--batch=<N>`** | **New (`v2.8`)** | Tier 2 Batched Monte Carlo solver ($N$ simultaneous `.spread` trials). |
 | **`-o <file>` / `--output=`** | **Enhanced (`v2.8`)** | Output file: **`.npy`**, **`.bin`**, **`.rawb`** *(New binary formats)* or `.csv`, `.dat`, `.raw` *(Inherited)*. |
+| **`-e [file]` / `--events=`** | **New (`v2.8`)** | Extracts $2\pi$ SFQ phase-slip events to `.npy` or `.csv`. Without `-o`, runs in zero-allocation **Events-Only Mode**. |
+| **`-E [spec]` / `--event-metrics=`** | **New (`v2.8`)** | Selects SFQ pulse metrics: `pulse` (default: `t_peak,v_peak,fwhm,dt_pi`), `all` (`+area`), or comma-separated list including `time=peak` / `time=cross`. |
 | **`-c [N]` / `--corrector=`** | **New (`v2.8`)** | Implicit predictor-corrector JJ iterations per step (default $N=2$ if value omitted). |
 | **`-f` / `--fixed-step`** | **New (`v2.8`)** | Disables automatic global timestep halving on $>0.4\pi$ phase jumps. |
 | `-m [0\|1]` / `--minimal` | Inherited (`v2.7`) | Suppresses progress bars and console status output. |
@@ -107,6 +110,8 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 | Netlist Directive | Origin | CLI Equivalent & Description |
 | :--- | :--- | :--- |
 | **`.option nodal`** | **New (`v2.8`)** | Same as `-n`. Enables Schur-complement nodal reduction ($A_{\text{red}}$). |
+| **`.option events[=file]`** | **New (`v2.8`)** | Same as `-e [file]`. Extracts $2\pi$ SFQ switching events (use `.option eventsonly[=file]` to force Events-Only mode). |
+| **`.option eventmetrics[=spec]`** | **New (`v2.8`)** | Same as `-E [spec]` (alias: `.option eventpulse`). Appends `t_peak`, `v_peak`, `fwhm`, `dt_pi`, `area`, or sets `time=peak`. |
 | **`.option lumpptl[=0\|1]`** | **New (`v2.8`)** | Enables/disables automatic lumped $L$-$C$ $\pi$-replacement of sub-step PTLs (default `1`; disable via `.option nolumpptl`). |
 | **`.option minptl=<val>`** | **New (`v2.8`)** | Custom delay threshold $T_{d,\min}$ (seconds) below which lossless PTLs are replaced by $\pi$-equivalents (default $0.5\Delta t$). |
 | **`.option gpu[=1\|2\|3\|4]`** | **New (`v2.8`)** | Same as `-g [1\|2\|3\|4]` (aliases: `.option gpumono`, `.option gpunodal`, `.option cusolverrf`). |
@@ -153,6 +158,17 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5` 
 | **`coupler`** ($P=464, W=420$) | 38,826 | **9,870** (`3.93x`) | 33.44 s | **10.94 s** (`3.06x`) | **2.41 s** | **13.85x** (`-p -n`) |
 | **`adder`** ($P=583\to126, W=3\to5$) | 47,425 | **9,195** (`5.16x`) | 79.92 s | **22.65 s** (`3.53x`) | **3.79 s** | **21.11x** (`-p -n`) |
 | **`dff`** ($P=1, W=1$) | 504 | **174** (`2.90x`) | 0.234 s | **0.137 s** | **0.137 s** | **1.71x** (`-n`) |
+
+#### Built-In SFQ Switching Event & Pulse Metric Extractor (`-e`, `-E all`) on `spec2si-seeqc` (`BNL exxact`)
+
+| Deck (Events Extracted) | Full `.npy` (`-o + -e`) | **Events-Only (`-e`)** | **Events + Pulse Metrics (`-e -E all`)** | **Output Size: `.npy` $\to$ `-e` (`-E all`)** | **Median Extracted Pulse Metrics (`-E all`)** |
+| :--- | ---: | ---: | ---: | :---: | :--- |
+| **`adder`** (`11,920` events) | 9.16 s (1.72 GB) | **4.63 s** (**0.19 GB**) | **4.79 s** (**0.23 GB**) | `3.18 GB` $\to$ **`605.5 KB`** (`1.07 MB`) | $\|V_{\text{peak}}\|=0.302\text{ mV}$, $\text{FWHM}=4.49\text{ ps}$, $\Delta t_\pi=7.65\text{ ps}$, $\|\text{area}\|=1.81\text{ fV}\cdot\text{s}$ |
+| **`coupler`** (`12,784` events) | 4.59 s (1.42 GB) | **2.58 s** (**0.21 GB**) | **2.43 s** (**0.27 GB**) | `1.28 GB` $\to$ **`512.0 KB`** (`1.01 MB`) | $\|V_{\text{peak}}\|=0.426\text{ mV}$, $\text{FWHM}=3.31\text{ ps}$, $\Delta t_\pi=7.03\text{ ps}$, $\|\text{area}\|=2.14\text{ fV}\cdot\text{s}$ |
+| **`xadd4`** (`56` events) | 9.58 s (0.22 GB) | **9.33 s** (**0.17 GB**) | **9.87 s** (**0.18 GB**) | `112.5 MB` $\to$ **`3.1 KB`** (`5.5 KB`) | $\|V_{\text{peak}}\|=0.319\text{ mV}$, $\text{FWHM}=4.94\text{ ps}$, $\Delta t_\pi=5.37\text{ ps}$, $\|\text{area}\|=1.83\text{ fV}\cdot\text{s}$ |
+| **`r10f1n`** (`4` events) | 27.36 s (0.28 GB) | **27.04 s** (**0.29 GB**) | **27.02 s** (**0.29 GB**) | `10.0 MB` $\to$ **`0.3 KB`** (`0.6 KB`) | $\|V_{\text{peak}}\|=0.319\text{ mV}$, $\text{FWHM}=4.01\text{ ps}$, $\Delta t_\pi=11.25\text{ ps}$, $\|\text{area}\|=2.33\text{ fV}\cdot\text{s}$ |
+| **`r10forig`** (`4` events) | 3.18 s (0.28 GB) | **3.18 s** (**0.29 GB**) | **3.18 s** (**0.29 GB**) | `1.0 MB` $\to$ **`0.3 KB`** (`0.6 KB`) | $\|V_{\text{peak}}\|=0.319\text{ mV}$, $\text{FWHM}=4.01\text{ ps}$, $\Delta t_\pi=11.25\text{ ps}$, $\|\text{area}\|=2.33\text{ fV}\cdot\text{s}$ |
+| **`dff`** (`9` events) | 0.21 s (0.13 GB) | **0.20 s** (**0.13 GB**) | **0.20 s** (**0.13 GB**) | `1.7 MB` $\to$ **`0.5 KB`** (`1.0 KB`) | $\|V_{\text{peak}}\|=0.277\text{ mV}$, $\text{FWHM}=4.69\text{ ps}$, $\Delta t_\pi=6.78\text{ ps}$, $\|\text{area}\|=2.09\text{ fV}\cdot\text{s}$ |
 
 ---
 

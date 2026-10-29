@@ -20,6 +20,19 @@
 #include <vector>
 
 namespace JoSIM {
+
+enum EventMetricFlags : uint32_t {
+    EVENT_METRIC_NONE      = 0u,
+    EVENT_METRIC_T_PEAK    = 1u << 0,
+    EVENT_METRIC_V_PEAK    = 1u << 1,
+    EVENT_METRIC_FWHM      = 1u << 2,
+    EVENT_METRIC_DT_PI     = 1u << 3,
+    EVENT_METRIC_AREA      = 1u << 4,
+    EVENT_METRIC_TIME_PEAK = 1u << 5,
+    EVENT_METRIC_PULSE     = EVENT_METRIC_T_PEAK | EVENT_METRIC_V_PEAK | EVENT_METRIC_FWHM | EVENT_METRIC_DT_PI,
+    EVENT_METRIC_ALL       = EVENT_METRIC_PULSE | EVENT_METRIC_AREA
+};
+
 class Input {
   public:
     Netlist                                      netlist;
@@ -52,6 +65,10 @@ class Input {
     bool                                                         argLumpPtl      = true;
     double                                                       argMinPtl       = 0.0;
     bool                                                         ptlLumpedDone   = false;
+    bool                                                         argEvents       = false;
+    bool                                                         argEventsOnly   = false;
+    uint32_t                                                     argEventMetrics = EVENT_METRIC_NONE;
+    std::optional<std::string>                                   eventsFile;
     std::optional<std::pair<std::string, std::optional<double>>> saveStateFile;
     std::optional<std::string>                                   loadStateFile;
 
@@ -67,6 +84,11 @@ class Input {
         argGpuMode                 = cli_options.gpuMode;
         argNodal                   = cli_options.nodal;
         argFixedStep               = cli_options.fixedStep;
+        argEvents                  = cli_options.events;
+        eventsFile                 = cli_options.events_file;
+        if (cli_options.event_metrics.has_value()) {
+            argEventMetrics = parse_event_metrics(cli_options.event_metrics.value(), argEventMetrics);
+        }
         argCorrector               = cli_options.corrector;
         argMcRuns                  = cli_options.batchRuns;
         cli_output_file            = cli_options.output_file;
@@ -74,6 +96,7 @@ class Input {
         netlist.sanityCheckSubckts = cli_options.sanityCheckSubckts;
     }
 
+    static uint32_t       parse_event_metrics(const std::string& spec, uint32_t currentMask = EVENT_METRIC_NONE);
     std::vector<tokens_t> read_input(LineInput& input, string_o fileName = std::nullopt);
     void                  parse_input(string_o fileName = std::nullopt);
     void                  syntax_check_controls(std::vector<tokens_t>& controls);

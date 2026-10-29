@@ -3,6 +3,7 @@
 #ifndef JOSIM_SIMULATION_HPP
 #define JOSIM_SIMULATION_HPP
 
+#include "JoSIM/Constants.hpp"
 #include "JoSIM/CudaSolver.hpp"
 #include "JoSIM/Errors.hpp"
 #include "JoSIM/LUSolve.hpp"
@@ -10,6 +11,7 @@
 #include "JoSIM/Misc.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <memory>
 #include <suitesparse/klu.h>
 
@@ -20,6 +22,241 @@ namespace JoSIM {
 #define AC             2
 #define PHASE          3
 #define NONE_SPECIFIED 4
+
+struct SfqEvent {
+    double  time     = 0.0;
+    double  phase    = 0.0;
+    int32_t traceId  = 0;
+    int32_t polarity = 1;
+    int32_t winding  = 0;
+    double  tPeak    = 0.0;
+    double  vPeak    = 0.0;
+    double  fwhm     = 0.0;
+    double  dtPi     = 0.0;
+    double  area     = 0.0;
+};
+
+struct InLoopEventTracker {
+    static constexpr int32_t HIST_CAP  = 2048;
+    static constexpr int32_t HIST_MASK = HIST_CAP - 1;
+    static constexpr int32_t LOOKBACK  = 1024;
+    static constexpr int32_t LOOKAHEAD = 768;
+
+    double                prevPhi          = 0.0;
+    double                prevT            = 0.0;
+    int64_t               prevK            = 0;
+    int32_t               traceId          = -1;
+    int32_t               sign             = 1;
+    int32_t               initialized      = 0;
+    int32_t               stepCount        = 0;
+    int32_t               hasPending       = 0;
+    int32_t               pendingEventIdx  = -1;
+    int32_t               pendingCrossStep = 0;
+    std::vector<double>   histT;
+    std::vector<double>   histPhi;
+    std::vector<SfqEvent> events;
+
+    void init_metrics(uint32_t metricsMask) {
+        if (metricsMask != 0u) {
+            histT.assign(HIST_CAP, 0.0);
+            histPhi.assign(HIST_CAP, 0.0);
+        } else {
+            histT.clear();
+            histPhi.clear();
+        }
+    }
+
+    void finalize_pending(int32_t lastValidStep, uint32_t metricsMask) {
+        if (!hasPending) { return; }
+        hasPending   = 0;
+        SfqEvent& ev = events[pendingEventIdx];
+        if (metricsMask == 0u || histT.empty()) { return; }
+
+        const int32_t cStep       = pendingCrossStep;
+        const int32_t oldestValid = std::max<int32_t>(0, lastValidStep - HIST_CAP + 1);
+        const int32_t wStart      = std::max<int32_t>(oldestValid, cStep - LOOKBACK);
+        const int32_t wEnd        = std::min<int32_t>(lastValidStep, cStep + LOOKAHEAD);
+        if (wEnd <= wStart) {
+            ev.tPeak = ev.time;
+            if ((metricsMask & EVENT_METRIC_TIME_PEAK) != 0u) { ev.time = ev.tPeak; }
+            return;
+        }
+
+        auto          hT     = [&](int32_t idx) -> double { return histT[idx & HIST_MASK]; };
+        auto          hPhi   = [&](int32_t idx) -> double { return histPhi[idx & HIST_MASK]; };
+        const double  pol    = static_cast<double>(ev.polarity);
+        const double  thresh = ev.phase;
+
+        int32_t iMin = std::max<int32_t>(wStart, cStep - 1);
+        while (iMin > wStart) {
+            const double relPrev = pol * (hPhi(iMin - 1) - thresh);
+            const double relCurr = pol * (hPhi(iMin) - thresh);
+            if (relCurr <= -1.75 * Constants::PI) { break; }
+            if (relCurr < -0.5 * Constants::PI && (relCurr - relPrev) <= 0.0) { break; }
+            --iMin;
+        }
+
+        int32_t iMax = std::min<int32_t>(wEnd, cStep);
+        while (iMax < wEnd) {
+            const double relCurr = pol * (hPhi(iMax) - thresh);
+            const double relNext = pol * (hPhi(iMax + 1) - thresh);
+            if (relCurr >= 1.75 * Constants::PI) { break; }
+            if (relCurr > 0.5 * Constants::PI && (relNext - relCurr) <= 0.0) { break; }
+            ++iMax;
+        }
+
+        const int32_t vStart = std::max<int32_t>(wStart + 1, iMin);
+        const int32_t vEnd   = std::min<int32_t>(wEnd, iMax + 1);
+
+        auto midT = [&](int32_t m) -> double { return 0.5 * (hT(m - 1) + hT(m)); };
+        auto midV = [&](int32_t m) -> double {
+            const double dt = hT(m) - hT(m - 1);
+            return (dt > 1e-30) ? (Constants::SIGMA * (hPhi(m) - hPhi(m - 1)) / dt) : 0.0;
+        };
+
+        const int32_t searchLo = std::max<int32_t>(vStart, iMin + 1);
+        const int32_t searchHi = std::max<int32_t>(searchLo, iMax);
+        int32_t       mPeak    = searchLo;
+        double        bestPolV = -1e300;
+        for (int32_t m = searchLo; m <= searchHi; ++m) {
+            const double pv = pol * midV(m);
+            if (pv > bestPolV) {
+                bestPolV = pv;
+                mPeak    = m;
+            }
+        }
+
+        double tPeak = midT(mPeak);
+        double vPeak = midV(mPeak);
+        if (mPeak > vStart && mPeak < vEnd) {
+            const double ym1   = pol * midV(mPeak - 1);
+            const double y0    = pol * midV(mPeak);
+            const double yp1   = pol * midV(mPeak + 1);
+            const double denom = ym1 - 2.0 * y0 + yp1;
+            if (y0 >= ym1 && y0 >= yp1 && denom < -1e-30) {
+                double delta = 0.5 * (ym1 - yp1) / denom;
+                if (delta < -0.5) { delta = -0.5; }
+                if (delta > 0.5) { delta = 0.5; }
+                const double yPeak = y0 - 0.125 * (ym1 - yp1) * (ym1 - yp1) / denom;
+                const double dtSide
+                        = (delta >= 0.0) ? (midT(mPeak + 1) - midT(mPeak)) : (midT(mPeak) - midT(mPeak - 1));
+                tPeak = midT(mPeak) + delta * dtSide;
+                vPeak = pol * yPeak;
+            }
+        }
+        ev.tPeak = tPeak;
+        ev.vPeak = vPeak;
+
+        const double yHalf  = 0.5 * std::abs(vPeak);
+        double       tLeft  = midT(vStart);
+        for (int32_t m = mPeak; m > vStart; --m) {
+            const double yPrev = pol * midV(m - 1);
+            const double yCurr = pol * midV(m);
+            if (yPrev <= yHalf && yCurr >= yHalf) {
+                const double dy   = yCurr - yPrev;
+                const double frac = (std::abs(dy) > 1e-30) ? ((yHalf - yPrev) / dy) : 0.5;
+                tLeft             = midT(m - 1) + frac * (midT(m) - midT(m - 1));
+                break;
+            }
+        }
+        double tRight = midT(vEnd);
+        for (int32_t m = mPeak; m < vEnd; ++m) {
+            const double yCurr = pol * midV(m);
+            const double yNext = pol * midV(m + 1);
+            if (yCurr >= yHalf && yNext <= yHalf) {
+                const double dy   = yCurr - yNext;
+                const double frac = (std::abs(dy) > 1e-30) ? ((yCurr - yHalf) / dy) : 0.5;
+                tRight            = midT(m) + frac * (midT(m + 1) - midT(m));
+                break;
+            }
+        }
+        ev.fwhm = std::max(0.0, tRight - tLeft);
+
+        const double thetaEnter = thresh - pol * (0.5 * Constants::PI);
+        const double thetaExit  = thresh + pol * (0.5 * Constants::PI);
+        double       tEnter     = hT(iMin);
+        for (int32_t idx = std::min<int32_t>(wEnd, cStep); idx > wStart; --idx) {
+            const double p0 = hPhi(idx - 1);
+            const double p1 = hPhi(idx);
+            if (pol * (p0 - thetaEnter) <= 0.0 && pol * (p1 - thetaEnter) >= 0.0) {
+                const double dp   = p1 - p0;
+                const double frac = (std::abs(dp) > 1e-30) ? ((thetaEnter - p0) / dp) : 0.5;
+                tEnter            = hT(idx - 1) + frac * (hT(idx) - hT(idx - 1));
+                break;
+            }
+        }
+        double tExit = hT(iMax);
+        for (int32_t idx = std::max<int32_t>(wStart + 1, cStep); idx <= wEnd; ++idx) {
+            const double p0 = hPhi(idx - 1);
+            const double p1 = hPhi(idx);
+            if (pol * (p0 - thetaExit) <= 0.0 && pol * (p1 - thetaExit) >= 0.0) {
+                const double dp   = p1 - p0;
+                const double frac = (std::abs(dp) > 1e-30) ? ((thetaExit - p0) / dp) : 0.5;
+                tExit             = hT(idx - 1) + frac * (hT(idx) - hT(idx - 1));
+                break;
+            }
+        }
+        ev.dtPi = std::max(0.0, tExit - tEnter);
+        ev.area = Constants::SIGMA * (hPhi(iMax) - hPhi(iMin));
+
+        if ((metricsMask & EVENT_METRIC_TIME_PEAK) != 0u) { ev.time = ev.tPeak; }
+    }
+
+    inline void step(double tCurr, double rawVal, uint32_t metricsMask) {
+        const double  phi     = (sign >= 0) ? rawVal : -rawVal;
+        const int64_t k       = static_cast<int64_t>(std::floor((phi + Constants::PI) / (2.0 * Constants::PI)));
+        const int32_t curStep = stepCount++;
+        if (metricsMask != 0u && !histT.empty()) {
+            histT[curStep & HIST_MASK]   = tCurr;
+            histPhi[curStep & HIST_MASK] = phi;
+        }
+        if (!initialized) {
+            prevPhi     = phi;
+            prevT       = tCurr;
+            prevK       = k;
+            initialized = 1;
+            return;
+        }
+        if (k != prevK) {
+            if (hasPending) {
+                finalize_pending(std::max<int32_t>(pendingCrossStep, curStep - 1), metricsMask);
+            }
+            const double  dPhi = phi - prevPhi;
+            const int32_t pol  = (k > prevK) ? 1 : -1;
+            int64_t       curK = prevK;
+            while (curK != k) {
+                if (hasPending) { finalize_pending(curStep, metricsMask); }
+                const int64_t nextK = curK + pol;
+                const double  thresh
+                        = (pol > 0) ? ((2.0 * static_cast<double>(nextK) - 1.0) * Constants::PI)
+                                    : ((2.0 * static_cast<double>(curK) - 1.0) * Constants::PI);
+                double frac = (std::abs(dPhi) > 1e-30) ? ((thresh - prevPhi) / dPhi) : 0.5;
+                if (frac < 0.0) { frac = 0.0; }
+                if (frac > 1.0) { frac = 1.0; }
+                const double tCross = prevT + frac * (tCurr - prevT);
+                events.push_back(SfqEvent{
+                        tCross, thresh, traceId, pol, static_cast<int32_t>(nextK), tCross, 0.0, 0.0, 0.0, 0.0});
+                if (metricsMask != 0u) {
+                    hasPending       = 1;
+                    pendingEventIdx  = static_cast<int32_t>(events.size()) - 1;
+                    pendingCrossStep = curStep;
+                }
+                curK = nextK;
+            }
+            prevK = k;
+        } else if (hasPending && (curStep - pendingCrossStep) >= LOOKAHEAD) {
+            finalize_pending(curStep, metricsMask);
+        }
+        prevPhi = phi;
+        prevT   = tCurr;
+    }
+
+    void finalize(uint32_t metricsMask) {
+        if (hasPending && stepCount > 0) {
+            finalize_pending(stepCount - 1, metricsMask);
+        }
+    }
+};
 
 class Results {
   public:
@@ -190,6 +427,11 @@ class Simulation {
 #endif
 
     void setup(Input& iObj, Matrix& mObj);
+    void init_event_trackers(const Matrix& mObj);
+    void finalize_event_trackers();
+    inline void record_inloop_event(int64_t globR, int32_t kSlot, double rawVal) {
+        eventTrackers_[globR].step(results.timeAxis[kSlot], rawVal, eventMetrics_);
+    }
     void setup_partitions(Matrix& mObj);
     bool build_nodal_system(Matrix& mObj);
     bool setup_nodal_partitions(Matrix& mObj);
@@ -229,7 +471,11 @@ class Simulation {
     void handle_tx(Matrix& mObj, const int64_t& i, double& step, double factor = 1);
 
   public:
-    Results results;
+    Results                         results;
+    bool                            eventsOnly_   = false;
+    uint32_t                        eventMetrics_ = 0u;
+    std::vector<uint8_t>            useEventTracker_;
+    std::vector<InLoopEventTracker> eventTrackers_;
 
     Simulation(Input& iObj, Matrix& mObj);
 };

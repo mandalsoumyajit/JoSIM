@@ -32,6 +32,9 @@ struct CliOptions {
     int64_t                         gpuMode       = 1;
     bool                            nodal         = false;
     bool                            fixedStep     = false;
+    bool                            events        = false;
+    std::optional<std::string>      events_file;
+    std::optional<std::string>      event_metrics;
     int64_t                         corrector     = 0;
     int64_t                         batchRuns     = 1;
     bool                            sanityCheck   = false;

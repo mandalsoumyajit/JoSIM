@@ -92,3 +92,64 @@ def load_josim(path: Union[str, Path], strip_quotes: bool = True) -> Dict[str, n
             mat = mat.reshape(1, -1)
         return {name: mat[:, idx] for idx, name in enumerate(names)}
     raise ValueError(f"Unsupported JoSIM file extension: {ext}")
+
+
+def load_josim_events(
+    path: Union[str, Path],
+    as_dict: bool = False,
+) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    """Load a JoSIM SFQ switching event file (.events.npy or .events.csv).
+
+    When as_dict=False (default), returns a 1D NumPy structured array with base fields:
+      ('trace_id', '<i4'), ('trace', '|S<N>'), ('time', '<f8'),
+      ('polarity', '<i4'), ('winding', '<i4'), ('phase', '<f8')
+    plus any optional pulse metric fields ('t_peak', 'v_peak', 'fwhm', 'dt_pi', 'area').
+    When as_dict=True, returns a dictionary mapping each trace name to a 1D float64
+    NumPy array of signed switching event timestamps (+t for polarity +1, -t for -1).
+    """
+    p = Path(path)
+    ext = p.suffix.lower()
+    if ext == ".npy":
+        arr = np.load(p, allow_pickle=False)
+    elif ext in (".csv", ".dat"):
+        rows = []
+        max_len = 1
+        with open(p, "r", encoding="utf-8") as f:
+            header_cols = [c.strip() for c in f.readline().strip().split(",") if c.strip()]
+            extra_cols = header_cols[6:]
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                parts = s.split(",")
+                tid_s, tr_s, t_s, pol_s, w_s, ph_s = parts[:6]
+                max_len = max(max_len, len(tr_s))
+                extra_vals = tuple(float(x) for x in parts[6 : 6 + len(extra_cols)])
+                rows.append(
+                    (int(tid_s), tr_s.encode("utf-8"), float(t_s), int(pol_s), int(w_s), float(ph_s))
+                    + extra_vals
+                )
+        dt_fields = [
+            ("trace_id", "<i4"),
+            ("trace", f"|S{max_len}"),
+            ("time", "<f8"),
+            ("polarity", "<i4"),
+            ("winding", "<i4"),
+            ("phase", "<f8"),
+        ] + [(col, "<f8") for col in extra_cols]
+        dt = np.dtype(dt_fields)
+        arr = np.array(rows, dtype=dt)
+    else:
+        raise ValueError(f"Unsupported JoSIM events file extension: {ext}")
+
+    if not as_dict:
+        return arr
+
+    by_trace: Dict[str, list] = {}
+    for row in arr:
+        raw_tr = row["trace"]
+        name = raw_tr.decode("utf-8") if isinstance(raw_tr, (bytes, np.bytes_)) else str(raw_tr)
+        signed_t = float(row["time"]) if int(row["polarity"]) >= 0 else -float(row["time"])
+        by_trace.setdefault(name, []).append(signed_t)
+    return {k: np.asarray(v, dtype=np.float64) for k, v in by_trace.items()}
+

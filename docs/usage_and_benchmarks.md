@@ -14,10 +14,10 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
 - **Standard Controls & Text Output:** `.tran`, `.print`/`.plot`/`.save`, `.param`, `.subckt`, `.include`, `.iv`, single-run `.spread`, `.option seed=<int>`, and ASCII text output (`.csv`, `.dat`, `.raw`).
 
 ### What Is New in This Fork (`v2.8` — Added Since `02a34ee`)
-1. **Tier 4 + Phase 5 Schur-Complement Nodal & Series $R+L$ Chain Elimination (`-n` CPU & `-g 4` GPU):**
+1. **Schur-Complement Nodal Admittance & Series $R+L$ Chain Elimination (`-n` CPU & `-g 4` GPU):**
    - Analytically eliminates internal branch rows (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) *plus* internal degree-2 nodes along series $R+L$, $R+R$, and $L+L$ damping/bias chains into a **2.25x–5.16x smaller** nodal matrix $A_{\text{red}}$ ($N_{\text{red}} \ll N$) and reconstructs requested `.print` branch currents on the fly.
    - Delivers **2.2x–3.2x additional single-thread speedup** on production macros (`r5cal`, `r10f1n`, `r10forig`, `xadd4`, `adder`, `coupler`) and **3.1x–4.4x speedup** on 2D JJ grids.
-2. **Tier 1 + Phase 5 Per-Partition Nodal PTL Block-Parallel Solver & Short-PTL Coarsening (`-p -n` OpenMP & `-g` CUDA GPU):**
+2. **Per-Partition Nodal PTL Block-Parallel Solver & Short-PTL Coarsening (`-p -n` OpenMP & `-g` CUDA GPU):**
    - Combines Nodal matrix reduction (`-n`) with PTL block-parallel windowing (`-p`): automatically coarsens 0-JJ passive PTL-via islands and ultra-short PTLs ($k < 4$) while partitioning the reduced matrix $A_{\text{red}}$ across transmission lines (`T`) and shared Dirichlet supply rails (`VS`/`PS`) into $P$ tiny independent KLU blocks (`47,425 -> 9,195` eqns coarsened from `583` to `126` blocks on `adder`, $W = 3 \to 5$, max block `164` eqns; `38,826 -> 9,870` eqns across `464` blocks on `coupler`, max block `30` eqns) and advances all $P$ blocks in parallel across the causal delay window $W = \min_{p_1 \neq p_2}(T_d / \Delta t)$ steps in L1/L2 cache (`-p -n`, **up to `75.3x` CPU speedup**) or in GPU shared memory (`-g`, **up to `21.5x` GPU speedup**).
    - Includes **activity-driven quiescent partition bypass** (`.option bypass`) and NUMA-aware thread capping (`16` threads).
 3. **Sub-Timestep PTL Lumped $\pi$-Replacement (`.option lumpptl`, `.option minptl`):**
@@ -25,13 +25,13 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
    - Eliminates artificial $40\times$ global timestep crushing from `1 fs` PTL via/pad stubs (e.g. `r10forig` drops from `1,904 s` in `v2.6.5` / `257 s` in `v2.7` / `41.6 s` previously to **`3.22 s` wall / `2.66 s` transient** — **`591.3x` faster than `v2.6.5` and `79.8x` faster than `v2.7`** with `0.000 fs` event shift).
 4. **Direct In-Loop Trace Recording, Zero-Allocation Streaming `.npy`/`.bin` Output & Built-In SFQ Event/Pulse Extractor (`-e`, `-E`):**
    - Drops unused JJ `variableIndex_` trace vectors from `relevantIndices`, folds exclusive `V(n1, n2)` and `P(n1, n2)` node-difference pairs into single difference vectors (`traceType = 4`), parallelizes NUMA trace allocation across OpenMP threads, and streams `.npy`/`.bin`/`.rawb` directly from `results.xVector` via a 64×8 L1 cache-tiled transpose without allocating `Output::traces`.
-   - Cuts `adder` full-waveform peak RSS memory from **`26.5 GB` (`v2.6.5`) / `8.04 GB` to `1.72 GB` (`15.4x` lower vs `v2.6.5`, `4.67x` vs pre-Item 4)** and `coupler` peak RSS from **`7.4 GB` (`v2.6.5`) / `4.3 GB` to `1.42 GB`**.
+   - Cuts `adder` full-waveform peak RSS memory from **`26.5 GB` (`v2.6.5`) / `8.04 GB` to `1.72 GB` (`15.4x` lower vs `v2.6.5`)** and `coupler` peak RSS from **`7.4 GB` (`v2.6.5`) / `4.3 GB` to `1.42 GB`**.
    - **Built-In SFQ Switching Event & Pulse Metric Extractor (`-e [file]`, `-E [spec]`, `.option events`, `.option eventmetrics`):** Detects $2\pi$ Josephson phase-slip crossings across $(2k-1)\pi$ barriers with sub-step linear interpolation (`time`, `polarity`, `winding`, `phase`) and user-selectable pulse metrics (`t_peak`, `v_peak`, `fwhm`, `dt_pi`, `area`, and `time=peak` vs `time=cross`). When invoked without `-o` (**Events-Only Mode**), tracks events in-loop without allocating `results.xVector`, cutting `adder -p -n -e` to **`4.63 s` wall / `195 MB` RSS / `606 KB` `.events.npy` (`5,250x` smaller than `.npy`, `117.1x` faster than `v2.6.5`)** and `coupler -p -n -e` to **`2.58 s` wall / `216 MB` RSS / `512 KB` `.events.npy` (`2,503x` smaller)**.
-5. **Tier 2 + Phase 5 Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Solver (`-b <N>`, `-p -n`, `-g`):**
-   - Parses and symbolically analyzes the netlist **once**, then executes $B = 2\text{–}4,096$ perturbed fabrication-yield trials (`.spread`) or deterministic 1D/2D parameter/margin sweep points (`.sweep`, `.option sweep=...`, `-S <spec>`) simultaneously across OpenMP threads with Batched Tier 4 Schur-Complement Nodal reduction (`-p -n`, **up to `83.7x` Monte Carlo speedup** and **`33.3x–51.8x` sweep speedup vs sequential MNA**), OpenMP MNA (`-p`, **up to `31.1x` speedup**), or a coalesced CUDA kernel (`-g`, **up to `19.7x` speedup**).
+5. **Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Solver (`-b <N>`, `-p -n`, `-g`):**
+   - Parses and symbolically analyzes the netlist **once**, then executes $B = 2\text{–}4,096$ perturbed fabrication-yield trials (`.spread`) or deterministic 1D/2D parameter/margin sweep points (`.sweep`, `.option sweep=...`, `-S <spec>`) simultaneously across OpenMP threads with Batched Schur-Complement Nodal reduction (`-p -n`, **up to `83.7x` Monte Carlo speedup** and **`33.3x–51.8x` sweep speedup vs sequential MNA**), OpenMP MNA (`-p`, **up to `31.1x` speedup**), or a coalesced CUDA kernel (`-g`, **up to `19.7x` speedup**).
    - Supports sweeping `.param` identifiers (re-evaluating all dependent parameter expressions and inline `{...}` expressions per sweep point), device categories (`@BIAS`, `@JJ`/`@B`, `@IND`/`@L`, `@RES`/`@R`, `@CAP`/`@C`, `@SRC`, `@ISRC`, `@VSRC`, `@PSRC`, `@GLOBAL`), and specific device labels or glob wildcards (`IB*`, `VBIAS*`, `B01*`, `L*`, `R*`) via linear steps (`<start> <stop> <step>` or `LIN <count> <start> <stop>`), relative margin windows (`MARGIN <delta> [<count>]`), explicit value lists (`LIST <v1> ... <vB>`), and 2D Cartesian products (two `.sweep` cards or two `-S` flags).
    - Computes Welford online ensemble statistics (`<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`), optional per-point waveforms (`<Trace>_MC0 .. <Trace>_MC{B-1}` via `.option mcall` / `.option sweepall`), and prints a **Monte Carlo Robustness Summary** or **Parameter Sweep / Margin Summary** table with automatic SFQ operating pass/fail margin window detection around nominal $N_{\text{SFQ}} = \text{round}(\Delta\phi / 2\pi)$. Fixed an upstream bug in `JJ.cpp` where default `area=1.0` junctions ignored `.spread`.
-6. **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`, `.option gpu=3`):**
+6. **Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`, `-g 4`, `.option gpu=3/4`):**
    - Keeps the entire transient loop in GPU VRAM with zero per-timestep PCIe transfers (**`2.5x–4.2x` GPU speedup** on 2D JJ arrays up to `65,536` JJs).
 7. **Single-Core Engine, Memory Footprint & Local Rollback Optimizations:**
    - $O(1)$ hash-map lookups (`deviceMap`, `csMap`) for mutual inductances (`K`) and `.print` traces; in-place CSR updates and `klu_l_refactor` on `RTYPE=1` switching; pre-reserved subcircuit flattening; linear token scanning; cached `PWL`/`PWS` segments; pre-computed `CUS` splines; and homogeneous device arrays (**1.5x–3.4x faster single-thread MNA** over `v2.6.5`/`v2.7`).
@@ -94,10 +94,10 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 | CLI Switch | Origin | Summary |
 | :--- | :--- | :--- |
 | `-a <0\|1>` / `--analysis=` | Inherited (`v2.7`) | `1` = Phase mode (default), `0` = Voltage mode. |
-| **`-n` / `--nodal`** | **New (`v2.8`)** | Tier 4 Schur-Complement Nodal Admittance solver ($2\times–6\times$ smaller matrix). |
+| **`-n` / `--nodal`** | **New (`v2.8`)** | Schur-Complement Nodal Admittance solver ($2\times–6\times$ smaller matrix). |
 | **`-p` / `--parallel`** | **Enhanced (`v2.8`)** | Multi-core OpenMP solver (Windowed PTL blocks, large meshes, batched MC). Combine as `-p -n`. |
 | **`-g [1\|2\|3\|4]` / `--gpu=`** | **New (`v2.8`)** | CUDA GPU solver: `1` = Auto, `2` = Hybrid, `3` = `cuSolverRF` MNA, `4` = `cuSolverRF` Nodal. |
-| **`-b <N>` / `--batch=<N>`** | **New (`v2.8`)** | Tier 2 Batched Monte Carlo solver ($N$ simultaneous `.spread` trials; combine with `-p -n` for Batched Nodal). |
+| **`-b <N>` / `--batch=<N>`** | **New (`v2.8`)** | Batched Monte Carlo solver ($N$ simultaneous `.spread` trials; combine with `-p -n` for Batched Nodal). |
 | **`-S <spec>` / `--sweep=<spec>`** | **New (`v2.8`)** | Deterministic parameter/margin sweep (e.g. `-S "@BIAS:MARGIN:0.3:21"` or `-S "Scaling:LIN:21:0.7:1.3"`). Pass twice for 2D Cartesian grid. |
 | **`-o <file>` / `--output=`** | **Enhanced (`v2.8`)** | Output file: **`.npy`**, **`.bin`**, **`.rawb`** *(New binary formats)* or `.csv`, `.dat`, `.raw` *(Inherited)*. |
 | **`-e [file]` / `--events=`** | **New (`v2.8`)** | Extracts $2\pi$ SFQ phase-slip events to `.npy` or `.csv`. Without `-o`, runs in zero-allocation **Events-Only Mode**. |
@@ -191,21 +191,21 @@ When a Josephson junction exceeds the $0.4\pi$ per-step phase-jump threshold (`n
 
 ---
 
-### B. Tier 4 Nodal (`-n`, `-g 4`) & Tier 3 (`-g 3`) on 2D Monolithic JJ Grids (`BNL exxact`)
+### B. Nodal (`-n`, `-g 4`) & GPU Monolithic (`-g 3`) Solvers on 2D JJ Grids (`BNL exxact`)
 
 1,001-timestep transient solve time on 0-PTL single-partition ($P=1$) 2D Josephson junction grids with dynamic `RTYPE=1` switching:
 
-| 2D Grid (`RTYPE=1` Switching) | Eqns ($N \to N_{\text{red}}$) | Serial MNA | **CPU Nodal (`-n`)** | **OMP Nodal (`-p -n`)** | GPU Tier 3 (`-g 3`) | **GPU Tier 4 (`-g 4`)** |
+| 2D Grid (`RTYPE=1` Switching) | Eqns ($N \to N_{\text{red}}$) | Serial MNA | **CPU Nodal (`-n`)** | **OMP Nodal (`-p -n`)** | GPU MNA (`-g 3`) | **GPU Nodal (`-g 4`)** |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **`Mono-2D-Grid-14kJJ`** ($120\times120$) | $86\text{k} \to \mathbf{14.4\text{k}}$ (`6.0x`) | 4.64 s | **1.11 s (`4.19x`)** | **1.06 s (`4.37x`)** | 3.47 s (`1.34x`) | **3.09 s (`1.50x`)** |
 | **`Mono-2D-Grid-25kJJ`** ($160\times160$) | $153\text{k} \to \mathbf{25.6\text{k}}$ (`6.0x`) | 8.88 s | **2.84 s (`3.13x`)** | **2.21 s (`4.01x`)** | 4.41 s (`2.02x`) | **3.82 s (`2.32x`)** |
 | **`Mono-2D-Grid-64kJJ`** ($256\times256$) | $393\text{k} \to \mathbf{65.5\text{k}}$ (`6.0x`) | 29.04 s | **9.29 s (`3.13x`)** | **8.65 s (`3.36x`)** | 34.09 s (`0.85x`) | **17.22 s (`1.69x`, `1.98x` vs `-g 3`)** |
 
-When junctions do not dynamically switch (`RTYPE=0` or quiescent bias), Tier 3 `cuSolverRF` (`-g 3` / `-g` auto) achieves **`3.86x–4.21x` GPU speedup** on `14kJJ` (`4.81 s -> 1.14 s`), **`3.70x`** on `25kJJ` (`8.87 s -> 2.40 s`), and **`2.57x`** on `64kJJ` (`30.46 s -> 11.87 s`).
+When junctions do not dynamically switch (`RTYPE=0` or quiescent bias), the GPU-resident `cuSolverRF` solver (`-g 3` / `-g` auto) achieves **`3.86x–4.21x` GPU speedup** on `14kJJ` (`4.81 s -> 1.14 s`), **`3.70x`** on `25kJJ` (`8.87 s -> 2.40 s`), and **`2.57x`** on `64kJJ` (`30.46 s -> 11.87 s`).
 
 ---
 
-### C. Tier 1 Windowed PTL Block-Parallel & Multi-Channel Benchmarks (`BNL exxact`)
+### C. Windowed PTL Block-Parallel & Multi-Channel Benchmarks (`BNL exxact`)
 
 Reproducible via [`scripts/benchmark_gpu_exxact.py`](../scripts/benchmark_gpu_exxact.py) and [`scripts/benchmark_non_ptl_exxact.py`](../scripts/benchmark_non_ptl_exxact.py):
 
@@ -221,7 +221,7 @@ Reproducible via [`scripts/benchmark_gpu_exxact.py`](../scripts/benchmark_gpu_ex
 
 ---
 
-### D. Tier 2 + Phase 5 Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Benchmarks (`BNL exxact`)
+### D. Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Benchmarks (`BNL exxact`)
 
 Reproducible via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.py):
 
@@ -235,7 +235,7 @@ Reproducible via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxa
 | **`ex_ksa4bit`** (4-bit KSA Adder, 695 JJs) | 66 | 256 | 204.24 s | **6.56 s** | **10.39 s** | **31.14x** | **19.65x** |
 | **`RSFQ-Pipeline-64B`** (2,048 JJs, 4.85M eqns) | 64 | 256 | 48.57 s | **1.68 s** | **3.19 s** | **28.87x** | **15.21x** |
 
-#### Batched Tier 4 Nodal (`-p -n`) & 64-Point Deterministic Parameter/Margin Sweeps (`.sweep`, `-S`) (`BNL exxact`)
+#### Batched Nodal (`-p -n`) & 64-Point Deterministic Parameter/Margin Sweeps (`.sweep`, `-S`) (`BNL exxact`)
 
 Combining Batched Nodal reduction (`Simulation::trans_sim_mc_nodal`, `-p -n`) with deterministic parameter/margin sweeps (`-S "@BIAS:MARGIN:0.25:64"`, `.sweep Scaling LIN 21 0.7 1.3`) or Monte Carlo (`-b 64`) achieves **`0.000e+00`–`1.000e-14` waveform parity** across MNA, Nodal, and GPU, automatically extracts the SFQ operating margin window (`Nom SFQ`, `Pass Pts`, `[vLo, vHi]`), and accelerates 64-point sweeps by **`33.3x–51.8x` over 64 sequential MNA runs** (**`1.46x–1.84x` faster than Batched MNA**):
 

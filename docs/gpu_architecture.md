@@ -28,9 +28,9 @@ Modern SPICE-class simulators face a fundamental tension on GPUs: transistor/dev
 
 ---
 
-## 3. Tiered GPU Acceleration Architecture for JoSIM
+## 3. Multi-Mode GPU & Parallel Acceleration Architecture for JoSIM
 
-### Tier 1: Multi-Step Windowed PTL Block-Parallel Solver ("Exact Waveform Relaxation" on GPU & CPU) — **[10x–25x Speedup on Large Multi-Tile Chips]**
+### 3.1 Multi-Step Windowed PTL Block-Parallel Solver ("Exact Waveform Relaxation" on GPU & CPU) — **[10x–25x Speedup on Large Multi-Tile Chips]**
 - **Target Workload:** Large PTL-interconnected superconducting processors and multi-tile fabrics ($5\text{k}–500\text{k}$ JJs partitioned into $P = 16 \text{ to } 4,096$ PTL-coupled islands).
 - **Mathematical Foundation:**
   1. Partition the MNA matrix AND all non-TX circuit devices (`JJ`, `Inductor`, `Resistor`, `Capacitor`, `VoltageSource`, `PhaseSource`, `CurrentSource`, `CCVS`, `VCCS`) into $P$ independent connected components $p \in \{0, \dots, P-1\}$ separated only by transmission lines (`T` elements).
@@ -46,24 +46,24 @@ Modern SPICE-class simulators face a fundamental tension on GPUs: transistor/dev
        - Writes newly solved PTL port voltages/currents into `tx.hist_` and requested `.print` traces into the GPU output buffer.
      - **On Multi-Core CPU (OpenMP):** Even without a GPU, advancing each partition $p$ for $W$ consecutive steps inside a single OpenMP parallel region reduces OpenMP thread-barrier frequency by a factor of $W$ (e.g. $20\times$ fewer barriers) and keeps partition $p$'s KLU factors and device arrays hot in per-core L1/L2 cache!
 
-### Tier 2: Batched GPU Solver for `.spread` Monte Carlo, Margin Optimization & Parameter Sweeps — **[50x–100x Throughput]**
-- **Target Workload:** Critical margin analysis, yield estimation (`.spread`), bias optimization, and `.iv` curves, where the same netlist is simulated $B = 64 \text{ to } 4,096$ times with perturbed parameters.
+### 3.2 Batched Solver for `.spread` Monte Carlo, Margin Optimization & Parameter Sweeps — **[50x–100x Throughput]**
+- **Target Workload:** Critical margin analysis, yield estimation (`.spread`), bias optimization (`.sweep`, `-S`), and `.iv` curves, where the same netlist is simulated $B = 64 \text{ to } 4,096$ times with perturbed parameters.
 - **Architecture:** All $B$ runs share the exact same sparsity graph (`rp`, `ci`) and symbolic elimination tree (`Symbolic_`). State vectors and nonzeros are stored in interleaved batch-major layout (`x[var_idx * B + batch_id]`), so each CUDA warp executes 32 independent circuit simulations in lockstep with 100% coalesced memory access.
 
-### Tier 3: Fully GPU-Resident Monolithic Solver (`NVIDIA cuDSS` / `GLU 3.0` + Fused SoA Kernels) — **[3x–6x Speedup for $>50\text{k}$ JJs]**
+### 3.3 Fully GPU-Resident Monolithic Solver (`NVIDIA cuDSS` / `cuSolverRF` + Fused SoA Kernels) — **[3x–6x Speedup for $>50\text{k}$ JJs]**
 - **Target Workload:** Single massive tightly-coupled circuits without PTL breaks ($>50,000$ JJs and $>250,000$ MNA equations).
 - **Architecture:** Structure-of-Arrays (SoA) device kernels in VRAM paired with `NVIDIA cuDSS` / `cuSolverRF` for level-scheduled GPU sparse LU refactorization and triangular solves.
 
-### Tier 4: Exact Schur-Complement Nodal Admittance Formulation on CPU (`-n`) & GPU (`-g 4`) + Quiescent Partition Bypass (`.option bypass`) — **[1.5x–4.4x Monolithic Speedup]**
+### 3.4 Exact Schur-Complement Nodal Admittance Formulation on CPU (`-n`) & GPU (`-g 4`) + Quiescent Partition Bypass (`.option bypass`) — **[1.5x–4.4x Monolithic Speedup]**
 - **Target Workload:** Large monolithic single-partition circuits ($P = 1\text{–}2$, e.g. `spec2si-seeqc` `r5cal`, `r10f1n`, `xadd4` and 2D/3D JJ arrays `14kJJ–64kJJ`) where standard MNA inflates the matrix dimension by $2\times–6\times$ with internal branch equations (`JJ` `variableIndex_` and `currentIndex_`, `R`/`C`/uncoupled `L`/`T` branch currents, and grounded `V`/`P` sources).
 - **Architecture:** Analytically eliminates all diagonal internal branch equations via exact Schur-complement reduction into the reduced Nodal Admittance matrix $A_{\text{red}}$ of dimension $N_{\text{red}} \ll N$ (reducing matrix rows by **1.9x–6.0x** and LU factor nonzeros $\text{nnz}(L+U)$ by **1.5x–2.5x**), solves $A_{\text{red}} \mathbf{x}_{\text{red}} = \mathbf{b}_{\text{red}}$ via KLU on CPU (`-n` / `.option nodal`) or `cuSolverRF` in GPU VRAM (`-g 4` / `.option gpu=4`), and reconstructs any requested `.print` branch currents on the fly. Also adds activity-driven quiescent partition bypass (`.option bypass`) and NUMA-aware OpenMP scaling (`adder -p` `3.61x`).
 
 ---
 
-## 4. Tier 1 Implementation Details & BNL `exxact` Benchmark Results
+## 4. Multi-Step Windowed PTL Block-Parallel Solver: Implementation & BNL `exxact` Benchmark Results
 
 ### 4.1 Implementation Architecture (`Simulation.cpp`, `CudaSolver.cu`)
-Tier 1 is implemented for both **Multi-Core OpenMP CPU (`-p` / `--parallel`, `-DUSING_OPENMP=ON`)** and **NVIDIA CUDA GPU (`-g` / `--gpu`, `.option gpu`, `-DUSING_CUDA=ON`)**:
+The Multi-Step Windowed PTL Block-Parallel Solver is implemented for both **Multi-Core OpenMP CPU (`-p` / `--parallel`, `-DUSING_OPENMP=ON`)** and **NVIDIA CUDA GPU (`-g` / `--gpu`, `.option gpu`, `-DUSING_CUDA=ON`)**:
 
 1. **Full Device & Matrix Partitioning (`Simulation::setup_partitions`):**
    - Partitions the MNA matrix $\mathbf{A}$ into $P$ connected components across lossless/lossy transmission lines (`T` elements) and classifies every circuit device (`JJ`, `Inductor` + mutual `M`, `Resistor`, `Capacitor`, `VoltageSource`, `PhaseSource`, `CurrentSource`, `CCVS`, `VCCS`, and `TransmissionLine` Port 1 / Port 2 halves) into its owning partition $p \in \{0, \dots, P-1\}$.
@@ -112,7 +112,7 @@ Benchmarked on PTL-coupled SFQ processor tile arrays ($W = 100$ step PTL lookahe
 
 #### Key Hardware & Roofline Takeaways
 1. **Up to `27.15x` OpenMP CPU Speedup & `21.47x` CUDA GPU Speedup:**
-   - The Tier 1 Multi-Step Windowed PTL Solver reduces the 131,072-JJ (`675,840`-equation) simulation runtime from **232.89 s** down to **8.58 s** on 32 EPYC CPU threads (**`27.15x` speedup**) and **10.85 s** on a single RTX A6000 GPU (**`21.47x` speedup**, and **`3.09x` faster than 8-thread OpenMP**).
+   - The Multi-Step Windowed PTL Solver reduces the 131,072-JJ (`675,840`-equation) simulation runtime from **232.89 s** down to **8.58 s** on 32 EPYC CPU threads (**`27.15x` speedup**) and **10.85 s** on a single RTX A6000 GPU (**`21.47x` speedup**, and **`3.09x` faster than 8-thread OpenMP**).
 2. **Workstation GA102 (`sm_86`) vs. Data-Center GA100/GH100 (`sm_80`/`sm_90`) FP64 Throughput:**
    - The NVIDIA RTX A6000 uses the workstation **GA102** die, which has a **1:64 FP64-to-FP32 ratio** (only **2 FP64 cores per SM × 84 SMs = 168 FP64 cores**, ~0.61 TFLOPS peak FP64, and microcoded ~60-cycle double-precision divisions during backward substitution).
    - Data-center GPUs (**NVIDIA A100 / H100 / B200**) feature full **1:2 FP64 Tensor/FP64 pipelines** (16x–55x higher FP64 throughput per SM than GA102), where the exact same shared-memory `advance_partitions_window_kernel` will scale proportionately higher on $10^5–10^6$ JJ netlists.
@@ -172,16 +172,16 @@ To evaluate performance on circuits that **do not rely solely on PTLs**—includ
 2. **Rich Component Mixes (`JJ + L + Mutual K + Cap C + R`) Scale Up to 1.21M Equations:**
    - Adding 393,216 mutual couplings (`K`) and 131,072 explicit capacitors (`C`) increases each partition's matrix size from `165` equations (`PTL-Tile-*`) to `296` equations (`RSFQ-ALU-Macros-*`, $nnz(L_p + U_p) \approx 1,350$), achieving **`20.93x` OpenMP speedup** and **`8.59x` GPU speedup** at 1.21M equations.
 3. **Purely Monolithic Single-Component Circuits ($P = 1$, `0 PTLs`) Confirm the Sandia Xyce / `CUSPICE` Roofline:**
-   - When all nodes are galvanically/inductively coupled into a single component ($P = 1$) with zero PTLs, a single global triangular solve `klu_l_tsolve` must execute at every timestep. For $47\text{k}–65\text{k}$ equations in Phase mode, one serial timestep takes only `0.7–0.9 ms` inside CPU L3 cache, so thread synchronization or PCIe transfers exceed the device-evaluation savings. Once per-step device work grows via Voltage-mode mutual inductance sweeps (`Mono-RLK-49kK-Volt`, **`1.16x` OMP**) or $>100\text{k}$ equations (`Mono-2D-JJ-Grid`, **`1.06x` OMP**), parallel device evaluation reaches net speedup, while confirming why **partition-level parallelism ($P \ge 2$) or batched `.spread` execution (Tier 2)** is essential for order-of-magnitude speedups.
+   - When all nodes are galvanically/inductively coupled into a single component ($P = 1$) with zero PTLs, a single global triangular solve `klu_l_tsolve` must execute at every timestep. For $47\text{k}–65\text{k}$ equations in Phase mode, one serial timestep takes only `0.7–0.9 ms` inside CPU L3 cache, so thread synchronization or PCIe transfers exceed the device-evaluation savings. Once per-step device work grows via Voltage-mode mutual inductance sweeps (`Mono-RLK-49kK-Volt`, **`1.16x` OMP**) or $>100\text{k}$ equations (`Mono-2D-JJ-Grid`, **`1.06x` OMP**), parallel device evaluation reaches net speedup, while confirming why **partition-level parallelism ($P \ge 2$) or batched `.spread` / `.sweep` execution** is essential for order-of-magnitude speedups.
 
 ---
 
-## 6. Tier 2 Implementation: Batched GPU (`-g`) & Multi-Core OpenMP (`-p`) Monte Carlo (`.spread`) Robustness Solver
+## 6. Batched GPU (`-g`) & Multi-Core OpenMP (`-p`) Monte Carlo (`.spread`) & Parameter Sweep (`.sweep`) Solver
 
 ### 6.1 Architectural Design (`Simulation::trans_sim_mc`, `advance_mc_coalesced_kernel`)
 Superconducting IC design requires extensive Monte Carlo yield and critical-margin analysis (`.spread`), simulating a circuit across $B = 32\text{ to }4,096$ fabrication-variation trials where every inductor (`L`), Josephson junction (`B` area/$I_c$), resistor (`R`), and capacitor (`C`) is perturbed around its nominal value. Running JoSIM $B$ times sequentially from the CLI repeats netlist parsing, subcircuit flattening, CSR assembly, and symbolic factorization $B$ times, and leaves single-component or modest-partition circuits ($P = 1\text{–}66$) unable to saturate a multi-core CPU or GPU.
 
-Tier 2 (`Simulation::trans_sim_mc` in [`src/Simulation.cpp`](../src/Simulation.cpp) and `advance_mc_coalesced_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)) solves all $B$ Monte Carlo trials simultaneously in a single invocation:
+The Batched Monte Carlo & Parameter Sweep solver (`Simulation::trans_sim_mc` and `Simulation::trans_sim_mc_nodal` in [`src/Simulation.cpp`](../src/Simulation.cpp) and `advance_mc_coalesced_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)) solves all $B$ trials simultaneously in a single invocation:
 
 1. **CLI & Netlist Controls:**
    - `-b <N>` / `--batch=<N>` CLI flag
@@ -209,7 +209,7 @@ Tier 2 (`Simulation::trans_sim_mc` in [`src/Simulation.cpp`](../src/Simulation.c
 5. **Numerically Stable Welford Ensemble Statistics & Robustness Summary (`Output::write_output`):**
    - Uses **Welford's online algorithm** across all $B$ trials at each output timestep to compute `<Trace>` (ensemble mean), `<Trace>_STD` (sample standard deviation), `<Trace>_MIN`, and `<Trace>_MAX` without catastrophic cancellation on constant $2\pi$ superconducting phase plateaus, plus a formatted **Monte Carlo Robustness Summary** table on stdout.
 
-### 6.2 Tier 2 Batched Monte Carlo Benchmark Results on BNL `exxact` (`Dual AMD EPYC 7413 + NVIDIA RTX A6000`)
+### 6.2 Batched Monte Carlo Benchmark Results on BNL `exxact` (`Dual AMD EPYC 7413 + NVIDIA RTX A6000`)
 
 Verified via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.py) and [`scripts/run_mc_exxact.sh`](../scripts/run_mc_exxact.sh) across **16 benchmark configurations** spanning:
 - Real production MIT-LL standard cells & multi-gate RSFQ logic (`ex_jtl_basic`, `ex_mitll_xor_wr`, `ex_mitll_dff_wr`, and `ex_ksa4bit` 4-bit Kogge-Stone Adder with 695 JJs, $P=66$ partitions)
@@ -236,7 +236,7 @@ Verified via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.p
 | **`RSFQ-Pipeline-64B` (2,048 JJs, 64 Blocks)** | 64 | 64 | 12.178 s | **0.510 s** | **1.243 s** | **23.87x** | **9.80x** | **6.34x** | `1.45e-17` |
 | **`RSFQ-Pipeline-64B` (2,048 JJs, 64 Blocks)** | 64 | 256 | 48.566 s | **1.682 s** | **3.192 s** | **28.87x** | **15.21x** | **12.55x** | `1.45e-17` |
 
-### 6.3 Key Takeaways from Tier 2 Batched Monte Carlo
+### 6.3 Key Takeaways from Batched Monte Carlo
 1. **Unlocks GPU & Multi-Core Speedups Even on Single-Partition Monolithic Circuits ($P = 1$) and Small Standard Cells:**
    - Whereas a single run ($B=1$) of a monolithic $P=1$ circuit or an MIT-LL standard cell (`ex_mitll_xor_wr`, `ex_mitll_dff_wr`) cannot saturate a GPU, batching $B = 1024$ Monte Carlo trials achieves **`24.3x–28.2x` OpenMP speedup** and **`3.3x–7.2x` CUDA GPU speedup** (`4.96x` total wall-clock GPU speedup on `ex_mitll_dff_wr`). Notice that on the GPU, increasing $B$ by $4\times$ (from `256` to `1024`) on `Mono-RSFQ-Cell-Macro` increases GPU transient time by only `7.8%` (`4.611s -> 4.972s`) as additional trial warps fill previously idle SMs!
 2. **Up to `31.14x` OpenMP Speedup & `19.65x` CUDA GPU Speedup (`18.33x` Wall-Clock Speedup) on Real Production RSFQ Circuits (`ex_ksa4bit`):**
@@ -246,15 +246,15 @@ Verified via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.p
 
 ---
 
-## 7. Tier 3 Implemented & Benchmarked: Fully GPU-Resident Monolithic Solver (`cuSolverRF`, `-g 3`) & Unified GPU Auto-Dispatcher (`-g`)
+## 7. Fully GPU-Resident Monolithic Solver (`cuSolverRF`, `-g 3`) & Unified GPU Auto-Dispatcher (`-g`)
 
 ### 7.1 Motivation & Architectural Design (`Simulation::setup_gpu_monolithic_full`, `CudaPartitionSolver::step_monolithic_full_window`)
 
-When a circuit contains **zero transmission lines ($P = 1$ single connected component)** and is simulated as a single run ($B = 1$), Tier 1's PTL block partitioning produces only a single global partition. If that monolithic circuit is a large 2D/3D mesh or Josephson junction array ($N \ge 50,000$ equations with 2D fill-in $\text{nnz}(L+U) \ge 10 N$), two bottlenecks limit hybrid CPU/GPU execution (`-g 2`):
+When a circuit contains **zero transmission lines ($P = 1$ single connected component)** and is simulated as a single run ($B = 1$), PTL block partitioning produces only a single global partition. If that monolithic circuit is a large 2D/3D mesh or Josephson junction array ($N \ge 50,000$ equations with 2D fill-in $\text{nnz}(L+U) \ge 10 N$), two bottlenecks limit hybrid CPU/GPU execution (`-g 2`):
 1. **Per-Timestep PCIe Transfers:** Copying the solution vector $\mathbf{x} \in \mathbb{R}^N$ (`H2D`) and right-hand side $\mathbf{b} \in \mathbb{R}^N$ (`D2H`) across PCIe at every timestep incurs ~15–40 $\mu\text{s}$ of latency per step.
 2. **Host KLU Triangular Solve Memory Bandwidth:** On 2D/3D meshes (`120x120` to `256x256` JJs), $L$ and $U$ contain `1,000,000` to `5,500,000+` FP64 nonzeros (`12–45 MB`), spilling out of CPU L2/L3 cache and making `klu_l_tsolve` memory-bandwidth bound on the host (`4.5 s` to `30.5 s` for 1,000 steps).
 
-To eliminate both bottlenecks, **Tier 3 (`-g 3` / `--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`)** keeps the **entire transient simulation loop 100% resident in GPU VRAM** with **zero per-timestep PCIe transfers**:
+To eliminate both bottlenecks, the **Fully GPU-Resident Monolithic Solver (`-g 3` / `--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`)** keeps the **entire transient simulation loop 100% resident in GPU VRAM** with **zero per-timestep PCIe transfers**:
 
 1. **Exact $O(\text{nnz}(L+U))$ KLU Factor Extraction (`klu_l_extract`):**
    - During setup (`Simulation::setup_gpu_monolithic_full` in [`src/Simulation.cpp`](../src/Simulation.cpp)), KLU factors the unscaled monolithic CSR matrix ($A$, interpreted by KLU as CSC of $A^T$) with `Common_.btf = 0; Common_.scale = 0`:
@@ -272,18 +272,18 @@ To eliminate both bottlenecks, **Tier 3 (`-g 3` / `--gpu=3`, `.option gpu=3`, `.
 
 | CLI / Netlist Option | Solver Mode | Target Circuit Topology & Characteristics |
 | :--- | :--- | :--- |
-| **`-g` or `-g 1`** (`.option gpu`) | **Unified Auto-Dispatcher** (Default) | Automatically inspects partition count $P$, equation count $N$, and LU fill-in density $\text{nnz}(L+U)/N$:<br>• **$P \ge 2$ partitions:** Dispatches to **Tier 1 Windowed Partitioned GPU Solver**.<br>• **$P = 1$ monolithic mesh ($\text{nnz}(L+U) \ge 10 N$ and $\text{nnz}(L+U) \ge 200\text{k}$):** Dispatches to **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`)**.<br>• **$P = 1$ monolithic 1D chain/tree ($\text{nnz}(L+U) < 10 N$):** Dispatches to **Hybrid Device-GPU + Host-KLU Monolithic Solver (`-g 2`)**. |
+| **`-g` or `-g 1`** (`.option gpu`) | **Unified Auto-Dispatcher** (Default) | Automatically inspects partition count $P$, equation count $N$, and LU fill-in density $\text{nnz}(L+U)/N$:<br>• **$P \ge 2$ partitions:** Dispatches to **Windowed Partitioned GPU Solver**.<br>• **$P = 1$ monolithic mesh ($\text{nnz}(L+U) \ge 10 N$ and $\text{nnz}(L+U) \ge 200\text{k}$):** Dispatches to **Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`)**.<br>• **$P = 1$ monolithic 1D chain/tree ($\text{nnz}(L+U) < 10 N$):** Dispatches to **Hybrid Device-GPU + Host-KLU Monolithic Solver (`-g 2`)**. |
 | **`-g 2`** (`--gpu=2`, `.option gpu=2`) | **Hybrid Device-GPU + Host-KLU Monolithic Solver** | Best for **1D chains, trees, and low-fill-in monolithic circuits** ($\text{nnz}(L+U)/N \approx 4.5\text{–}8$, e.g., long 1D RSFQ pipelines or RLK ladders) where $L$ and $U$ fit in CPU L2/L3 cache (`klu_l_tsolve` takes `<0.4 ms/step`) while nonlinear JJ `sin/cos` and mutual inductance $K$ evaluations run in parallel on the GPU. |
-| **`-g 3`** (`--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`) | **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver** | Best for **large 2D/3D Josephson junction grids, arrays, and high-fill-in monolithic meshes** ($\text{nnz}(L+U)/N \ge 10$, $\text{nnz}(L+U) \ge 200\text{k}$), where CPU KLU triangular solve is memory-bandwidth bound on millions of FP64 nonzeros while `cuSolverRF` exploits wide 2D/3D level-set parallelism and 768 GB/s GDDR6 bandwidth with zero per-step PCIe traffic. |
+| **`-g 3`** (`--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`) | **Fully GPU-Resident `cuSolverRF` Monolithic Solver** | Best for **large 2D/3D Josephson junction grids, arrays, and high-fill-in monolithic meshes** ($\text{nnz}(L+U)/N \ge 10$, $\text{nnz}(L+U) \ge 200\text{k}$), where CPU KLU triangular solve is memory-bandwidth bound on millions of FP64 nonzeros while `cuSolverRF` exploits wide 2D/3D level-set parallelism and 768 GB/s GDDR6 bandwidth with zero per-step PCIe traffic. |
 
-### 7.3 Tier 3 Numerical Verification & Benchmark Results on BNL `exxact` (`2x Xeon Gold 6338 / EPYC + NVIDIA RTX A6000`)
+### 7.3 Monolithic `cuSolverRF` Numerical Verification & Benchmark Results on BNL `exxact` (`2x Xeon Gold 6338 / EPYC + NVIDIA RTX A6000`)
 
 Reproducible via [`scripts/benchmark_tier3_exxact.py`](../scripts/benchmark_tier3_exxact.py):
 
-#### Phase 1: Numerical Accuracy Verification (Serial `1T` vs. Tier 3 `cuSolverRF` `-g 3`)
+#### A. Numerical Accuracy Verification (Serial `1T` vs. `cuSolverRF` `-g 3`)
 All 8 verification circuits across Phase mode (`-a 1`) and Voltage mode (`-a 0`), including `RTYPE=1` switching junctions, mutual inductances (`K`), passive $RLC$ meshes, and transmission lines (`T`), match the serial CPU KLU solver to machine precision (**`0.000e+00` to `1.320e-17` max absolute difference**):
 
-| Verification Circuit | Mode | MNA Eqns ($N$) | $\text{nnz}(L+U)$ | Window $W$ | Max $\|\text{Serial} - \text{GPU Tier 3}\|$ |
+| Verification Circuit | Mode | MNA Eqns ($N$) | $\text{nnz}(L+U)$ | Window $W$ | Max $\|\text{Serial} - \text{GPU } (-g\ 3)\|$ |
 | :--- | :---: | ---: | ---: | ---: | :---: |
 | `Verify-2D-Grid-Phase` ($30\times30$ JJs, `RTYPE=1`) | Phase (`-a 1`) | 5,402 | 41,648 | 399 | **`1.320e-17`** |
 | `Verify-2D-Grid-Volt` ($30\times30$ JJs, `RTYPE=1`) | Voltage (`-a 0`) | 5,402 | 40,748 | 399 | **`2.000e-19`** |
@@ -294,7 +294,7 @@ All 8 verification circuits across Phase mode (`-a 1`) and Voltage mode (`-a 0`)
 | `Verify-PTL-JTL-Phase` (16 PTL blocks, 240 JJs) | Phase (`-a 1`) | 1,230 | 4,888 | 20 | **`1.000e-17`** |
 | `Verify-PTL-JTL-Volt` (16 PTL blocks, 240 JJs) | Voltage (`-a 0`) | 1,230 | 4,648 | 20 | **`1.000e-18`** |
 
-#### Phase 2: Transient Solver Performance Comparison (`1,000` Timesteps)
+#### B. Transient Solver Performance Comparison (`1,000` Timesteps)
 
 | Circuit | Topology & Scale | Serial `1T` | OpenMP `-p` | GPU Hybrid `-g 2` | GPU `cuSolverRF` `-g 3` | GPU Auto `-g` | `-g 2` Speedup | `-g 3` Speedup | `-g` Auto Speedup |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -311,19 +311,19 @@ All 8 verification circuits across Phase mode (`-a 1`) and Voltage mode (`-a 0`)
 | **`PTL-512x30JTL-Phase`** | 512-Block PTL Network (`15,360` JJs, $P=512$) | `2.180 s` | `0.681 s` | `0.922 s` | *Partitioned* | **`0.150 s`** | 2.37x | — | **14.49x** |
 | **`PTL-800x30JTL-Phase`** | 800-Block PTL Network (`24,000` JJs, $P=800$) | `4.170 s` | `0.664 s` | `1.460 s` | *Partitioned* | **`0.300 s`** | 2.86x | — | **13.89x** |
 
-### 7.4 Key Takeaways from Tier 3 (`cuSolverRF` Monolithic Solver & Auto-Dispatcher)
+### 7.4 Key Takeaways from `cuSolverRF` Monolithic Solver & Auto-Dispatcher
 1. **`2.44x–4.21x` GPU Speedup on Purely Monolithic 0-PTL 2D Josephson Junction Arrays (`14k` to `65k` JJs):**
-   - Whereas OpenMP (`-p`, `1.02x–1.20x`) and Hybrid Device-Only GPU (`-g 2`, `1.08x–1.48x`) are bottlenecked by host KLU triangular solves on 2D meshes (`N = 86,402` to `393,730`, $\text{nnz}(L+U) = 1.0\text{M}$ to $5.5\text{M}$), keeping the entire simulation loop in VRAM via Tier 3 `cuSolverRF` (`-g 3`) accelerates transient simulation by **`3.86x–4.21x` on $120\times120$ grids**, **`3.68x–3.71x` on $160\times160$ grids (`8.87s -> 2.39s`)**, and **`2.45x–2.57x` on $256\times256$ grids (`30.46s -> 11.87s`)**—roughly **`2.1x–3.4x` faster than Hybrid `-g 2`**.
+   - Whereas OpenMP (`-p`, `1.02x–1.20x`) and Hybrid Device-Only GPU (`-g 2`, `1.08x–1.48x`) are bottlenecked by host KLU triangular solves on 2D meshes (`N = 86,402` to `393,730`, $\text{nnz}(L+U) = 1.0\text{M}$ to $5.5\text{M}$), keeping the entire simulation loop in VRAM via `cuSolverRF` (`-g 3`) accelerates transient simulation by **`3.86x–4.21x` on $120\times120$ grids**, **`3.68x–3.71x` on $160\times160$ grids (`8.87s -> 2.39s`)**, and **`2.45x–2.57x` on $256\times256$ grids (`30.46s -> 11.87s`)**—roughly **`2.1x–3.4x` faster than Hybrid `-g 2`**.
 2. **Seamless Unified `-g` Auto-Dispatcher Across All Superconducting Circuit Topologies:**
    - Simply passing `-g` (or `.option gpu`) now delivers strong GPU speedups across the entire spectrum of superconducting circuits:
-     - **Multi-block PTL circuits ($P \ge 2$):** Dispatches to Tier 1 (`5.82x–21.47x` speedup).
-     - **Monolithic 2D/3D arrays ($P = 1$, high fill-in):** Dispatches to Tier 3 `cuSolverRF` (`2.45x–4.21x` speedup).
+     - **Multi-block PTL circuits ($P \ge 2$):** Dispatches to the Windowed PTL GPU Solver (`5.82x–21.47x` speedup).
+     - **Monolithic 2D/3D arrays ($P = 1$, high fill-in):** Dispatches to `cuSolverRF` (`-g 3`, `2.45x–4.21x` speedup).
      - **Monolithic 1D chains & mutual-inductance macros ($P = 1$, low fill-in):** Dispatches to Hybrid `-g 2` (`1.36x–1.77x` speedup).
-     - **Batched Monte Carlo robustness studies (`-b N -g`):** Dispatches to Tier 2 Coalesced Batch Solver (`up to 19.65x` GPU speedup).
+     - **Batched Monte Carlo & sweep studies (`-b N -g`):** Dispatches to the Coalesced Batch GPU Solver (`up to 19.65x` GPU speedup).
 
 ---
 
-## 8. Tier 4 Implemented & Benchmarked: Exact Schur-Complement Nodal Admittance Solver (`-n` CPU & `-g 4` GPU) and Quiescent Partition Bypass (`.option bypass`)
+## 8. Exact Schur-Complement Nodal Admittance Solver (`-n` CPU & `-g 4` GPU) and Quiescent Partition Bypass (`.option bypass`)
 
 ### 8.1 Motivation: Why Standard MNA Inflates Superconducting Circuit Matrices by $2\times–6\times$
 In JoSIM's standard Modified Nodal Analysis (MNA) formulation:
@@ -334,7 +334,7 @@ In JoSIM's standard Modified Nodal Analysis (MNA) formulation:
 As a result, a circuit with $14,400$ nodes and $14,400$ JJs (`Mono-2D-Grid-14kJJ`) has **$N = 86,163$ MNA equations** even though only **$N_{\text{red}} = 14,401$ independent nodal equations** exist! Similarly, on real production superconducting IC designs (`spec2si-seeqc`: `xadd4`, `r5cal`, `r10f1n`, `coupler`, `adder`), auxiliary branch rows account for **48%–60% of the entire MNA matrix** and **35%–55% of all LU nonzeros $\text{nnz}(L+U)$**. Crucially, when a circuit has only $P = 1$ or $P = 2$ PTL partitions (`xadd4`, `r5cal`, `r10f1n`), partition-level OpenMP cannot parallelize the global triangular solve (`klu_l_tsolve`), making matrix size reduction the primary lever for both single-core CPU and GPU performance.
 
 ### 8.2 Exact Schur-Complement Nodal Admittance Formulation (`Simulation::build_nodal_system`)
-Tier 4 (`Simulation::build_nodal_system`, `Simulation::setup_cpu_nodal`, `Simulation::setup_gpu_nodal`, `Simulation::trans_sim_nodal`, and `Simulation::trans_sim_gpu_nodal` in [`src/Simulation.cpp`](../src/Simulation.cpp); `nodal_full_setup_b_kernel` and `nodal_full_post_solve_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)) analytically eliminates all diagonal internal branch equations prior to factorization:
+The Schur-Complement Nodal Admittance Solver (`Simulation::build_nodal_system`, `Simulation::setup_cpu_nodal`, `Simulation::setup_gpu_nodal`, `Simulation::trans_sim_nodal`, and `Simulation::trans_sim_gpu_nodal` in [`src/Simulation.cpp`](../src/Simulation.cpp); `nodal_full_setup_b_kernel` and `nodal_full_post_solve_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)) analytically eliminates all diagonal internal branch equations prior to factorization:
 
 1. **Two-Row Josephson Junction Elimination (`variableIndex_` and `currentIndex_`):**
    - From row $v = \text{variableIndex\_}$:
@@ -357,17 +357,17 @@ Tier 4 (`Simulation::build_nodal_system`, `Simulation::setup_cpu_nodal`, `Simula
 2. **NUMA-Aware OpenMP Thread Cap (`Simulation::trans_sim_omp_windowed`, `Simulation::setup_b`):**
    - On dual-socket 96-thread servers (`exxact`), spawning 96 threads across two NUMA sockets for small-window PTL circuits (such as `spec2si-seeqc` `adder` with $P = 583$ tiny partitions and lookahead window $W = 3$) previously incurred cross-socket barrier and cache-coherency overhead. Capping default partition OpenMP threads to 16 (single-socket L3 domain) and raising the per-window PTL precomputation threshold (`numTx * w >= 4096`) and monolithic `setup_b` parallel threshold (`32,768` devices) accelerates `adder -p` to **`3.61x` transient speedup (`23.36 s` vs `84.24 s`)**.
 
-### 8.4 Tier 4 CLI & Netlist Options
+### 8.4 Nodal Solver CLI & Netlist Options
 - **CPU Schur-Complement Nodal Solver:**
   - CLI: `-n` or `--nodal` (combine with `-p` for OpenMP device evaluation + nodal KLU solve: `-p -n`)
   - Netlist: `.option nodal`
-- **GPU Tier 4 Schur-Complement Nodal `cuSolverRF` Solver:**
+- **GPU Schur-Complement Nodal `cuSolverRF` Solver:**
   - CLI: `-g 4` or `--gpu=4`
   - Netlist: `.option gpu=4` or `.option gpunodal`
 - **Quiescent Partition Bypass:**
   - Netlist: `.option bypass`, `.option bypasstol=<val>` (or `.option latency=<val>`)
 
-### 8.5 Tier 4 Numerical Verification & Benchmark Results on BNL `exxact`
+### 8.5 Nodal Solver Numerical Verification & Benchmark Results on BNL `exxact`
 
 #### A. Matrix Dimension Reduction & Machine-Precision Equivalence (`-n` CPU Nodal & `-g 4` GPU Nodal vs. Baseline MNA)
 
@@ -383,7 +383,7 @@ Tier 4 (`Simulation::build_nodal_system`, `Simulation::setup_cpu_nodal`, `Simula
 
 #### B. 2D Monolithic Josephson Junction Grid Benchmarks (`1,001` Timesteps, $P = 1$, 0 PTLs, `RTYPE=1` Switching)
 
-| Circuit ($N \to N_{\text{red}}$) | Serial MNA | OpenMP MNA (`-p`) | **CPU Nodal (`-n`)** | **OMP Nodal (`-p -n`)** | GPU Tier 3 (`-g 3`) | **GPU Tier 4 (`-g 4`)** | Best CPU Nodal Speedup | `-g 4` vs `-g 3` Speedup |
+| Circuit ($N \to N_{\text{red}}$) | Serial MNA | OpenMP MNA (`-p`) | **CPU Nodal (`-n`)** | **OMP Nodal (`-p -n`)** | GPU MNA (`-g 3`) | **GPU Nodal (`-g 4`)** | Best CPU Nodal Speedup | `-g 4` vs `-g 3` Speedup |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |
 | **`Mono-2D-Grid-14kJJ`**<br>($86,163 \to 14,401$ eqns) | `4.636 s`<br>*(wall `5.19s`)* | `3.981 s`<br>*(1.16x)* | **`1.106 s`**<br>*(wall `1.58s`)* | **`1.060 s`**<br>*(wall `1.59s`)* | `3.470 s`<br>*(1.34x)* | **`3.089 s`**<br>*(1.50x)* | **`4.37x` tran**<br>**(`3.28x` wall)** | **`1.12x` faster** |
 | **`Mono-2D-Grid-25kJJ`**<br>($153,283 \to 25,601$ eqns) | `8.882 s`<br>*(wall `9.91s`)* | `8.375 s`<br>*(1.06x)* | **`2.836 s`**<br>*(wall `3.70s`)* | **`2.214 s`**<br>*(wall `3.15s`)* | `4.406 s`<br>*(2.02x)* | **`3.820 s`**<br>*(2.32x)* | **`4.01x` tran**<br>**(`3.15x` wall)** | **`1.15x` faster** |
@@ -402,21 +402,21 @@ Evaluated across all 6 circuits from the `spec2si-seeqc` benchmark suite (`xadd4
 | **`adder`** | 5,451 | 47,425 | **20,450** (`2.32x`) | 583 ($W=3$) | `84.24 s`<br>*(wall `93.27s`)* | **`46.84 s`**<br>*(wall `55.68s`)* | **`23.36 s`**<br>*(wall `30.95s`)* | **`23.36 s`**<br>*(wall `30.95s`)* | **`1.80x` tran**<br>**(`1.68x` wall)** | **`3.61x` tran**<br>**(`3.01x` wall)** |
 | **`dff`** | 56 | 504 | **230** (`2.19x`) | 1 ($W=1$) | `0.231 s`<br>*(wall `0.343s`)* | **`0.157 s`**<br>*(wall `0.260s`)* | `0.231 s` | **`0.157 s`**<br>*(wall `0.260s`)* | **`1.47x` tran**<br>**(`1.32x` wall)** | **`1.47x`** (`-n` / `-p -n`) |
 
-### 8.6 Key Takeaways from Tier 4
+### 8.6 Key Takeaways from the Schur-Complement Nodal Solver
 1. **Solves the $P = 1$ Monolithic Bottleneck on Production Superconducting Netlists (`r5cal`, `r10f1n`, `xadd4`):**
-   - On production circuits without PTL partitions (`r5cal`, `r10f1n`, `xadd4`), partition-level OpenMP (`-p`) has only $P = 1\text{–}2$ blocks and previously achieved `1.00x` speedup over Serial MNA. The Tier 4 Schur-Complement Nodal Admittance solver (`-n` / `-p -n`) shrinks the matrix by ~`2.0x` and accelerates **`r5cal` by `2.47x` (`218.69 s -> 88.49 s`)**, **`r10f1n` by `2.14x` (`79.05 s -> 37.01 s`)**, and **`xadd4` by `1.59x` (`25.44 s -> 15.95 s`)** on a single CPU core!
+   - On production circuits without PTL partitions (`r5cal`, `r10f1n`, `xadd4`), partition-level OpenMP (`-p`) has only $P = 1\text{–}2$ blocks and previously achieved `1.00x` speedup over Serial MNA. The Schur-Complement Nodal Admittance solver (`-n` / `-p -n`) shrinks the matrix by ~`2.0x` and accelerates **`r5cal` by `2.47x` (`218.69 s -> 88.49 s`)**, **`r10f1n` by `2.14x` (`79.05 s -> 37.01 s`)**, and **`xadd4` by `1.59x` (`25.44 s -> 15.95 s`)** on a single CPU core!
 2. **`3.36x–4.37x` CPU Nodal Speedup & `1.98x` Faster GPU `cuSolverRF` on Large 2D JJ Grids (`14kJJ–64kJJ`):**
-   - Eliminating the 5 branch rows per JJ cell on 2D grids shrinks `Mono-2D-Grid-64kJJ` from $392,707$ rows to $65,537$ nodal rows (`5.99x` smaller) and cuts $\text{nnz}(L+U)$ from $5.41\text{M}$ to $3.94\text{M}$, fitting the factors into L3 cache on CPU (**`3.36x–4.37x` speedup**) and cutting `cuSolverRF` refactorization + solve time on GPU nearly in half (**`1.98x` faster than Tier 3 `-g 3`** on `64kJJ` with dynamic `RTYPE=1` switching).
+   - Eliminating the 5 branch rows per JJ cell on 2D grids shrinks `Mono-2D-Grid-64kJJ` from $392,707$ rows to $65,537$ nodal rows (`5.99x` smaller) and cuts $\text{nnz}(L+U)$ from $5.41\text{M}$ to $3.94\text{M}$, fitting the factors into L3 cache on CPU (**`3.36x–4.37x` speedup**) and cutting `cuSolverRF` refactorization + solve time on GPU nearly in half (**`1.98x` faster than GPU MNA `-g 3`** on `64kJJ` with dynamic `RTYPE=1` switching).
 3. **`3.61x` OpenMP Speedup on Short-Window PTL Circuits (`adder`) & `7.53x` on `coupler`:**
    - With NUMA-aware thread capping (`16` threads) and tuned parallel thresholds, `adder` ($P = 583$, $W = 3$) accelerates from `84.24 s` to **`23.36 s` (`3.61x` speedup)** and `coupler` ($P = 464$, $W = 420$) accelerates from `35.44 s` to **`4.70 s` (`7.53x` speedup)**.
 
 ---
 
-## 9. Phase 5 Enhancements (Items #1–#7): Series $R+L$ Elimination, Per-Partition Nodal PTL Solver (`-p -n`), Short-PTL Coarsening, Streaming Binary/Event I/O (`-e`, `-E`), Local Rollback (`.option rollback`), & Batched Sweeps (`.sweep`, `-S`)
+## 9. Series $R+L$ Elimination, Per-Partition Nodal PTL Solver (`-p -n`), Short-PTL Coarsening, Streaming Binary/Event I/O (`-e`, `-E`), Local Rollback (`.option rollback`), & Batched Sweeps (`.sweep`, `-S`)
 
-Building on Tiers 1–4, **Phase 5** implements 7 synergistic algorithmic and architectural enhancements documented in [`ENHANCEMENT_PLAN.md`](../ENHANCEMENT_PLAN.md) and [`docs/usage_and_benchmarks.md`](usage_and_benchmarks.md):
+Building on the core solver modes, JoSIM `v2.8` includes 7 synergistic algorithmic and architectural enhancements documented in [`ENHANCEMENT_PLAN.md`](../ENHANCEMENT_PLAN.md) and [`docs/usage_and_benchmarks.md`](usage_and_benchmarks.md):
 
-| Rank | Phase 5 Enhancement | Architectural Summary & Measured Impact on BNL `exxact` |
+| # | Algorithmic / Architectural Enhancement | Summary & Measured Impact on BNL `exxact` |
 | :---: | :--- | :--- |
 | **1** | **Series $R + L$ Internal Node Elimination in Nodal Solver (`-n`)** | Eliminates degree-2 internal nodes between series $R$ and uncoupled $L$ damping/bias chains into composite super-edges (`RLSuperEdge`, $g_{\text{eff}} = 1 / (\tilde{Z}_R + \tilde{Z}_L)$), shrinking $A_{\text{red}}$ to **`8,565` eqns (`3.71x`)** on `xadd4`, **`9,870` (`3.93x`)** on `coupler`, **`9,195` (`5.16x`)** on `adder`, **`28,093` (`2.29x`)** on `r5cal`, and **`39,976` (`2.25x`)** on `r10f1n` (**2.3x–3.5x 1-thread speedup**). |
 | **2** | **Per-Partition Nodal Reduction Inside Windowed PTL Solver (`-p -n`)** | Applies Nodal + series $R+L$ reduction inside each PTL-bounded partition (`NodalPartition`) and decouples shared Dirichlet `VS`/`PS` supply rails, multiplying `-p` and `-n` gains on `adder` (`47,425 -> 9,195` eqns) and `coupler` (`38,826 -> 9,870` eqns across 464 tiny blocks of $\le 30$ eqns). |

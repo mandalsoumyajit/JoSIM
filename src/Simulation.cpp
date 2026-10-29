@@ -1780,7 +1780,7 @@ bool Simulation::setup_gpu_monolithic_full(Matrix& mObj) {
         return false;
     }
     if (verb_ >= 1) {
-        std::cout << "JoSIM: Initialized CUDA Tier 3 Fully GPU-Resident Monolithic Solver (cuSolverRF, N = " << N
+        std::cout << "JoSIM: Initialized CUDA Fully GPU-Resident Monolithic Solver (cuSolverRF, N = " << N
                   << ", nnz(L+U) = " << (lnz + unz) << ", window W = " << windowSize_ << ")\n";
     }
     return true;
@@ -3925,7 +3925,7 @@ bool Simulation::setup_cpu_nodal(Matrix& mObj) {
     }
     nodalActive_ = true;
     if (verb_ >= 1 && !gpu_) {
-        std::cout << "JoSIM: Initialized Tier 4 Schur-Complement Nodal Solver (N = " << N << " -> N_red = "
+        std::cout << "JoSIM: Initialized Schur-Complement Nodal Solver (N = " << N << " -> N_red = "
                   << nodalNRed_ << ", nnz(L+U) = " << (NumericRed_->lnz + NumericRed_->unz) << ")\n";
     }
     return true;
@@ -4097,7 +4097,7 @@ bool Simulation::setup_gpu_nodal(Matrix& mObj) {
         return false;
     }
     if (verb_ >= 1) {
-        std::cout << "JoSIM: Initialized CUDA Tier 4 Schur-Complement Nodal Solver (cuSolverRF, N = " << N
+        std::cout << "JoSIM: Initialized CUDA Schur-Complement Nodal Solver (cuSolverRF, N = " << N
                   << " -> N_red = " << nRed << ", nnz(L+U) = " << (lnz + unz) << ", window W = " << windowSize_
                   << ")\n";
     }
@@ -6109,7 +6109,7 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
     }
 
     if (verb_ >= 1) {
-        std::cout << "JoSIM: Running Batched Tier 4 Schur-Complement Nodal Solver (" << B << " trials, N = " << N
+        std::cout << "JoSIM: Running Batched Schur-Complement Nodal Solver (" << B << " trials, N = " << N
                   << " -> N_red = " << nRed << ")\n";
     }
     ProgressBar bar;

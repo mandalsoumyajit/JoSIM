@@ -325,13 +325,13 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "-g" << std::setw(3) << std::left << "|"
               << "Enables NVIDIA CUDA GPU solver (requires -DUSING_CUDA=ON)." << std::endl;
     std::cout << std::setw(16) << std::left << "--gpu=" << std::setw(3) << std::left << "|"
-              << "1 (Default): Auto-dispatch (Tier 1 PTL / Tier 3 cuSolverRF / Hybrid)." << std::endl;
+              << "1 (Default): Auto-dispatch (Windowed PTL / cuSolverRF / Hybrid)." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
               << "2: Hybrid Device-GPU + Host-KLU solver." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
-              << "3: Tier 3 Fully GPU-Resident cuSolverRF Monolithic MNA solver." << std::endl;
+              << "3: Fully GPU-Resident cuSolverRF Monolithic MNA solver." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
-              << "4: Tier 4 Fully GPU-Resident cuSolverRF Nodal Admittance solver." << std::endl;
+              << "4: Fully GPU-Resident cuSolverRF Nodal Admittance solver." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Help menu
     // ---------------------------------------------------------------------------
@@ -360,7 +360,7 @@ void CliOptions::display_help() {
     // Nodal admittance solver
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-n" << std::setw(3) << std::left << "|"
-              << "Enables Tier 4 Schur-Complement Nodal Admittance solver." << std::endl;
+              << "Enables Schur-Complement Nodal Admittance solver." << std::endl;
     std::cout << std::setw(16) << std::left << "--nodal" << std::setw(3) << std::left << "|"
               << "Eliminates internal branch rows (JJ/R/C/L/T/V/P) to shrink the matrix" << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"

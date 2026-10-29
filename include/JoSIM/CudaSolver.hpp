@@ -60,7 +60,8 @@ struct GpuJJ {
 struct GpuRes {
     int32_t posIdx = -1, negIdx = -1, curIdx = -1;
     double  pn1 = 0.0, pn2 = 0.0;
-    double  g = 0.0;
+    double  g     = 0.0;
+    double  alpha = 1.0;
 };
 
 struct GpuInd {

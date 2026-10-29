@@ -170,3 +170,18 @@ Verified via [`scripts/test_phase4_wsl.sh`](scripts/test_phase4_wsl.sh) and [`sc
       - **`coupler` ($N=38,826 \to N_{\text{red}}=15,372$, $P=464$):** Serial MNA `35.44s` $\to$ **CPU Nodal (`-n`) `18.92s` (`1.87x` 1-core speedup)**, **OpenMP (`-p`) `4.70s` (`7.53x` parallel partition speedup)**.
       - **`adder` ($N=47,425 \to N_{\text{red}}=20,450$, $P=583$):** Serial MNA `84.24s` $\to$ **CPU Nodal (`-n`) `46.84s` (`1.80x` 1-core speedup)**, **OpenMP (`-p`) `23.36s` (`3.61x` parallel partition speedup)**.
       - **`dff` ($N=504 \to N_{\text{red}}=230$, $P=1$):** Serial MNA `0.231s` $\to$ **CPU Nodal (`-n`) `0.157s` (`1.47x` speedup)**.
+
+---
+
+## 9. Phase 5 Prioritized Roadmap (Ordered by Payoff / Effort Ratio)
+
+| Rank | Proposed Improvement | Status | Effort | Payoff | Primary Target & Measured / Expected Impact |
+| :---: | :--- | :---: | :---: | :---: | :--- |
+| **1** | **Series $R + L$ Internal Node Elimination in Nodal Solver (`-n`)** | **DONE** | **Low**<br>*(~150 LOC)* | **Very High** | Eliminates degree-2 internal nodes between series $R$ and uncoupled $L$ chains, shrinking $A_{\text{red}}$ to **`8,565` eqns (`3.71x`)** on `xadd4`, **`9,870` (`3.93x`)** on `coupler`, **`9,195` (`5.16x`)** on `adder`, **`29,622` (`2.17x`)** on `r5cal`, and **`41,262` (`2.18x`)** on `r10f1n` (**2.3x–3.2x 1-thread speedup**). |
+| **2** | **Per-Partition Nodal Reduction Inside Windowed PTL Solver (`-p -n`)** | **DONE** | **Low–Med**<br>*(~250 LOC)* | **Very High** | Applies Nodal reduction *inside each PTL partition* (`NodalPartition`), multiplying `-p` and `-n` gains on `adder` (**`23.36s -> 12.53s` solve / `18.96s` wall**, **`6.65x` solve speedup**) and `coupler` (**`4.70s -> 2.71s` solve / `5.73s` wall**, **`13.38x` solve speedup**). |
+| **3** | **Short-PTL Coarsening & Sub-Step Lumped $\pi$-Replacement (`r10forig`, `adder`)** | Planned | **Low–Med**<br>*(~200 LOC)* | **Very High** | Replaces $T_d < \Delta t$ PTL stubs (`1 fs` lines in `r10forig`) with exact $\pi$-equivalents (**`15x–20x` speedup on `r10forig`**) and merges only partitions linked by short PTLs so `adder`'s window jumps from $W=3 \to W \ge 20$. |
+| **4** | **Direct In-Loop Trace Recording & Streaming `.npy`/`.bin` Output** | Planned | **Low–Med**<br>*(~200 LOC)* | **High** | Eliminates `results.xVector` double-buffering in MNA/OpenMP modes, cutting `adder` peak RAM from **`8.0 GB -> ~3.2 GB`** (or **`<100 MB`** when streaming) and saving **`4–6 s`** of post-sim copy time. |
+| **5** | **Built-In SFQ Switching Event Extractor (`.option events` / `.events.npy`)** | Planned | **Low**<br>*(~120 LOC)* | **High** | Detects $(2k+1)\pi$ SFQ phase crossings with sub-step interpolation in-loop, shrinking digital verification output on `adder`/`coupler` from **`3.26 GB` `.npy` to `<200 KB`** (`16,000x` smaller). |
+| **6** | **In-Memory Rolling Checkpoints for Local Step-Halving Rollback** | Planned | **Medium**<br>*(~200 LOC)* | **Med–High** | Keeps a rolling 256-step in-memory state buffer (`<2 MB`) so `needsTR_` rolls back only 256 steps instead of restarting the entire simulation from $t = 0$. |
+| **7** | **Batched Deterministic Parameter Sweeps (`.sweep` + `-b <N> -n`)** | Planned | **Medium**<br>*(~300 LOC)* | **High** | Extends the Tier 2 batched engine (`-p -b` / `-g -b`) with Nodal reduction and deterministic bias/margin tables, accelerating DC bias / margin sweeps by **10x–30x** in a single run. |
+

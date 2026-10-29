@@ -32,8 +32,8 @@ This repository is an enhanced fork of [`JoeyDelp/JoSIM`](https://github.com/Joe
   - SPICE netlist parser, RCSJ Josephson junction physics (`RTYPE=0/1`, Haberkorn tunneling, multi-harmonic CPR, `.temp`/`.neb` thermal noise), transmission lines (`T`), mutual inductances (`K`), and controlled sources.
   - Phase-mode (`-a 1`, default) and Voltage-mode (`-a 0`) Modified Nodal Analysis (MNA) with 2nd-order Gear (BDF2) integration, serial SuiteSparse KLU solve, single-run `.spread`, `.iv`, and ASCII text output (`.csv`, `.dat`, `.raw`).
 - **New in This Fork (`v2.8`):**
-  1. **Tier 4 Schur-Complement Nodal Admittance Solver (`-n` CPU & `-g 4` GPU):** Eliminates internal branch rows (`JJ`, `R`, `C`, uncoupled `L`, `T`, grounded `V`/`P`) into a **2x–6x smaller** nodal matrix $A_{\text{red}}$ and reconstructs `.print` currents on the fly (**1.5x–2.5x faster** on 1 thread for production macros; **3.1x–4.4x** on 2D JJ grids).
-  2. **Tier 1 Multi-Step Windowed PTL Block-Parallel Solver (`-p` OpenMP & `-g` CUDA GPU):** Partitions the circuit across PTLs (`T`) and independent channels into $P$ blocks and advances them across the causal delay window $W = \min(T_d / \Delta t)$ (**up to `27.1x` OpenMP speedup** and **`21.5x` GPU speedup**), with optional quiescent partition bypass (`.option bypass`).
+  1. **Tier 4 + Phase 5 Schur-Complement Nodal & Series $R+L$ Chain Elimination (`-n` CPU & `-g 4` GPU):** Eliminates internal branch rows (`JJ`, `R`, `C`, uncoupled `L`, `T`, grounded `V`/`P`) *plus* internal degree-2 nodes along series $R+L$, $R+R$, and $L+L$ damping/bias chains into a **2.25x–5.16x smaller** nodal matrix $A_{\text{red}}$, reconstructing `.print` traces on the fly (**2.2x–3.2x faster** on 1 thread for production macros; **3.1x–4.4x** on 2D JJ grids).
+  2. **Per-Partition Nodal PTL Block-Parallel Solver (`-p -n` OpenMP & `-g` CUDA GPU):** Combines Nodal matrix reduction (`-n`) with PTL block-parallel windowing (`-p`), decoupling $A_{\text{red}}$ across transmission lines (`T`) and shared Dirichlet supply rails into $P$ tiny independent KLU blocks (e.g. `47,425 -> 9,195` eqns across `583` blocks on `adder`, max block `85` eqns; `38,826 -> 9,870` eqns across `464` blocks on `coupler`, max block `30` eqns) and advancing them in parallel across the causal delay window $W = \min(T_d / \Delta t)$ (**up to `27.1x` OpenMP speedup** and **`21.5x` GPU speedup**), with optional quiescent partition bypass (`.option bypass`).
   3. **Tier 2 Batched Monte Carlo (`.spread`) Solver (`-b <N>`, `.option mc=<N>`, `.option mcall`):** Solves $N$ perturbed fabrication-yield trials simultaneously in one run with Welford online ensemble statistics (**up to `31.1x` OpenMP speedup** and **`19.7x` GPU speedup**).
   4. **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`):** Zero-PCIe in-VRAM transient loop (**`2.5x–4.2x` GPU speedup** on 2D JJ grids).
   5. **Core Single-Thread & Memory Optimizations:** $O(1)$ hash-map lookups (`deviceMap`, `csMap`), in-place CSR updates + `klu_l_refactor` on `RTYPE=1` switching, compact PTL circular ring buffers (`hist_`), and in-loop `PRSTART`/`PRSTEP` decimation (**1.5x–3.4x faster 1T MNA** and **2x–17.6x lower peak RAM**).
@@ -47,13 +47,13 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5`,
 
 | Deck (Scale & Partitions) | `v2.6.5` (CSV) | `v2.7` (CSV) | **Fork 1T (`-n`)** | **Fork OMP (`-p -n`)** | **Speedup vs `v2.6.5` (`v2.7`)** |
 | :--- | ---: | ---: | ---: | ---: | :---: |
-| **`r5cal`** (7.2k JJs, $P=1$) | 762 s (0.29 GB) | 385 s | **90.3 s** (0.28 GB) | **90.3 s** | **8.4x** (4.3x) |
-| **`r10f1n`** (10k JJs, $P=2$) | 337 s (1.31 GB) | 173 s (0.73 GB) | **37.8 s** (**0.21 GB**) | **37.8 s** | **8.9x** (4.6x) |
-| **`r10forig`** (10k JJs, 1 fs PTL) | 1,904 s (6.0 GB) | 257 s (0.87 GB) | **~66 s** (**0.34 GB**) | **~66 s** | **28.8x** (3.9x) |
-| **`adder`** (5.5k JJs, $P=583$) | 542 s (26.5 GB) | 325 s (15.2 GB) | **55.7 s** (**8.0 GB**) | **30.95 s** | **17.5x** (10.5x) |
-| **`coupler`** (5.1k JJs, $P=464$) | 156 s (7.4 GB) | 126 s | **21.6 s** (**4.3 GB**) | **7.36 s** | **21.2x** (17.1x) |
-| **`xadd4`** (3.5k JJs, $P=1$) | 85 s (0.42 GB) | 39 s | **19.6 s** (**0.32 GB**) | **19.6 s** | **4.3x** (2.0x) |
-| **`dff`** (56 JJs, $P=1$) | 0.82 s | 0.46 s | **0.26 s** | **0.26 s** | **3.2x** (1.8x) |
+| **`r5cal`** (3.5k JJs, $P=1$) | 762 s (0.29 GB) | 385 s | **82.8 s** (0.28 GB) | **82.8 s** | **9.2x** (4.6x) |
+| **`r10f1n`** (10k JJs, $P=2$) | 337 s (1.31 GB) | 173 s (0.73 GB) | **35.5 s** (**0.21 GB**) | **35.5 s** | **9.5x** (4.9x) |
+| **`r10forig`** (10k JJs, 1 fs PTL) | 1,904 s (6.0 GB) | 257 s (0.87 GB) | **41.6 s** (**0.34 GB**) | **41.6 s** | **45.8x** (6.2x) |
+| **`adder`** (5.5k JJs, $P=583$) | 542 s (26.5 GB) | 325 s (15.2 GB) | **36.3 s** (**8.0 GB**) | **18.96 s** | **28.6x** (17.1x) |
+| **`coupler`** (2.1k JJs, $P=464$) | 156 s (7.4 GB) | 126 s | **15.3 s** (**4.3 GB**) | **5.73 s** | **27.2x** (22.0x) |
+| **`xadd4`** (3.5k JJs, $P=1$) | 85 s (0.42 GB) | 39 s | **9.77 s** (**0.32 GB**) | **9.77 s** | **8.7x** (4.0x) |
+| **`dff`** (33 JJs, $P=1$) | 0.82 s | 0.46 s | **0.20 s** | **0.20 s** | **4.1x** (2.3x) |
 
 ---
 
@@ -61,8 +61,8 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5`,
 
 | Workload / Circuit Type | Recommended Command | Speedup & Notes |
 | :--- | :--- | :--- |
-| **Single-Core / Cluster Pool Job** *(1 thread)* | `josim-cli -n -o out.npy deck.cir` | **1.5x–4.2x** via Nodal reduction (`-n`). |
-| **Universal Multi-Core CPU** *(PTL or monolithic)* | `josim-cli -p -n -o out.npy deck.cir` | **3.6x–27x** if $P \ge 4$; uses `-n` if $P \le 2$. |
+| **Single-Core / Cluster Pool Job** *(1 thread)* | `josim-cli -n -o out.npy deck.cir` | **2.2x–4.4x** via Nodal + $R/L$-chain reduction (`-n`). |
+| **Universal Multi-Core CPU** *(PTL or monolithic)* | `josim-cli -p -n -o out.npy deck.cir` | **6.6x–27x** if $P \ge 4$ (Per-Partition Nodal PTL); uses `-n` if $P \le 2$. |
 | **Large PTL Tile Array on GPU** *($P \ge 64, W \ge 8$)* | `josim-cli -g -o out.bin deck.cir` | **Up to 21.5x** (1 CUDA warp per partition). |
 | **Monolithic 2D/3D JJ Grid on GPU** *(0 PTLs)* | `josim-cli -g 3 -o out.bin deck.cir`<br>`josim-cli -g 4 -o out.bin deck.cir` | **2.5x–4.2x** (`-g 3` for `RTYPE=0`, `-g 4` for switching `RTYPE=1`). |
 | **Batched `.spread` Yield Sweep** *($B$ trials)* | `josim-cli -p -b 256 -o mc.npy deck.cir`<br>`josim-cli -g -b 256 -o mc.npy deck.cir` | **23x–31x** on OpenMP CPU; **12x–20x** on GPU. |

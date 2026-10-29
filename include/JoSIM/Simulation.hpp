@@ -60,6 +60,36 @@ struct KluPartition {
     std::vector<int64_t> traceGlobalRows;
 };
 
+struct NodalPartition {
+    int32_t              n = 0;
+    std::vector<int32_t> redRows;
+    std::vector<int32_t> dirLocalRows;
+    std::vector<int32_t> dirGlobalIdx;
+    std::vector<int64_t> rp;
+    std::vector<int64_t> ci;
+    std::vector<double>  nz;
+    std::vector<double>  xLocal;
+    std::vector<double>  bLocal;
+    klu_l_symbolic*      symbolic = nullptr;
+    klu_l_numeric*       numeric  = nullptr;
+    klu_l_common         common{};
+
+    std::vector<GpuJJ>       jjs;
+    std::vector<int64_t>     jjOrigIdx;
+    std::vector<GpuRes>      ress;
+    std::vector<GpuInd>      inds;
+    std::vector<GpuMut>      muts;
+    std::vector<GpuCap>      caps;
+    std::vector<GpuVS>       vss;
+    std::vector<GpuPS>       pss;
+    std::vector<GpuCS>       css;
+    std::vector<GpuCCVS>     ccvss;
+    std::vector<GpuVCCS>     vccss;
+    std::vector<GpuTxHalf>   txHalves;
+    std::vector<GpuRelTrace> relTraces;
+    std::vector<int64_t>     traceGlobalRows;
+};
+
 class Simulation {
   private:
     bool                SLU = false;
@@ -150,6 +180,10 @@ class Simulation {
     std::vector<GpuVCCS>                 nodalVCCSs_;
     std::vector<GpuTxHalf>               nodalTxHalves_;
     std::vector<GpuRelTrace>             nodalRelTraces_;
+    std::vector<uint8_t>                 nodalIsDirichletRed_;
+    std::vector<double>                  nodalDirichletSign_;
+    bool                                 useNodalPartitions_ = false;
+    std::vector<NodalPartition>          nodalPartitions_;
 #ifdef JOSIM_CUDA
     std::unique_ptr<CudaPartitionSolver> cudaSolver_;
 #endif
@@ -158,6 +192,7 @@ class Simulation {
     void setup(Input& iObj, Matrix& mObj);
     void setup_partitions(Matrix& mObj);
     bool build_nodal_system(Matrix& mObj);
+    bool setup_nodal_partitions(Matrix& mObj);
     bool setup_cpu_nodal(Matrix& mObj);
     bool setup_gpu_solver(Matrix& mObj);
     bool setup_gpu_monolithic(Matrix& mObj);
@@ -170,6 +205,7 @@ class Simulation {
     void trans_sim(Matrix& mObj);
     void trans_sim_mc(Matrix& mObj);
     void trans_sim_nodal(Matrix& mObj);
+    void trans_sim_nodal_omp_windowed(Matrix& mObj);
     void trans_sim_omp_windowed(Matrix& mObj);
     void trans_sim_gpu_windowed(Matrix& mObj);
     void trans_sim_gpu_monolithic(Matrix& mObj);

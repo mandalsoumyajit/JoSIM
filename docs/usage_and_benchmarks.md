@@ -14,11 +14,11 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
 - **Standard Controls & Text Output:** `.tran`, `.print`/`.plot`/`.save`, `.param`, `.subckt`, `.include`, `.iv`, single-run `.spread`, `.option seed=<int>`, and ASCII text output (`.csv`, `.dat`, `.raw`).
 
 ### What Is New in This Fork (`v2.8` — Added Since `02a34ee`)
-1. **Tier 4 Schur-Complement Nodal Admittance Solver (`-n` CPU & `-g 4` GPU):**
-   - Analytically eliminates internal branch rows (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) into a **2x–6x smaller** nodal matrix $A_{\text{red}}$ ($N_{\text{red}} \ll N$) and reconstructs requested `.print` branch currents on the fly.
-   - Delivers **1.5x–2.5x additional single-thread speedup** on production monolithic macros (`r5cal`, `r10f1n`, `xadd4`) and **3.1x–4.4x speedup** on 2D JJ grids.
-2. **Tier 1 Multi-Step Windowed PTL Block-Parallel Solver (`-p` OpenMP & `-g` CUDA GPU):**
-   - Partitions the MNA matrix and devices across transmission lines (`T`) into $P$ independent KLU blocks and advances all $P$ blocks independently across the causal delay window $W = \min(T_d / \Delta t)$ steps in L1/L2 cache (`-p`, **up to `27.1x` CPU speedup**) or in GPU shared memory (`-g`, **up to `21.5x` GPU speedup**).
+1. **Tier 4 + Phase 5 Schur-Complement Nodal & Series $R+L$ Chain Elimination (`-n` CPU & `-g 4` GPU):**
+   - Analytically eliminates internal branch rows (`JJ` `variableIndex_` and `currentIndex_`, `R`, `C`, uncoupled `L`, `T` port currents, and grounded Dirichlet `V`/`P` sources) *plus* internal degree-2 nodes along series $R+L$, $R+R$, and $L+L$ damping/bias chains into a **2.25x–5.16x smaller** nodal matrix $A_{\text{red}}$ ($N_{\text{red}} \ll N$) and reconstructs requested `.print` branch currents on the fly.
+   - Delivers **2.2x–3.2x additional single-thread speedup** on production macros (`r5cal`, `r10f1n`, `r10forig`, `xadd4`, `adder`, `coupler`) and **3.1x–4.4x speedup** on 2D JJ grids.
+2. **Tier 1 + Phase 5 Per-Partition Nodal PTL Block-Parallel Solver (`-p -n` OpenMP & `-g` CUDA GPU):**
+   - Combines Nodal matrix reduction (`-n`) with PTL block-parallel windowing (`-p`): partitions the reduced matrix $A_{\text{red}}$ across transmission lines (`T`) and shared Dirichlet supply rails (`VS`/`PS`) into $P$ tiny independent KLU blocks (`47,425 -> 9,195` eqns across `583` blocks on `adder`, max block `85` eqns; `38,826 -> 9,870` eqns across `464` blocks on `coupler`, max block `30` eqns) and advances all $P$ blocks in parallel across the causal delay window $W = \min(T_d / \Delta t)$ steps in L1/L2 cache (`-p -n`, **up to `27.1x` CPU speedup**) or in GPU shared memory (`-g`, **up to `21.5x` GPU speedup**).
    - Includes **activity-driven quiescent partition bypass** (`.option bypass`) and NUMA-aware thread capping (`16` threads).
 3. **Tier 2 Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>`, `.option mc=<N>`, `.option mcall`):**
    - Parses and symbolically analyzes the netlist **once**, then executes $B = 32\text{–}4,096$ perturbed fabrication-yield trials simultaneously across OpenMP threads (`-p -b <N>`, **up to `31.1x` speedup**) or in a coalesced CUDA kernel (`-g -b <N>`, **up to `19.7x` speedup**).
@@ -126,24 +126,25 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5` 
 
 | Deck (Scale & Partitions) | `v2.6.5` (CSV) | `v2.7` (CSV) | **Fork 1T MNA** | **Fork 1T `-n`** | **Fork OMP `-p -n`** | **Speedup vs `v2.6.5` (`v2.7`)** |
 | :--- | ---: | ---: | ---: | ---: | ---: | :---: |
-| **`r5cal`** (7.2k JJs, $P=1$) | 762 s (0.29 GB) | 385 s | 220.7 s (0.28 GB) | **90.3 s** | **90.3 s** | **8.4x** (4.3x) |
-| **`r10f1n`** (10k JJs, $P=2$) | 337 s (1.31 GB) | 173 s (0.73 GB) | 79.9 s (**0.21 GB**) | **37.8 s** | **37.8 s** | **8.9x** (4.6x) |
-| **`r10forig`** (10k JJs, 1 fs PTL) | 1,904 s (6.0 GB) | 257 s (0.87 GB) | 140.0 s (**0.34 GB**) | **~66 s** | **~66 s** | **28.8x** (3.9x) |
-| **`adder`** (5.5k JJs, $P=583$) | 542 s (26.5 GB) | 325 s (15.2 GB) | 93.3 s (**8.0 GB**) | **55.7 s** | **30.95 s** | **17.5x** (10.5x) |
-| **`coupler`** (5.1k JJs, $P=464$) | 156 s (7.4 GB) | 126 s | 38.1 s (**4.3 GB**) | **21.6 s** | **7.36 s** | **21.2x** (17.1x) |
-| **`xadd4`** (3.5k JJs, $P=1$) | 85 s (0.42 GB) | 39 s | 29.0 s (**0.32 GB**) | **19.6 s** | **19.6 s** | **4.3x** (2.0x) |
-| **`dff`** (56 JJs, $P=1$) | 0.82 s | 0.46 s | 0.34 s | **0.26 s** | **0.26 s** | **3.2x** (1.8x) |
+| **`r5cal`** (3.5k JJs, $P=1$) | 762 s (0.29 GB) | 385 s | 212.6 s (0.28 GB) | **82.8 s** | **82.8 s** | **9.2x** (4.6x) |
+| **`r10f1n`** (10k JJs, $P=2$) | 337 s (1.31 GB) | 173 s (0.73 GB) | 80.9 s (**0.21 GB**) | **35.5 s** | **35.5 s** | **9.5x** (4.9x) |
+| **`r10forig`** (10k JJs, 1 fs PTL) | 1,904 s (6.0 GB) | 257 s (0.87 GB) | 131.5 s (**0.34 GB**) | **41.6 s** | **41.6 s** | **45.8x** (6.2x) |
+| **`adder`** (5.5k JJs, $P=583$) | 542 s (26.5 GB) | 325 s (15.2 GB) | 91.9 s (**8.0 GB**) | **36.3 s** | **18.96 s** | **28.6x** (17.1x) |
+| **`coupler`** (2.1k JJs, $P=464$) | 156 s (7.4 GB) | 126 s | 39.5 s (**4.3 GB**) | **15.3 s** | **5.73 s** | **27.2x** (22.0x) |
+| **`xadd4`** (3.5k JJs, $P=1$) | 85 s (0.42 GB) | 39 s | 24.6 s (**0.32 GB**) | **9.77 s** | **9.77 s** | **8.7x** (4.0x) |
+| **`dff`** (33 JJs, $P=1$) | 0.82 s | 0.46 s | 0.29 s | **0.20 s** | **0.20 s** | **4.1x** (2.3x) |
 
 #### Transient Solve Time & Matrix Reduction on `spec2si-seeqc` (`Fork v2.8`)
 
 | Deck | Full MNA ($N$) | Nodal ($N_{\text{red}}$) | Serial MNA Solve | **1T Nodal (`-n`) Solve** | **OpenMP (`-p -n`) Solve** | **Best Solve Speedup** |
 | :--- | ---: | ---: | ---: | ---: | ---: | :---: |
-| **`r5cal`** ($P=1, W=1$) | 64,400 | **33,578** (`1.92x`) | 218.69 s | **88.49 s** | **88.49 s** | **2.47x** (`-n`) |
-| **`r10f1n`** ($P=2, W=1$) | 89,806 | **46,994** (`1.91x`) | 79.05 s | **37.01 s** | **37.01 s** | **2.14x** (`-n`) |
-| **`xadd4`** ($P=1, W=1$) | 31,813 | **16,393** (`1.94x`) | 25.44 s | **15.95 s** | **15.95 s** | **1.59x** (`-n`) |
-| **`coupler`** ($P=464, W=420$) | 38,826 | **15,372** (`2.53x`) | 35.44 s | **18.92 s** (`1.87x`) | **4.70 s** | **7.53x** (`-p`) |
-| **`adder`** ($P=583, W=3$) | 47,425 | **20,450** (`2.32x`) | 84.24 s | **46.84 s** (`1.80x`) | **23.36 s** | **3.61x** (`-p`) |
-| **`dff`** ($P=1, W=1$) | 504 | **230** (`2.19x`) | 0.231 s | **0.157 s** | **0.157 s** | **1.47x** (`-n`) |
+| **`r5cal`** ($P=1, W=1$) | 64,400 | **29,622** (`2.17x`) | 212.10 s | **82.04 s** | **82.04 s** | **2.59x** (`-n`) |
+| **`r10f1n`** ($P=2, W=1$) | 89,806 | **41,262** (`2.18x`) | 80.29 s | **34.90 s** | **34.90 s** | **2.30x** (`-n`) |
+| **`r10forig`** ($P=2, W=1$) | 89,808 | **41,264** (`2.18x`) | 130.63 s | **41.06 s** | **40.76 s** | **3.20x** (`-n`) |
+| **`xadd4`** ($P=1, W=1$) | 31,813 | **8,565** (`3.71x`) | 24.06 s | **9.18 s** | **9.18 s** | **2.62x** (`-n`) |
+| **`coupler`** ($P=464, W=420$) | 38,826 | **9,870** (`3.93x`) | 36.19 s | **12.14 s** (`2.98x`) | **2.71 s** | **13.38x** (`-p -n`) |
+| **`adder`** ($P=583, W=3$) | 47,425 | **9,195** (`5.16x`) | 83.34 s | **28.06 s** (`2.97x`) | **12.53 s** | **6.65x** (`-p -n`) |
+| **`dff`** ($P=1, W=1$) | 504 | **174** (`2.90x`) | 0.234 s | **0.141 s** | **0.141 s** | **1.66x** (`-n`) |
 
 ---
 

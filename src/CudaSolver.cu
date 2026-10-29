@@ -1519,13 +1519,15 @@ __global__ void nodal_full_setup_b_kernel(int32_t          numJJs,
 
     // 2. Resistors (Phase mode only; Voltage mode resistors have zero RHS)
     if (analysisType == 1 && tid < numRess) {
-        GpuRes&      res  = d_ress[tid];
-        const double vPos = read_node_x(d_x, res.posIdx);
-        const double vNeg = read_node_x(d_x, res.negIdx);
-        res.pn1           = vPos - vNeg;
-        const double bCur = (4.0 / 3.0) * res.pn1 - (1.0 / 3.0) * res.pn2;
-        res.pn2           = res.pn1;
-        const double jRes = res.g * bCur;
+        GpuRes&      res   = d_ress[tid];
+        const double vPos  = read_node_x(d_x, res.posIdx);
+        const double vNeg  = read_node_x(d_x, res.negIdx);
+        const double vDiff = vPos - vNeg;
+        const double pn1   = res.alpha * vDiff + (1.0 - res.alpha) * res.pn1;
+        const double bCur  = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * res.pn2;
+        res.pn2            = pn1;
+        res.pn1            = bCur;
+        const double jRes  = res.g * bCur;
         if (res.curIdx >= 0) { d_b[res.curIdx] = jRes; }
         if (res.posIdx >= 0) { atomicAdd(&d_b[res.posIdx], jRes); }
         if (res.negIdx >= 0) { atomicAdd(&d_b[res.negIdx], -jRes); }

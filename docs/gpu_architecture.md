@@ -60,7 +60,7 @@ Modern SPICE-class simulators face a fundamental tension on GPUs: transistor/dev
 
 ---
 
-## 4. Multi-Step Windowed PTL Block-Parallel Solver: Implementation & BNL `exxact` Benchmark Results
+## 4. Multi-Step Windowed PTL Block-Parallel Solver: Implementation & Benchmark Results
 
 ### 4.1 Implementation Architecture (`Simulation.cpp`, `CudaSolver.cu`)
 The Multi-Step Windowed PTL Block-Parallel Solver is implemented for both **Multi-Core OpenMP CPU (`-p` / `--parallel`, `-DUSING_OPENMP=ON`)** and **NVIDIA CUDA GPU (`-g` / `--gpu`, `.option gpu`, `-DUSING_CUDA=ON`)**:
@@ -80,8 +80,8 @@ The Multi-Step Windowed PTL Block-Parallel Solver is implemented for both **Mult
      - **`v2` (1 Warp/Partition + Shared-Memory Working Vectors `sx, sb, sy`):** Parallelized device evaluations across all 32 lanes of a warp with `sx, sb, sy` in shared memory, cutting small-circuit GPU runtime from `10.37s` to `6.20s`.
      - **`v3` (1 Warp/Partition + Full Shared-Memory $L_p + U_p$ Factors + Register-Cached Devices):** Coalesce-loads each partition's entire sparse $L_p + U_p$ matrix (`s_luVal`, `s_luCi`, `s_luRp`, `s_luDiag`, `s_P`, `s_Q`) into on-chip shared memory (~13.7 KB/warp for 165-equation tiles, enabling up to 7 concurrent warps/SM with `cudaFuncAttributePreferredSharedMemoryCarveout = 100`) and caches per-lane `JJ`, `Resistor`, and `TxHalf` states in hardware registers across all $W$ steps of the window.
 
-### 4.2 Numerical Equivalence Verification (`exxact` Workstation)
-Verified via [`scripts/benchmark_gpu_exxact.py`](../scripts/benchmark_gpu_exxact.py) across Phase mode (`-a 1`), Voltage mode (`-a 0`), `RTYPE=1` piecewise-linear switching junctions, `RTYPE=0` non-switching junctions, mutual inductances (`K`), fractional-delay interpolated PTLs (`.option txinterp`), and output decimation (`PRSTART`/`PRSTEP`):
+### 4.2 Numerical Equivalence Verification
+Verified across Phase mode (`-a 1`), Voltage mode (`-a 0`), `RTYPE=1` piecewise-linear switching junctions, `RTYPE=0` non-switching junctions, mutual inductances (`K`), fractional-delay interpolated PTLs (`.option txinterp`), and output decimation (`PRSTART`/`PRSTEP`):
 
 | Verification Suite | `max \|Serial - OpenMP (-p)\|` | `max \|Serial - GPU (-g)\|` | Status |
 | :--- | :---: | :---: | :---: |
@@ -89,7 +89,7 @@ Verified via [`scripts/benchmark_gpu_exxact.py`](../scripts/benchmark_gpu_exxact
 | **Phase mode (`-a 1`) + `RTYPE=0` + Fractional PTL (`INTERP=1`)** | `1.665e-15` | `3.664e-15` | **PASS** |
 | **Voltage mode (`-a 0`) + `RTYPE=1` + Mutual `L` + Decimation** | `0.000e+00` | `5.107e-15` | **PASS** |
 
-### 4.3 Scaling Benchmark Results on BNL `exxact` (`Dual AMD EPYC 7413 48C/96T + NVIDIA RTX A6000`)
+### 4.3 Scaling Benchmark Results (`Dual AMD EPYC 7413 48C/96T, 512 GB RAM, NVIDIA RTX A6000 48 GB`)
 Benchmarked on PTL-coupled SFQ processor tile arrays ($W = 100$ step PTL lookahead window, 32 JJs and 165 MNA equations per tile, `RTYPE=1` dynamic switching with in-place LU refactorization):
 
 #### A. Transient Solver Runtime (`Simulation::trans_sim`)
@@ -121,7 +121,7 @@ Benchmarked on PTL-coupled SFQ processor tile arrays ($W = 100$ step PTL lookahe
 
 ## 5. Benchmarks on Non-PTL & Diverse Superconducting Circuit Topologies
 
-To evaluate performance on circuits that **do not rely solely on PTLs**—including circuits with **zero transmission lines (`0 PTLs`)**, dense 3D field-extracted mutual inductance meshes (`K`), explicit shunt/parasitic capacitors (`C`), and both Phase (`-a 1`) and Voltage (`-a 0`) simulation modes—[`scripts/benchmark_non_ptl_exxact.py`](../scripts/benchmark_non_ptl_exxact.py) benchmarks 11 representative circuits across three topological categories on BNL `exxact`:
+To evaluate performance on circuits that **do not rely solely on PTLs**—including circuits with **zero transmission lines (`0 PTLs`)**, dense 3D field-extracted mutual inductance meshes (`K`), explicit shunt/parasitic capacitors (`C`), and both Phase (`-a 1`) and Voltage (`-a 0`) simulation modes—11 representative circuits were benchmarked across three topological categories (`Dual AMD EPYC 7413 48C/96T, 512 GB RAM, NVIDIA RTX A6000 48 GB`):
 
 1. **Category 1 — Purely Monolithic Tightly-Coupled Non-PTL Circuits (`0 PTLs`, $P = 1$):**
    - `Mono-2D-JJ-Grid`: $128 \times 128$ 2D Josephson junction array (`16,384` JJs, `32,512` inductors, `8,192` capacitors, `106,242` MNA equations, $P = 1$).
@@ -209,9 +209,9 @@ The Batched Monte Carlo & Parameter Sweep solver (`Simulation::trans_sim_mc` and
 5. **Numerically Stable Welford Ensemble Statistics & Robustness Summary (`Output::write_output`):**
    - Uses **Welford's online algorithm** across all $B$ trials at each output timestep to compute `<Trace>` (ensemble mean), `<Trace>_STD` (sample standard deviation), `<Trace>_MIN`, and `<Trace>_MAX` without catastrophic cancellation on constant $2\pi$ superconducting phase plateaus, plus a formatted **Monte Carlo Robustness Summary** table on stdout.
 
-### 6.2 Batched Monte Carlo Benchmark Results on BNL `exxact` (`Dual AMD EPYC 7413 + NVIDIA RTX A6000`)
+### 6.2 Batched Monte Carlo Benchmark Results (`Dual AMD EPYC 7413 48C/96T, 512 GB RAM, NVIDIA RTX A6000 48 GB`)
 
-Verified via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.py) and [`scripts/run_mc_exxact.sh`](../scripts/run_mc_exxact.sh) across **16 benchmark configurations** spanning:
+Verified across **16 benchmark configurations** spanning:
 - Real production MIT-LL standard cells & multi-gate RSFQ logic (`ex_jtl_basic`, `ex_mitll_xor_wr`, `ex_mitll_dff_wr`, and `ex_ksa4bit` 4-bit Kogge-Stone Adder with 695 JJs, $P=66$ partitions)
 - Purely monolithic 0-PTL circuits ($P=1$: `Mono-RSFQ-Cell-Macro` 128-JJ coupled logic macro and `Mono-RLK-SQUID-Macro` 96-JJ SQUID sensor array with 191 mutual inductances `K`)
 - PTL-coupled RSFQ ALU processor pipelines (`RSFQ-Pipeline-16B` $P=16$ and `RSFQ-Pipeline-64B` $P=64$, 2,048 JJs, 18,940 equations/trial $\times B=256$ = **`4,848,640` simultaneous MNA equations**)
@@ -276,9 +276,7 @@ To eliminate both bottlenecks, the **Fully GPU-Resident Monolithic Solver (`-g 3
 | **`-g 2`** (`--gpu=2`, `.option gpu=2`) | **Hybrid Device-GPU + Host-KLU Monolithic Solver** | Best for **1D chains, trees, and low-fill-in monolithic circuits** ($\text{nnz}(L+U)/N \approx 4.5\text{–}8$, e.g., long 1D RSFQ pipelines or RLK ladders) where $L$ and $U$ fit in CPU L2/L3 cache (`klu_l_tsolve` takes `<0.4 ms/step`) while nonlinear JJ `sin/cos` and mutual inductance $K$ evaluations run in parallel on the GPU. |
 | **`-g 3`** (`--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`) | **Fully GPU-Resident `cuSolverRF` Monolithic Solver** | Best for **large 2D/3D Josephson junction grids, arrays, and high-fill-in monolithic meshes** ($\text{nnz}(L+U)/N \ge 10$, $\text{nnz}(L+U) \ge 200\text{k}$), where CPU KLU triangular solve is memory-bandwidth bound on millions of FP64 nonzeros while `cuSolverRF` exploits wide 2D/3D level-set parallelism and 768 GB/s GDDR6 bandwidth with zero per-step PCIe traffic. |
 
-### 7.3 Monolithic `cuSolverRF` Numerical Verification & Benchmark Results on BNL `exxact` (`2x Xeon Gold 6338 / EPYC + NVIDIA RTX A6000`)
-
-Reproducible via [`scripts/benchmark_tier3_exxact.py`](../scripts/benchmark_tier3_exxact.py):
+### 7.3 Monolithic `cuSolverRF` Numerical Verification & Benchmark Results (`Dual AMD EPYC 7413 48C/96T, 512 GB RAM, NVIDIA RTX A6000 48 GB`)
 
 #### A. Numerical Accuracy Verification (Serial `1T` vs. `cuSolverRF` `-g 3`)
 All 8 verification circuits across Phase mode (`-a 1`) and Voltage mode (`-a 0`), including `RTYPE=1` switching junctions, mutual inductances (`K`), passive $RLC$ meshes, and transmission lines (`T`), match the serial CPU KLU solver to machine precision (**`0.000e+00` to `1.320e-17` max absolute difference**):
@@ -355,7 +353,7 @@ The Schur-Complement Nodal Admittance Solver (`Simulation::build_nodal_system`, 
 1. **Quiescent Partition Bypass (`.option bypass`, `.option bypasstol=<val>`, `.option latency=<val>`):**
    - In `Simulation::trans_sim_omp_windowed`, each partition $p \in [0, P)$ tracks whether any internal device (`JJ`, `R`, `C`, `L` + mutual `K`, sources) or incoming PTL boundary wave (`txRemote1_`, `txRemote2_`) changed its companion RHS or state above `bypassTol_` (default `1e-12`) compared to the previous step (`partPrevB_`, `partPrevX_`). When a partition is completely quiescent and had zero step change on the previous step, `klu_l_tsolve` is bypassed for that partition at that timestep.
 2. **NUMA-Aware OpenMP Thread Cap (`Simulation::trans_sim_omp_windowed`, `Simulation::setup_b`):**
-   - On dual-socket 96-thread servers (`exxact`), spawning 96 threads across two NUMA sockets for small-window PTL circuits (such as `spec2si-seeqc` `adder` with $P = 583$ tiny partitions and lookahead window $W = 3$) previously incurred cross-socket barrier and cache-coherency overhead. Capping default partition OpenMP threads to 16 (single-socket L3 domain) and raising the per-window PTL precomputation threshold (`numTx * w >= 4096`) and monolithic `setup_b` parallel threshold (`32,768` devices) accelerates `adder -p` to **`3.61x` transient speedup (`23.36 s` vs `84.24 s`)**.
+   - On dual-socket 96-thread servers (`2 × AMD EPYC 7413`), spawning 96 threads across two NUMA sockets for small-window PTL circuits (such as `spec2si-seeqc` `adder` with $P = 583$ tiny partitions and lookahead window $W = 3$) previously incurred cross-socket barrier and cache-coherency overhead. Capping default partition OpenMP threads to 16 (single-socket L3 domain) and raising the per-window PTL precomputation threshold (`numTx * w >= 4096`) and monolithic `setup_b` parallel threshold (`32,768` devices) accelerates `adder -p` to **`3.61x` transient speedup (`23.36 s` vs `84.24 s`)**.
 
 ### 8.4 Nodal Solver CLI & Netlist Options
 - **CPU Schur-Complement Nodal Solver:**
@@ -367,7 +365,7 @@ The Schur-Complement Nodal Admittance Solver (`Simulation::build_nodal_system`, 
 - **Quiescent Partition Bypass:**
   - Netlist: `.option bypass`, `.option bypasstol=<val>` (or `.option latency=<val>`)
 
-### 8.5 Nodal Solver Numerical Verification & Benchmark Results on BNL `exxact`
+### 8.5 Nodal Solver Numerical Verification & Benchmark Results (`Dual AMD EPYC 7413 48C/96T, 512 GB RAM, NVIDIA RTX A6000 48 GB`)
 
 #### A. Matrix Dimension Reduction & Machine-Precision Equivalence (`-n` CPU Nodal & `-g 4` GPU Nodal vs. Baseline MNA)
 
@@ -389,7 +387,7 @@ The Schur-Complement Nodal Admittance Solver (`Simulation::build_nodal_system`, 
 | **`Mono-2D-Grid-25kJJ`**<br>($153,283 \to 25,601$ eqns) | `8.882 s`<br>*(wall `9.91s`)* | `8.375 s`<br>*(1.06x)* | **`2.836 s`**<br>*(wall `3.70s`)* | **`2.214 s`**<br>*(wall `3.15s`)* | `4.406 s`<br>*(2.02x)* | **`3.820 s`**<br>*(2.32x)* | **`4.01x` tran**<br>**(`3.15x` wall)** | **`1.15x` faster** |
 | **`Mono-2D-Grid-64kJJ`**<br>($392,707 \to 65,537$ eqns) | `29.037 s`<br>*(wall `32.12s`)* | `26.890 s`<br>*(1.08x)* | **`9.289 s`**<br>*(wall `11.64s`)* | **`8.646 s`**<br>*(wall `11.19s`)* | `34.091 s`<br>*(0.85x)* | **`17.223 s`**<br>*(1.69x)* | **`3.36x` tran**<br>**(`2.87x` wall)** | **`1.98x` faster** |
 
-#### C. Production `spec2si-seeqc` Benchmarks (`-a 1` Phase Mode on BNL `exxact`)
+#### C. Production `spec2si-seeqc` Benchmarks (`-a 1` Phase Mode)
 
 Evaluated across all 6 circuits from the `spec2si-seeqc` benchmark suite (`xadd4`, `r5cal`, `r10f1n`, `coupler`, `dff`, `adder`):
 
@@ -416,7 +414,7 @@ Evaluated across all 6 circuits from the `spec2si-seeqc` benchmark suite (`xadd4
 
 Building on the core solver modes, JoSIM `v2.8` includes 7 synergistic algorithmic and architectural enhancements documented in [`ENHANCEMENT_PLAN.md`](../ENHANCEMENT_PLAN.md) and [`docs/usage_and_benchmarks.md`](usage_and_benchmarks.md):
 
-| # | Algorithmic / Architectural Enhancement | Summary & Measured Impact on BNL `exxact` |
+| # | Algorithmic / Architectural Enhancement | Summary & Measured Impact (`2× AMD EPYC 7413, 512 GB RAM, RTX A6000`) |
 | :---: | :--- | :--- |
 | **1** | **Series $R + L$ Internal Node Elimination in Nodal Solver (`-n`)** | Eliminates degree-2 internal nodes between series $R$ and uncoupled $L$ damping/bias chains into composite super-edges (`RLSuperEdge`, $g_{\text{eff}} = 1 / (\tilde{Z}_R + \tilde{Z}_L)$), shrinking $A_{\text{red}}$ to **`8,565` eqns (`3.71x`)** on `xadd4`, **`9,870` (`3.93x`)** on `coupler`, **`9,195` (`5.16x`)** on `adder`, **`28,093` (`2.29x`)** on `r5cal`, and **`39,976` (`2.25x`)** on `r10f1n` (**2.3x–3.5x 1-thread speedup**). |
 | **2** | **Per-Partition Nodal Reduction Inside Windowed PTL Solver (`-p -n`)** | Applies Nodal + series $R+L$ reduction inside each PTL-bounded partition (`NodalPartition`) and decouples shared Dirichlet `VS`/`PS` supply rails, multiplying `-p` and `-n` gains on `adder` (`47,425 -> 9,195` eqns) and `coupler` (`38,826 -> 9,870` eqns across 464 tiny blocks of $\le 30$ eqns). |

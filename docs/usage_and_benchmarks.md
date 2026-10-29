@@ -142,7 +142,9 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 
 ## 4. Benchmark Results
 
-### A. Production `spec2si-seeqc` Benchmarks (`BNL exxact`)
+*Test Platform: Dual-socket AMD EPYC 7413 (2 × 24 cores / 96 threads across 2 NUMA nodes), 512 GB DDR4 RAM, NVIDIA RTX A6000 GPU (48 GB GDDR6 VRAM).*
+
+### A. Production `spec2si-seeqc` Benchmarks
 
 End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5` (`c81027a`), upstream `v2.7` (`02a34ee`), and this fork (`v2.8`) using `.npy` binary output:
 
@@ -168,7 +170,7 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5` 
 | **`adder`** ($P=583\to126, W=3\to5$) | 47,425 | **9,195** (`5.16x`) | 79.92 s | **22.65 s** (`3.53x`) | **3.79 s** | **21.11x** (`-p -n`) |
 | **`dff`** ($P=1, W=1$) | 504 | **174** (`2.90x`) | 0.234 s | **0.137 s** | **0.137 s** | **1.71x** (`-n`) |
 
-#### Built-In SFQ Switching Event & Pulse Metric Extractor (`-e`, `-E all`) on `spec2si-seeqc` (`BNL exxact`)
+#### Built-In SFQ Switching Event & Pulse Metric Extractor (`-e`, `-E all`) on `spec2si-seeqc`
 
 | Deck (Events Extracted) | Full `.npy` (`-o + -e`) | **Events-Only (`-e`)** | **Events + Pulse Metrics (`-e -E all`)** | **Output Size: `.npy` $\to$ `-e` (`-E all`)** | **Median Extracted Pulse Metrics (`-E all`)** |
 | :--- | ---: | ---: | ---: | :---: | :--- |
@@ -179,7 +181,7 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5` 
 | **`r10forig`** (`4` events) | 3.18 s (0.28 GB) | **3.18 s** (**0.29 GB**) | **3.18 s** (**0.29 GB**) | `1.0 MB` $\to$ **`0.3 KB`** (`0.6 KB`) | $\|V_{\text{peak}}\|=0.319\text{ mV}$, $\text{FWHM}=4.01\text{ ps}$, $\Delta t_\pi=11.25\text{ ps}$, $\|\text{area}\|=2.33\text{ fV}\cdot\text{s}$ |
 | **`dff`** (`9` events) | 0.21 s (0.13 GB) | **0.20 s** (**0.13 GB**) | **0.20 s** (**0.13 GB**) | `1.7 MB` $\to$ **`0.5 KB`** (`1.0 KB`) | $\|V_{\text{peak}}\|=0.277\text{ mV}$, $\text{FWHM}=4.69\text{ ps}$, $\Delta t_\pi=6.78\text{ ps}$, $\|\text{area}\|=2.09\text{ fV}\cdot\text{s}$ |
 
-#### In-Memory Rolling Checkpoints & Local Step-Halving Rollback (`.option rollback`) (`BNL exxact`)
+#### In-Memory Rolling Checkpoints & Local Step-Halving Rollback (`.option rollback`)
 
 When a Josephson junction exceeds the $0.4\pi$ per-step phase-jump threshold (`needsTR_`), upstream JoSIM discards all computed work and restarts the entire transient simulation from $t = 0$ (`.option norollback`). With **in-memory rolling checkpoints** (`.option rollback=1` [`window`, default] or `.option rollback=2` [`stay`]), JoSIM rolls back only $32\text{–}256$ base steps to the nearest 128-step rolling checkpoint and sub-steps locally ($M = 2, 4, 8, 16$):
 
@@ -191,7 +193,7 @@ When a Josephson junction exceeds the $0.4\pi$ per-step phase-jump threshold (`n
 
 ---
 
-### B. Nodal (`-n`, `-g 4`) & GPU Monolithic (`-g 3`) Solvers on 2D JJ Grids (`BNL exxact`)
+### B. Nodal (`-n`, `-g 4`) & GPU Monolithic (`-g 3`) Solvers on 2D JJ Grids
 
 1,001-timestep transient solve time on 0-PTL single-partition ($P=1$) 2D Josephson junction grids with dynamic `RTYPE=1` switching:
 
@@ -205,9 +207,9 @@ When junctions do not dynamically switch (`RTYPE=0` or quiescent bias), the GPU-
 
 ---
 
-### C. Windowed PTL Block-Parallel & Multi-Channel Benchmarks (`BNL exxact`)
+### C. Windowed PTL Block-Parallel & Multi-Channel Benchmarks
 
-Reproducible via [`scripts/benchmark_gpu_exxact.py`](../scripts/benchmark_gpu_exxact.py) and [`scripts/benchmark_non_ptl_exxact.py`](../scripts/benchmark_non_ptl_exxact.py):
+Reproducible via the benchmark scripts in [`scripts/`](../scripts/):
 
 | Circuit | Scale & Topology | Serial (1T) | **OpenMP (`-p`)** | **CUDA GPU (`-g`)** | **OpenMP Speedup** | **GPU Speedup** |
 | :--- | :--- | ---: | ---: | ---: | :---: | :---: |
@@ -221,9 +223,7 @@ Reproducible via [`scripts/benchmark_gpu_exxact.py`](../scripts/benchmark_gpu_ex
 
 ---
 
-### D. Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Benchmarks (`BNL exxact`)
-
-Reproducible via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.py):
+### D. Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Benchmarks
 
 | Design (`.spread` Yield Analysis) | Base $P$ | Trials ($B$) | Est. $B \times$ Serial 1T | **Batched OpenMP (`-p`)** | **Batched GPU (`-g`)** | **OpenMP Speedup** | **GPU Speedup** |
 | :--- | ---: | ---: | ---: | ---: | ---: | :---: | :---: |
@@ -235,7 +235,7 @@ Reproducible via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxa
 | **`ex_ksa4bit`** (4-bit KSA Adder, 695 JJs) | 66 | 256 | 204.24 s | **6.56 s** | **10.39 s** | **31.14x** | **19.65x** |
 | **`RSFQ-Pipeline-64B`** (2,048 JJs, 4.85M eqns) | 64 | 256 | 48.57 s | **1.68 s** | **3.19 s** | **28.87x** | **15.21x** |
 
-#### Batched Nodal (`-p -n`) & 64-Point Deterministic Parameter/Margin Sweeps (`.sweep`, `-S`) (`BNL exxact`)
+#### Batched Nodal (`-p -n`) & 64-Point Deterministic Parameter/Margin Sweeps (`.sweep`, `-S`)
 
 Combining Batched Nodal reduction (`Simulation::trans_sim_mc_nodal`, `-p -n`) with deterministic parameter/margin sweeps (`-S "@BIAS:MARGIN:0.25:64"`, `.sweep Scaling LIN 21 0.7 1.3`) or Monte Carlo (`-b 64`) achieves **`0.000e+00`–`1.000e-14` waveform parity** across MNA, Nodal, and GPU, automatically extracts the SFQ operating margin window (`Nom SFQ`, `Pass Pts`, `[vLo, vHi]`), and accelerates 64-point sweeps by **`33.3x–51.8x` over 64 sequential MNA runs** (**`1.46x–1.84x` faster than Batched MNA**):
 

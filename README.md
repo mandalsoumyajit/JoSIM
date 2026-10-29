@@ -43,7 +43,9 @@ This repository is an enhanced fork of [`JoeyDelp/JoSIM`](https://github.com/Joe
 
 ---
 
-## Summary of Results (Production `spec2si-seeqc` Suite on BNL `exxact`)
+## Summary of Results (Production `spec2si-seeqc` Suite)
+
+*Test Platform: Dual-socket AMD EPYC 7413 (2 × 24 cores / 96 threads), 512 GB RAM, NVIDIA RTX A6000 (48 GB VRAM).*
 
 End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5`, upstream `v2.7` (`02a34ee`), and this fork (`v2.8` with `.npy` output):
 

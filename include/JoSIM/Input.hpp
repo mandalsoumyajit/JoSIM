@@ -33,6 +33,19 @@ enum EventMetricFlags : uint32_t {
     EVENT_METRIC_ALL       = EVENT_METRIC_PULSE | EVENT_METRIC_AREA
 };
 
+enum class SweepMode {
+    Linear,
+    Margin,
+    List
+};
+
+struct SweepDim {
+    std::string         target;
+    SweepMode           mode       = SweepMode::Linear;
+    bool                isRelative = false;
+    std::vector<double> values;
+};
+
 class Input {
   public:
     Netlist                                      netlist;
@@ -63,6 +76,9 @@ class Input {
     double                                                       argKCutoff      = 0.0;
     int64_t                                                      argMcRuns       = 1;
     bool                                                         argMcAll        = false;
+    bool                                                         argSweep        = false;
+    std::vector<SweepDim>                                        sweeps;
+    std::vector<std::string>                                     cliSweeps;
     bool                                                         argLumpPtl      = true;
     double                                                       argMinPtl       = 0.0;
     bool                                                         ptlLumpedDone   = false;
@@ -90,6 +106,7 @@ class Input {
         if (cli_options.event_metrics.has_value()) {
             argEventMetrics = parse_event_metrics(cli_options.event_metrics.value(), argEventMetrics);
         }
+        cliSweeps                  = cli_options.sweeps;
         argCorrector               = cli_options.corrector;
         argMcRuns                  = cli_options.batchRuns;
         cli_output_file            = cli_options.output_file;
@@ -98,6 +115,8 @@ class Input {
     }
 
     static uint32_t       parse_event_metrics(const std::string& spec, uint32_t currentMask = EVENT_METRIC_NONE);
+    void                  parse_sweep_tokens(const tokens_t& c);
+    void                  parse_sweep_spec(const std::string& spec);
     std::vector<tokens_t> read_input(LineInput& input, string_o fileName = std::nullopt);
     void                  parse_input(string_o fileName = std::nullopt);
     void                  syntax_check_controls(std::vector<tokens_t>& controls);

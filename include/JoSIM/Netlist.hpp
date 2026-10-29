@@ -68,6 +68,7 @@ class Netlist {
     std::unordered_set<std::string>                                           sanityCheckSubckts;
     tokens_t                                                                  subckts;
     std::vector<std::pair<tokens_t, string_o>>                                expNetlist;
+    std::vector<std::pair<tokens_t, string_o>>                                rawExpNetlist;
     int64_t jjCount, compCount, subcktCounter, nestedSubcktCount, subcktTotal = 0;
     bool    containsSubckt, argMin = false;
     Netlist() : jjCount(0), compCount(0), subcktCounter(0), nestedSubcktCount(0), containsSubckt(false) {};

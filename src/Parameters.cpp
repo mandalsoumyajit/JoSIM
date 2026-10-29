@@ -407,6 +407,9 @@ void JoSIM::parse_parameters(param_map& parameters) {
     double value;
     // Counter to ensure that we do not get stuck in a loop
     size_t parsedCounter = 0;
+    for (const auto& i : parameters) {
+        if (i.second.get_value()) { parsedCounter++; }
+    }
     // Parse parameters while counter is less than total parameter count
     while (parsedCounter < parameters.size()) {
         // Set previous counter to counter to do sanity check
@@ -445,8 +448,8 @@ void JoSIM::parse_parameters(param_map& parameters) {
 }
 
 void JoSIM::update_parameters(param_map& parameters) {
-    // Reset all the paraemeter values (doubles)
-    for (auto i : parameters) { i.second.set_value(std::nan("")); }
+    // Reset all the parameter values (doubles)
+    for (auto& i : parameters) { i.second.reset_value(); }
     // Parse all the parameters again
     parse_parameters(parameters);
 }

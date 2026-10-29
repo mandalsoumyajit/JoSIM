@@ -50,6 +50,8 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
             char swChar = swStr.at(0);
             if (swLower.rfind("eventmetric", 0) == 0 || swLower.rfind("eventpulse", 0) == 0) {
                 swChar = 'E';
+            } else if (swLower.rfind("sweep", 0) == 0) {
+                swChar = 'S';
             }
             ap.emplace_back(std::make_pair(swChar, val));
         } else {
@@ -218,6 +220,12 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                         out.sanityCheckSubckts.insert(i.second.value());
                     }
                     break;
+                    // Deterministic parameter / margin sweep
+                case 'S':
+                    if (i.second && !i.second.value().empty()) {
+                        out.sweeps.push_back(i.second.value());
+                    }
+                    break;
                     // Enable verbose mode
                 case 'V': try { out.verbose = std::stoi(i.second.value_or("1"));
                     } catch (const std::invalid_argument&) {
@@ -284,9 +292,9 @@ void CliOptions::display_help() {
     // Batched Monte Carlo
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-b" << std::setw(3) << std::left << "|"
-              << "Executes N batched Monte Carlo (.spread) trials simultaneously." << std::endl;
+              << "Executes N batched Monte Carlo (.spread) or parameter sweep (.sweep) trials." << std::endl;
     std::cout << std::setw(16) << std::left << "--batch=" << std::setw(3) << std::left << "|"
-              << "Combine with -p (OpenMP CPU) or -g (CUDA GPU), e.g. -p -b 256." << std::endl;
+              << "Combine with -p (OpenMP CPU), -n (Nodal CPU), or -g (CUDA GPU), e.g. -p -b 256." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Corrector iterations
     // ---------------------------------------------------------------------------
@@ -389,6 +397,13 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
               << "Checks every superconductor circuit cell node connects to exactly "
               << "one other node, assuming the design denotes high-level connections." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // Parameter / margin sweep
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "-S" << std::setw(3) << std::left << "|"
+              << "Specifies a deterministic parameter or margin sweep (1D or 2D Cartesian)." << std::endl;
+    std::cout << std::setw(16) << std::left << "--sweep=" << std::setw(3) << std::left << "|"
+              << "Examples: -S @BIAS:MARGIN:0.3:21, -S @BIAS:0.7:1.3:0.05, -S Scaling:0.8:1.2:9." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Verbose switch
     // ---------------------------------------------------------------------------

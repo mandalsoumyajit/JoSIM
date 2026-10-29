@@ -88,14 +88,17 @@ struct GpuCap {
 struct GpuVS {
     int32_t posIdx = -1, negIdx = -1, curIdx = -1, srcIdx = -1;
     double  pn1 = 0.0, pn2 = 0.0;
+    double  scale = 1.0;
 };
 
 struct GpuPS {
     int32_t curIdx = -1, srcIdx = -1;
+    double  scale = 1.0;
 };
 
 struct GpuCS {
     int32_t posIdx = -1, negIdx = -1, srcIdx = -1;
+    double  scale = 1.0;
 };
 
 struct GpuCCVS {

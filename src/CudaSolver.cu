@@ -1960,7 +1960,7 @@ __global__ void advance_mc_coalesced_kernel(int32_t             B,
         // Current Sources
         for (int32_t k = 0; k < part.csCount; ++k) {
             const GpuCS  cs     = d_css[(part.csStart + k) * B + b];
-            const double srcVal = d_srcWindow[(s + 2) * numSources + cs.srcIdx];
+            const double srcVal = d_srcWindow[(s + 2) * numSources + cs.srcIdx] * cs.scale;
             if (cs.posIdx >= 0) { b_at(cs.posIdx) -= srcVal; }
             if (cs.negIdx >= 0) { b_at(cs.negIdx) += srcVal; }
         }
@@ -2025,7 +2025,7 @@ __global__ void advance_mc_coalesced_kernel(int32_t             B,
         for (int32_t k = 0; k < part.vsCount; ++k) {
             const int32_t vSlot  = (part.vsStart + k) * B + b;
             GpuVS         vs     = d_vss[vSlot];
-            const double  srcVal = d_srcWindow[(s + 2) * numSources + vs.srcIdx];
+            const double  srcVal = d_srcWindow[(s + 2) * numSources + vs.srcIdx] * vs.scale;
             if (analysisType == 0) {
                 b_at(vs.curIdx) = srcVal;
             } else {
@@ -2043,12 +2043,12 @@ __global__ void advance_mc_coalesced_kernel(int32_t             B,
         // Phase Sources
         for (int32_t k = 0; k < part.psCount; ++k) {
             const GpuPS  ps = d_pss[(part.psStart + k) * B + b];
-            const double s0 = d_srcWindow[(s + 2) * numSources + ps.srcIdx];
+            const double s0 = d_srcWindow[(s + 2) * numSources + ps.srcIdx] * ps.scale;
             if (analysisType == 1) {
                 b_at(ps.curIdx) = s0;
             } else {
-                const double s1 = d_srcWindow[(s + 1) * numSources + ps.srcIdx];
-                const double s2 = d_srcWindow[s * numSources + ps.srcIdx];
+                const double s1 = d_srcWindow[(s + 1) * numSources + ps.srcIdx] * ps.scale;
+                const double s2 = d_srcWindow[s * numSources + ps.srcIdx] * ps.scale;
                 if (i == 0) {
                     b_at(ps.curIdx) = (Constants::SIGMA / stepSize) * (1.5 * s0);
                 } else if (i == 1) {
@@ -2323,19 +2323,40 @@ bool CudaPartitionSolver::initialize(int32_t                            nParts,
         }
         std::vector<GpuCap> capsT(caps.size());
         for (int32_t b = 0; b < B; ++b) {
-            for (size_t k = 0; k < nBaseCaps; ++k) { capsT[k * B + b] = caps[k]; }
+            for (size_t k = 0; k < nBaseCaps; ++k) {
+                GpuCap gcap = caps[static_cast<size_t>(b) * nBaseCaps + k];
+                gcap.posIdx = caps[k].posIdx;
+                gcap.negIdx = caps[k].negIdx;
+                gcap.curIdx = caps[k].curIdx;
+                capsT[k * B + b] = gcap;
+            }
         }
         std::vector<GpuVS> vssT(vss.size());
         for (int32_t b = 0; b < B; ++b) {
-            for (size_t k = 0; k < nBaseVSs; ++k) { vssT[k * B + b] = vss[k]; }
+            for (size_t k = 0; k < nBaseVSs; ++k) {
+                GpuVS gvs  = vss[static_cast<size_t>(b) * nBaseVSs + k];
+                gvs.posIdx = vss[k].posIdx;
+                gvs.negIdx = vss[k].negIdx;
+                gvs.curIdx = vss[k].curIdx;
+                vssT[k * B + b] = gvs;
+            }
         }
         std::vector<GpuPS> pssT(pss.size());
         for (int32_t b = 0; b < B; ++b) {
-            for (size_t k = 0; k < nBasePSs; ++k) { pssT[k * B + b] = pss[k]; }
+            for (size_t k = 0; k < nBasePSs; ++k) {
+                GpuPS gps  = pss[static_cast<size_t>(b) * nBasePSs + k];
+                gps.curIdx = pss[k].curIdx;
+                pssT[k * B + b] = gps;
+            }
         }
         std::vector<GpuCS> cssT(css.size());
         for (int32_t b = 0; b < B; ++b) {
-            for (size_t k = 0; k < nBaseCSs; ++k) { cssT[k * B + b] = css[k]; }
+            for (size_t k = 0; k < nBaseCSs; ++k) {
+                GpuCS gcs  = css[static_cast<size_t>(b) * nBaseCSs + k];
+                gcs.posIdx = css[k].posIdx;
+                gcs.negIdx = css[k].negIdx;
+                cssT[k * B + b] = gcs;
+            }
         }
         std::vector<GpuCCVS> ccvssT(ccvss.size());
         for (int32_t b = 0; b < B; ++b) {

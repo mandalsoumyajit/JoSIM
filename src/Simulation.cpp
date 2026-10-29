@@ -50,6 +50,7 @@ Simulation::Simulation(Input& iObj, Matrix& mObj) {
 
 void Simulation::setup(Input& iObj, Matrix& mObj) {
     // Simulation setup
+    input_                   = &iObj;
     simSize_                 = iObj.transSim.simsize();
     atyp_                    = iObj.argAnal;
     minOut_                  = iObj.argMin;
@@ -318,7 +319,7 @@ void Simulation::setup_partitions(Matrix& mObj) {
     cudaSolver_.reset();
 #endif
     const int64_t N = static_cast<int64_t>(mObj.rp.size()) - 1;
-    if (nodal_ && mcRuns_ <= 1) { return; }
+    if (nodal_ && (!gpu_ || mcRuns_ <= 1)) { return; }
     if (gpu_ && gpuMode_ >= 2 && mcRuns_ <= 1) { return; }
     if (N < 32 && mcRuns_ <= 1) { return; }
     if (N < 4) { return; }
@@ -2118,6 +2119,7 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
         if (e2.resIdx >= 0 && isRelevantRow[resistors_[e2.resIdx].indexInfo.currentIndex_.value()]) { continue; }
         if (e1.indIdx >= 0 && isRelevantRow[inductors_[e1.indIdx].indexInfo.currentIndex_.value()]) { continue; }
         if (e2.indIdx >= 0 && isRelevantRow[inductors_[e2.indIdx].indexInfo.currentIndex_.value()]) { continue; }
+        if (mcRuns_ > 1 && ((e1.resIdx >= 0 && e2.resIdx >= 0) || (e1.indIdx >= 0 && e2.indIdx >= 0))) { continue; }
 
         // Merge e2 into e1 across node m (oriented from u -> v)
         if (e1.resIdx >= 0 && e2.resIdx >= 0) {
@@ -2441,6 +2443,8 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
         indOldToNew[idx] = static_cast<int32_t>(nodalInds_.size());
         nodalInds_.emplace_back();
     }
+    nodalCoupledIndStamps_.clear();
+    nodalCoupledMutStamps_.clear();
     for (size_t idx = 0; idx < inductors_.size(); ++idx) {
         if (indSuppressed[idx]) { continue; }
         const auto& ind  = inductors_[idx];
@@ -2465,12 +2469,28 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
             traceRefByOrigRow[ind.indexInfo.currentIndex_.value()] = NodalRelTraceRef{2, indOldToNew[idx]};
         } else {
             gind.g = 0.0;
+            NodalCoupledIndStamp cis{};
+            cis.origIndIdx  = static_cast<int32_t>(idx);
+            cis.nodalIndIdx = indOldToNew[idx];
+            cis.diagCsrIdx  = find_any_csr_idx(gind.curIdx, gind.curIdx);
+            cis.diagBaseVal = ind.matrixInfo.nonZeros_.back();
+            nodalCoupledIndStamps_.push_back(cis);
             for (const auto& m : ind.get_mutualInductance()) {
-                GpuMut gmut{};
+                const int32_t mutSlot = static_cast<int32_t>(nodalMuts_.size());
+                GpuMut        gmut{};
                 gmut.targetIndIdx = indOldToNew[m.first];
                 gmut.targetCurIdx = nodalPermToSolver_[inductors_[m.first].indexInfo.currentIndex_.value()];
                 gmut.M            = m.second;
                 nodalMuts_.push_back(gmut);
+
+                NodalCoupledMutStamp cms{};
+                cms.origIndIdx1 = static_cast<int32_t>(idx);
+                cms.origIndIdx2 = static_cast<int32_t>(m.first);
+                cms.nodalMutIdx = mutSlot;
+                cms.csrIdx      = find_any_csr_idx(gind.curIdx, gmut.targetCurIdx);
+                cms.baseVal     = (atyp_ == AnalysisType::Voltage) ? (-(3.0 / (2.0 * stepSize_)) * m.second)
+                                                                   : (-(m.second / Constants::SIGMA));
+                nodalCoupledMutStamps_.push_back(cms);
             }
             gind.mutCount = static_cast<int32_t>(nodalMuts_.size()) - gind.mutStart;
         }
@@ -2489,6 +2509,8 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
         es.nzIdxQP     = find_csr_idx(e.negNode, e.posNode);
         es.nodalResIdx = (e.resIdx >= 0) ? resOldToNew[e.resIdx] : -1;
         es.nodalIndIdx = (e.indIdx >= 0) ? indOldToNew[e.indIdx] : -1;
+        es.origResIdx  = e.resIdx;
+        es.origIndIdx  = e.indIdx;
         nodalRLEdges_.push_back(es);
     }
 
@@ -3874,7 +3896,7 @@ bool Simulation::setup_cpu_nodal(Matrix& mObj) {
     if (NumericRed_) { klu_l_free_numeric(&NumericRed_, &CommonRed_); }
     if (!build_nodal_system(mObj) || nodalNRed_ <= 0) { return false; }
 
-    if (!gpu_ && setup_nodal_partitions(mObj)) {
+    if (!gpu_ && mcRuns_ <= 1 && setup_nodal_partitions(mObj)) {
         nodalActive_ = true;
         return true;
     }
@@ -4308,6 +4330,429 @@ void Simulation::free_lu() {
 #endif
 }
 
+void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScales>& outScales) {
+    const int64_t B = mcRuns_;
+    outScales.resize(static_cast<size_t>(B));
+    for (int64_t b = 0; b < B; ++b) {
+        auto& ts = outScales[b];
+        ts.indScale.assign(inductors_.size(), 1.0);
+        ts.resScale.assign(resistors_.size(), 1.0);
+        ts.capScale.assign(capacitors_.size(), 1.0);
+        ts.jjScale.assign(jjs_.size(), 1.0);
+        ts.vsScale.assign(vsources_.size(), 1.0);
+        ts.psScale.assign(psources_.size(), 1.0);
+        ts.csScale.assign(mObj.components.currentsources.size(), 1.0);
+    }
+
+    const bool isSweep = (input_ != nullptr && input_->argSweep && !input_->sweeps.empty());
+    if (!isSweep) {
+        for (int64_t b = 1; b < B; ++b) {
+            auto&           ts = outScales[b];
+            std::mt19937_64 rng(Rng::base_seed() + static_cast<uint64_t>(b) * 0x9E3779B97F4A7C15ULL);
+            for (size_t lIdx = 0; lIdx < inductors_.size(); ++lIdx) {
+                const auto&  ind   = inductors_[lIdx];
+                const double baseL = ind.netlistInfo.value_;
+                const double L     = mObj.spread.spread_value_rng(ind.nominalValue_, Spread::IND, ind.spread_, rng);
+                ts.indScale[lIdx]  = (std::abs(baseL) > 1e-30) ? (L / baseL) : 1.0;
+            }
+            for (size_t rIdx = 0; rIdx < resistors_.size(); ++rIdx) {
+                const auto&  res   = resistors_[rIdx];
+                const double baseR = res.netlistInfo.value_;
+                const double R     = mObj.spread.spread_value_rng(res.nominalValue_, Spread::RES, res.spread_, rng);
+                ts.resScale[rIdx]  = (std::abs(baseR) > 1e-30) ? (R / baseR) : 1.0;
+            }
+            for (size_t cIdx = 0; cIdx < capacitors_.size(); ++cIdx) {
+                const auto&  cap   = capacitors_[cIdx];
+                const double baseC = cap.netlistInfo.value_;
+                const double C     = mObj.spread.spread_value_rng(cap.nominalValue_, Spread::CAP, cap.spread_, rng);
+                ts.capScale[cIdx]  = (std::abs(baseC) > 1e-30) ? (C / baseC) : 1.0;
+            }
+            for (size_t jIdx = 0; jIdx < jjs_.size(); ++jIdx) {
+                const auto&  jj   = jjs_[jIdx];
+                const double area = mObj.spread.spread_value_rng(jj.nominalArea_, Spread::JJ, jj.spread_, rng);
+                ts.jjScale[jIdx]  = (std::abs(jj.area_) > 1e-30) ? (area / jj.area_) : area;
+            }
+        }
+        return;
+    }
+
+    auto glob_match = [](const std::string& str, const std::string& pat) -> bool {
+        size_t s = 0, p = 0, starIdx = std::string::npos, matchIdx = 0;
+        while (s < str.size()) {
+            if (p < pat.size() && (pat[p] == '?' || pat[p] == str[s])) {
+                ++s;
+                ++p;
+            } else if (p < pat.size() && pat[p] == '*') {
+                starIdx  = p++;
+                matchIdx = s;
+            } else if (starIdx != std::string::npos) {
+                p = starIdx + 1;
+                s = ++matchIdx;
+            } else {
+                return false;
+            }
+        }
+        while (p < pat.size() && pat[p] == '*') { ++p; }
+        return p == pat.size();
+    };
+
+    auto match_label = [&](const std::string& label, const std::string& pat) -> bool {
+        if (pat.find('|') != std::string::npos) { return glob_match(label, pat); }
+        if (glob_match(label, pat)) { return true; }
+        const size_t pipePos = label.find('|');
+        if (pipePos != std::string::npos) {
+            if (glob_match(label.substr(0, pipePos), pat)) { return true; }
+            if (glob_match(label.substr(pipePos + 1), pat)) { return true; }
+        }
+        return false;
+    };
+
+    auto is_bias_name = [](const std::string& label) -> bool {
+        const size_t      pipePos = label.find('|');
+        const std::string leaf    = (pipePos != std::string::npos) ? label.substr(0, pipePos) : label;
+        return (leaf.rfind("IB", 0) == 0 || leaf.rfind("VB", 0) == 0 || leaf.rfind("VBIAS", 0) == 0
+                || leaf.rfind("IBIAS", 0) == 0 || leaf.rfind("VDD", 0) == 0 || leaf.rfind("VCC", 0) == 0
+                || leaf.rfind("ISS", 0) == 0 || label.find("BIAS") != std::string::npos);
+    };
+
+    auto src_max_amp = [&](size_t srcIdx) -> double {
+        if (srcIdx >= mObj.sourcegen.size()) { return 0.0; }
+        const auto& amps = mObj.sourcegen[srcIdx].ampValues();
+        double      best = 0.0;
+        for (double a : amps) {
+            if (std::abs(a) > std::abs(best)) { best = a; }
+        }
+        return best;
+    };
+
+    auto is_bias_waveform = [&](size_t srcIdx) -> bool {
+        if (srcIdx >= mObj.sourcegen.size()) { return false; }
+        return mObj.sourcegen[srcIdx].is_bias_like();
+    };
+
+    std::vector<uint8_t> csIsBias(mObj.components.currentsources.size(), 0);
+    std::vector<uint8_t> vsIsBias(vsources_.size(), 0);
+    bool                 anyBiasMatched = false;
+    for (size_t idx = 0; idx < mObj.components.currentsources.size(); ++idx) {
+        if (is_bias_name(mObj.components.currentsources[idx].netlistInfo.label_)) {
+            csIsBias[idx]  = 1;
+            anyBiasMatched = true;
+        }
+    }
+    for (size_t idx = 0; idx < vsources_.size(); ++idx) {
+        if (is_bias_name(vsources_[idx].netlistInfo.label_)) {
+            vsIsBias[idx]  = 1;
+            anyBiasMatched = true;
+        }
+    }
+    if (!anyBiasMatched) {
+        for (size_t idx = 0; idx < mObj.components.currentsources.size(); ++idx) {
+            if (is_bias_waveform(mObj.components.currentsources[idx].sourceIndex_)) {
+                csIsBias[idx]  = 1;
+                anyBiasMatched = true;
+            }
+        }
+        for (size_t idx = 0; idx < vsources_.size(); ++idx) {
+            if (is_bias_waveform(vsources_[idx].sourceIndex_)) {
+                vsIsBias[idx]  = 1;
+                anyBiasMatched = true;
+            }
+        }
+    }
+    if (!anyBiasMatched) {
+        std::fill(csIsBias.begin(), csIsBias.end(), 1);
+        std::fill(vsIsBias.begin(), vsIsBias.end(), 1);
+    }
+
+    auto resolve_scale = [](double val, double nominal, bool isRel) -> double {
+        if (isRel || std::abs(nominal) <= 1e-30) { return val; }
+        if (std::abs(nominal) <= 1e-2 && std::abs(val) >= 0.05 && std::abs(val) <= 5.0
+            && std::abs(val) > 20.0 * std::abs(nominal)) {
+            return val;
+        }
+        return val / nominal;
+    };
+
+    auto match_param_target = [&](const ParameterName& pn, const std::string& target) -> bool {
+        std::string pName = pn.name();
+        std::transform(pName.begin(), pName.end(), pName.begin(), ::toupper);
+        const size_t sepPos = target.find_first_of("|.");
+        if (sepPos != std::string::npos) {
+            const std::string subPat  = target.substr(0, sepPos);
+            const std::string namePat = target.substr(sepPos + 1);
+            std::string       subStr  = pn.subcircuit().value_or("");
+            std::transform(subStr.begin(), subStr.end(), subStr.begin(), ::toupper);
+            return glob_match(subStr, subPat) && glob_match(pName, namePat);
+        }
+        return glob_match(pName, target);
+    };
+
+    for (int64_t b = 0; b < B; ++b) {
+        auto&  ts       = outScales[b];
+        double dimVals[2] = {1.0, 1.0};
+        if (input_->sweeps.size() == 1) {
+            const auto& d0 = input_->sweeps[0];
+            dimVals[0]     = d0.values[static_cast<size_t>(b) % d0.values.size()];
+        } else if (input_->sweeps.size() >= 2) {
+            const auto&  d0 = input_->sweeps[0];
+            const auto&  d1 = input_->sweeps[1];
+            const size_t n1 = d1.values.size();
+            dimVals[0]      = d0.values[(static_cast<size_t>(b) / n1) % d0.values.size()];
+            dimVals[1]      = d1.values[static_cast<size_t>(b) % n1];
+        }
+
+        bool      anyParamMatched = false;
+        param_map trialParams     = input_->parameters;
+        bool      dimMatchedParam[2] = {false, false};
+        for (size_t dIdx = 0; dIdx < input_->sweeps.size() && dIdx < 2; ++dIdx) {
+            const auto&  dim = input_->sweeps[dIdx];
+            const double val = dimVals[dIdx];
+            if (!dim.target.empty() && dim.target.front() == '@') { continue; }
+            for (auto& kv : trialParams) {
+                if (match_param_target(kv.first, dim.target)) {
+                    const double nomVal = kv.second.get_value().value_or(1.0);
+                    const double newVal = dim.isRelative ? (nomVal * val) : val;
+                    kv.second.set_expression(Misc::precise_to_string(newVal));
+                    anyParamMatched       = true;
+                    dimMatchedParam[dIdx] = true;
+                }
+            }
+        }
+
+        if (anyParamMatched && !input_->netlist.rawExpNetlist.empty()) {
+            update_parameters(trialParams);
+            std::unordered_set<std::string> changedParamNames;
+            for (const auto& kv : trialParams) {
+                auto itOrig = input_->parameters.find(kv.first);
+                if (itOrig != input_->parameters.end()) {
+                    const double vNew  = kv.second.get_value().value_or(0.0);
+                    const double vOrig = itOrig->second.get_value().value_or(0.0);
+                    if (std::abs(vNew - vOrig) > 1e-18 * std::max(1.0, std::abs(vOrig))) {
+                        changedParamNames.insert(kv.first.name());
+                    }
+                }
+            }
+
+            size_t lOrd = 0, jOrd = 0, rOrd = 0, iOrd = 0, cOrd = 0, pOrd = 0, vOrd = 0;
+            for (const auto& rawLine : input_->netlist.rawExpNetlist) {
+                if (rawLine.first.empty() || rawLine.first.front().empty()) { continue; }
+                const char devChar = rawLine.first.front().at(0);
+                bool       hasChangedRef = false;
+                for (size_t tokIdx = 3; tokIdx < rawLine.first.size(); ++tokIdx) {
+                    const std::string& tok = rawLine.first[tokIdx];
+                    if (tok.find('{') != std::string::npos) {
+                        hasChangedRef = true;
+                        break;
+                    }
+                    for (const auto& cName : changedParamNames) {
+                        if (tok.find(cName) != std::string::npos) {
+                            hasChangedRef = true;
+                            break;
+                        }
+                    }
+                    if (hasChangedRef) { break; }
+                }
+
+                switch (devChar) {
+                    case 'L':
+                        if (hasChangedRef && lOrd < inductors_.size()) {
+                            auto lineCopy = rawLine;
+                            expand_inline_parameters(lineCopy, trialParams);
+                            const double newVal = parse_param(lineCopy.first.at(3), trialParams, lineCopy.second);
+                            const double nomVal = inductors_[lOrd].nominalValue_;
+                            if (std::isfinite(newVal) && std::abs(nomVal) > 1e-30) {
+                                ts.indScale[lOrd] *= (newVal / nomVal);
+                            }
+                        }
+                        ++lOrd;
+                        break;
+                    case 'R':
+                        if (hasChangedRef && rOrd < resistors_.size()) {
+                            auto lineCopy = rawLine;
+                            expand_inline_parameters(lineCopy, trialParams);
+                            const double newVal = parse_param(lineCopy.first.at(3), trialParams, lineCopy.second);
+                            const double nomVal = resistors_[rOrd].nominalValue_;
+                            if (std::isfinite(newVal) && std::abs(nomVal) > 1e-30) {
+                                ts.resScale[rOrd] *= (newVal / nomVal);
+                            }
+                        }
+                        ++rOrd;
+                        break;
+                    case 'C':
+                        if (hasChangedRef && cOrd < capacitors_.size()) {
+                            auto lineCopy = rawLine;
+                            expand_inline_parameters(lineCopy, trialParams);
+                            const double newVal = parse_param(lineCopy.first.at(3), trialParams, lineCopy.second);
+                            const double nomVal = capacitors_[cOrd].nominalValue_;
+                            if (std::isfinite(newVal) && std::abs(nomVal) > 1e-30) {
+                                ts.capScale[cOrd] *= (newVal / nomVal);
+                            }
+                        }
+                        ++cOrd;
+                        break;
+                    case 'B':
+                        if (hasChangedRef && jOrd < jjs_.size()) {
+                            auto lineCopy = rawLine;
+                            expand_inline_parameters(lineCopy, trialParams);
+                            for (size_t tiIdx = 3; tiIdx < lineCopy.first.size(); ++tiIdx) {
+                                const auto& ti = lineCopy.first[tiIdx];
+                                if (ti.rfind("AREA=", 0) == 0) {
+                                    const double newArea = parse_param(ti.substr(5), trialParams, lineCopy.second);
+                                    const double nomArea = jjs_[jOrd].nominalArea_;
+                                    if (std::isfinite(newArea) && std::abs(nomArea) > 1e-30) {
+                                        ts.jjScale[jOrd] *= (newArea / nomArea);
+                                    }
+                                } else if (ti.rfind("IC=", 0) == 0 && jjs_[jOrd].nominalIc_.has_value()) {
+                                    const double newIc = parse_param(ti.substr(3), trialParams, lineCopy.second);
+                                    const double nomIc = jjs_[jOrd].nominalIc_.value();
+                                    if (std::isfinite(newIc) && std::abs(nomIc) > 1e-30) {
+                                        ts.jjScale[jOrd] *= (newIc / nomIc);
+                                    }
+                                }
+                            }
+                        }
+                        ++jOrd;
+                        break;
+                    case 'I':
+                        if (hasChangedRef && iOrd < mObj.components.currentsources.size()) {
+                            auto lineCopy = rawLine;
+                            expand_inline_parameters(lineCopy, trialParams);
+                            std::swap(input_->parameters, trialParams);
+                            Function fTrial;
+                            fTrial.parse_function(Misc::vector_to_string(lineCopy.first), *input_, lineCopy.second);
+                            std::swap(input_->parameters, trialParams);
+                            double trialMax = 0.0;
+                            for (double a : fTrial.ampValues()) {
+                                if (std::abs(a) > std::abs(trialMax)) { trialMax = a; }
+                            }
+                            const double nomMax = src_max_amp(mObj.components.currentsources[iOrd].sourceIndex_);
+                            if (std::abs(nomMax) > 1e-30) { ts.csScale[iOrd] *= (trialMax / nomMax); }
+                        }
+                        ++iOrd;
+                        break;
+                    case 'V':
+                        if (hasChangedRef && vOrd < vsources_.size()) {
+                            auto lineCopy = rawLine;
+                            expand_inline_parameters(lineCopy, trialParams);
+                            std::swap(input_->parameters, trialParams);
+                            Function fTrial;
+                            fTrial.parse_function(Misc::vector_to_string(lineCopy.first), *input_, lineCopy.second);
+                            std::swap(input_->parameters, trialParams);
+                            double trialMax = 0.0;
+                            for (double a : fTrial.ampValues()) {
+                                if (std::abs(a) > std::abs(trialMax)) { trialMax = a; }
+                            }
+                            const double nomMax = src_max_amp(vsources_[vOrd].sourceIndex_);
+                            if (std::abs(nomMax) > 1e-30) { ts.vsScale[vOrd] *= (trialMax / nomMax); }
+                        }
+                        ++vOrd;
+                        break;
+                    case 'P':
+                        if (hasChangedRef && pOrd < psources_.size()) {
+                            auto lineCopy = rawLine;
+                            expand_inline_parameters(lineCopy, trialParams);
+                            std::swap(input_->parameters, trialParams);
+                            Function fTrial;
+                            fTrial.parse_function(Misc::vector_to_string(lineCopy.first), *input_, lineCopy.second);
+                            std::swap(input_->parameters, trialParams);
+                            double trialMax = 0.0;
+                            for (double a : fTrial.ampValues()) {
+                                if (std::abs(a) > std::abs(trialMax)) { trialMax = a; }
+                            }
+                            const double nomMax = src_max_amp(psources_[pOrd].sourceIndex_);
+                            if (std::abs(nomMax) > 1e-30) { ts.psScale[pOrd] *= (trialMax / nomMax); }
+                        }
+                        ++pOrd;
+                        break;
+                    default: break;
+                }
+            }
+        }
+
+        for (size_t dIdx = 0; dIdx < input_->sweeps.size() && dIdx < 2; ++dIdx) {
+            if (dimMatchedParam[dIdx]) { continue; }
+            const auto&        dim = input_->sweeps[dIdx];
+            const double       val = dimVals[dIdx];
+            const std::string& tgt = dim.target;
+            if (tgt == "@GLOBAL" || tgt == "@ALL") {
+                for (double& s : ts.indScale) { s *= val; }
+                for (double& s : ts.resScale) { s *= val; }
+                for (double& s : ts.capScale) { s *= val; }
+                for (double& s : ts.jjScale) { s *= val; }
+                for (double& s : ts.vsScale) { s *= val; }
+                for (double& s : ts.psScale) { s *= val; }
+                for (double& s : ts.csScale) { s *= val; }
+            } else if (tgt == "@BIAS") {
+                for (size_t idx = 0; idx < ts.csScale.size(); ++idx) {
+                    if (csIsBias[idx]) { ts.csScale[idx] *= val; }
+                }
+                for (size_t idx = 0; idx < ts.vsScale.size(); ++idx) {
+                    if (vsIsBias[idx]) { ts.vsScale[idx] *= val; }
+                }
+            } else if (tgt == "@SRC") {
+                for (double& s : ts.vsScale) { s *= val; }
+                for (double& s : ts.psScale) { s *= val; }
+                for (double& s : ts.csScale) { s *= val; }
+            } else if (tgt == "@ISRC" || tgt == "@CS" || tgt == "@I") {
+                for (double& s : ts.csScale) { s *= val; }
+            } else if (tgt == "@VSRC" || tgt == "@VS" || tgt == "@V") {
+                for (double& s : ts.vsScale) { s *= val; }
+            } else if (tgt == "@PSRC" || tgt == "@PS" || tgt == "@P") {
+                for (double& s : ts.psScale) { s *= val; }
+            } else if (tgt == "@JJ" || tgt == "@B") {
+                for (double& s : ts.jjScale) { s *= val; }
+            } else if (tgt == "@IND" || tgt == "@L") {
+                for (double& s : ts.indScale) { s *= val; }
+            } else if (tgt == "@RES" || tgt == "@R") {
+                for (double& s : ts.resScale) { s *= val; }
+            } else if (tgt == "@CAP" || tgt == "@C") {
+                for (double& s : ts.capScale) { s *= val; }
+            } else {
+                const bool hasWildcard = (tgt.find('*') != std::string::npos || tgt.find('?') != std::string::npos);
+                const bool useRel      = dim.isRelative || hasWildcard;
+                for (size_t idx = 0; idx < inductors_.size(); ++idx) {
+                    if (match_label(inductors_[idx].netlistInfo.label_, tgt)) {
+                        ts.indScale[idx] *= resolve_scale(val, inductors_[idx].netlistInfo.value_, useRel);
+                    }
+                }
+                for (size_t idx = 0; idx < resistors_.size(); ++idx) {
+                    if (match_label(resistors_[idx].netlistInfo.label_, tgt)) {
+                        ts.resScale[idx] *= resolve_scale(val, resistors_[idx].netlistInfo.value_, useRel);
+                    }
+                }
+                for (size_t idx = 0; idx < capacitors_.size(); ++idx) {
+                    if (match_label(capacitors_[idx].netlistInfo.label_, tgt)) {
+                        ts.capScale[idx] *= resolve_scale(val, capacitors_[idx].netlistInfo.value_, useRel);
+                    }
+                }
+                for (size_t idx = 0; idx < jjs_.size(); ++idx) {
+                    if (match_label(jjs_[idx].netlistInfo.label_, tgt)) {
+                        ts.jjScale[idx] *= resolve_scale(val, jjs_[idx].area_, useRel);
+                    }
+                }
+                for (size_t idx = 0; idx < mObj.components.currentsources.size(); ++idx) {
+                    if (match_label(mObj.components.currentsources[idx].netlistInfo.label_, tgt)) {
+                        const double nomAmp = src_max_amp(mObj.components.currentsources[idx].sourceIndex_);
+                        ts.csScale[idx] *= resolve_scale(val, nomAmp, useRel);
+                    }
+                }
+                for (size_t idx = 0; idx < vsources_.size(); ++idx) {
+                    if (match_label(vsources_[idx].netlistInfo.label_, tgt)) {
+                        const double nomAmp = src_max_amp(vsources_[idx].sourceIndex_);
+                        ts.vsScale[idx] *= resolve_scale(val, nomAmp, useRel);
+                    }
+                }
+                for (size_t idx = 0; idx < psources_.size(); ++idx) {
+                    if (match_label(psources_[idx].netlistInfo.label_, tgt)) {
+                        const double nomAmp = src_max_amp(psources_[idx].sourceIndex_);
+                        ts.psScale[idx] *= resolve_scale(val, nomAmp, useRel);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void Simulation::trans_sim_mc(Matrix& mObj) {
 #ifndef SLU
     const int64_t B              = mcRuns_;
@@ -4348,8 +4793,11 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
     std::vector<GpuMut>      baseMuts;
     std::vector<GpuCap>      baseCaps;
     std::vector<GpuVS>       baseVSs;
+    std::vector<int32_t>     baseVSOrigIdx;
     std::vector<GpuPS>       basePSs;
+    std::vector<int32_t>     basePSOrigIdx;
     std::vector<GpuCS>       baseCSs;
+    std::vector<int32_t>     baseCSOrigIdx;
     std::vector<GpuCCVS>     baseCCVSs;
     std::vector<GpuVCCS>     baseVCCSs;
     std::vector<GpuTxHalf>   baseTxHalves;
@@ -4588,6 +5036,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             gvs.pn1    = vs.pn1_;
             gvs.pn2    = vs.pn2_;
             baseVSs.push_back(gvs);
+            baseVSOrigIdx.push_back(static_cast<int32_t>(vIdx));
         }
 
         desc.psStart = static_cast<int32_t>(basePSs.size());
@@ -4598,6 +5047,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             gps.curIdx = globalToAbsLocal[ps.indexInfo.currentIndex_.value()];
             gps.srcIdx = static_cast<int32_t>(ps.sourceIndex_);
             basePSs.push_back(gps);
+            basePSOrigIdx.push_back(static_cast<int32_t>(pIdx));
         }
 
         desc.csStart = static_cast<int32_t>(baseCSs.size());
@@ -4609,6 +5059,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             gcs.negIdx = cs.indexInfo.negIndex_ ? globalToAbsLocal[cs.indexInfo.negIndex_.value()] : -1;
             gcs.srcIdx = static_cast<int32_t>(cs.sourceIndex_);
             baseCSs.push_back(gcs);
+            baseCSOrigIdx.push_back(static_cast<int32_t>(cIdx));
         }
 
         desc.ccvsStart = static_cast<int32_t>(baseCCVSs.size());
@@ -4736,12 +5187,17 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
     std::vector<GpuTxLine>      allTxLines(B * nBaseTxLines);
     std::vector<GpuTxHistEntry> allTxHist(B * nBaseTxHist);
 
+    std::vector<TrialDeviceScales> trialScales;
+    compute_trial_scales(mObj, trialScales);
+    const bool isSweep = (input_ != nullptr && input_->argSweep && !input_->sweeps.empty());
+
     bool setupSingErr = false;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (parallel_ || gpu_) reduction(|| : setupSingErr)
 #endif
     for (int64_t b = 0; b < B; ++b) {
-        const int32_t rowOffB    = static_cast<int32_t>(b * nBaseRows);
+        const auto&         ts         = trialScales[b];
+        const int32_t       rowOffB    = static_cast<int32_t>(b * nBaseRows);
         const int32_t rpOffB     = static_cast<int32_t>(b * nBaseRp);
         const int32_t luOffB     = static_cast<int32_t>(b * nBaseLu);
         const int32_t nzOffB     = static_cast<int32_t>(b * nBasePartNz);
@@ -4833,17 +5289,20 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             if (gvs.posIdx >= 0) { gvs.posIdx += rowOffB; }
             if (gvs.negIdx >= 0) { gvs.negIdx += rowOffB; }
             gvs.curIdx += rowOffB;
+            gvs.scale   = ts.vsScale[baseVSOrigIdx[idx]];
             allVSs[vsOffB + idx] = gvs;
         }
         for (int64_t idx = 0; idx < nBasePSs; ++idx) {
             GpuPS gps   = basePSs[idx];
             gps.curIdx += rowOffB;
+            gps.scale   = ts.psScale[basePSOrigIdx[idx]];
             allPSs[psOffB + idx] = gps;
         }
         for (int64_t idx = 0; idx < nBaseCSs; ++idx) {
             GpuCS gcs = baseCSs[idx];
             if (gcs.posIdx >= 0) { gcs.posIdx += rowOffB; }
             if (gcs.negIdx >= 0) { gcs.negIdx += rowOffB; }
+            gcs.scale = ts.csScale[baseCSOrigIdx[idx]];
             allCSs[csOffB + idx] = gcs;
         }
         for (int64_t idx = 0; idx < nBaseCCVSs; ++idx) {
@@ -4881,14 +5340,12 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
         }
         std::copy(baseTxHist.begin(), baseTxHist.end(), allTxHist.begin() + txHistOffB);
 
-        if (b > 0) {
-            std::mt19937_64 rng(Rng::base_seed() + static_cast<uint64_t>(b) * 0x9E3779B97F4A7C15ULL);
-
+        if (isSweep || b > 0) {
             std::vector<double> newIndL(inductors_.size(), 0.0);
             for (size_t lIdx = 0; lIdx < inductors_.size(); ++lIdx) {
                 const auto&   ind   = inductors_[lIdx];
                 const double  baseL = ind.netlistInfo.value_;
-                const double  L     = mObj.spread.spread_value_rng(ind.nominalValue_, Spread::IND, ind.spread_, rng);
+                const double  L     = baseL * ts.indScale[lIdx];
                 newIndL[lIdx]       = L;
                 const int32_t gInd  = globalIndToGpuInd[lIdx];
                 if (gInd >= 0) { allInds[indOffB + gInd].L = L; }
@@ -4935,16 +5392,16 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             for (size_t rIdx = 0; rIdx < resistors_.size(); ++rIdx) {
                 const auto&   res   = resistors_[rIdx];
                 const double  baseR = res.netlistInfo.value_;
-                const double  R     = mObj.spread.spread_value_rng(res.nominalValue_, Spread::RES, res.spread_, rng);
+                const double  R     = baseR * ts.resScale[rIdx];
                 const int64_t p     = resPartIdx_[rIdx];
                 const int64_t nzLoc = resPartNzIdx_[rIdx];
-                if (nzLoc >= 0) {
+                if (nzLoc >= 0 && std::abs(R) > 1e-30) {
                     const double baseDiag = (atyp_ == AnalysisType::Voltage)
                                                     ? (-baseR)
-                                                    : (-((2.0 * stepSize_) / (3.0 * Constants::SIGMA * baseR)));
+                                                    : (-((2.0 * stepSize_) / 3.0) * (baseR / Constants::SIGMA));
                     const double newDiag  = (atyp_ == AnalysisType::Voltage)
                                                     ? (-R)
-                                                    : (-((2.0 * stepSize_) / (3.0 * Constants::SIGMA * R)));
+                                                    : (-((2.0 * stepSize_) / 3.0) * (R / Constants::SIGMA));
                     allPartNz[nzOffB + baseParts[p].nzStart + nzLoc] += (newDiag - baseDiag);
                 }
             }
@@ -4952,10 +5409,10 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             for (size_t cIdx = 0; cIdx < capacitors_.size(); ++cIdx) {
                 const auto&   cap   = capacitors_[cIdx];
                 const double  baseC = cap.netlistInfo.value_;
-                const double  C     = mObj.spread.spread_value_rng(cap.nominalValue_, Spread::CAP, cap.spread_, rng);
+                const double  C     = baseC * ts.capScale[cIdx];
                 const int64_t p     = capPartIdx_[cIdx];
                 const int64_t nzLoc = capPartNzIdx_[cIdx];
-                if (nzLoc >= 0) {
+                if (nzLoc >= 0 && std::abs(C) > 1e-30) {
                     const double baseDiag = (atyp_ == AnalysisType::Voltage)
                                                     ? (-((2.0 * stepSize_) / (3.0 * baseC)))
                                                     : (-((4.0 * stepSize_ * stepSize_)
@@ -4970,20 +5427,18 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
 
             for (size_t jIdx = 0; jIdx < jjs_.size(); ++jIdx) {
                 const auto&   jj    = jjs_[jIdx];
-                const double  area  = mObj.spread.spread_value_rng(jj.nominalArea_, Spread::JJ, jj.spread_, rng);
+                const double  area  = jj.area_ * ts.jjScale[jIdx];
                 const int32_t gJJ   = globalJJToGpuJJ[jIdx];
                 const int64_t p     = jjPartIdx_[jIdx];
                 const int64_t nzLoc = jjPartNzIdx_[jIdx];
-                if (gJJ >= 0) {
+                if (gJJ >= 0 && std::abs(area) > 1e-30) {
                     GpuJJ&       gjj     = allJJs[jjOffB + gJJ];
                     const double baseNz  = gjj.curNzVal;
-                    const double baseIc  = jj.nominalIc_.has_value() ? jj.nominalIc_.value() : jj.baseModel_.ic();
-                    gjj.ic               = baseIc * area;
-                    gjj.r0               = jj.baseModel_.r0() / area;
+                    gjj.ic               = jj.baseModel_.ic() * area;
                     gjj.rn               = jj.baseModel_.rn() / area;
+                    gjj.r0               = (jj.baseModel_.rtype() == 0) ? gjj.rn : (jj.baseModel_.r0() / area);
                     gjj.c                = jj.baseModel_.c() * area;
-                    gjj.gLarge           = (jj.baseModel_.ic() / jj.del_)
-                                 * ((jj.upperB_ + jj.lowerB_) / (jj.upperB_ - jj.lowerB_));
+                    gjj.gLarge           = gjj.ic / (jj.baseModel_.icFct() * jj.baseModel_.deltaV());
                     gjj.negInvSubgap     = -(1.0 / (((3.0 * gjj.c) / (2.0 * stepSize_)) + (1.0 / gjj.r0)));
                     gjj.negInvNormal     = -(1.0 / (((3.0 * gjj.c) / (2.0 * stepSize_)) + (1.0 / gjj.rn)));
                     gjj.negInvTrans      = -(1.0 / (((3.0 * gjj.c) / (2.0 * stepSize_)) + gjj.gLarge));
@@ -5389,7 +5844,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
                     // Current Sources
                     for (int32_t k = 0; k < part.csCount; ++k) {
                         const GpuCS& cs     = allCSs[part.csStart + k];
-                        const double srcVal = srcAll[(i + 2) * numSrc + cs.srcIdx];
+                        const double srcVal = srcAll[(i + 2) * numSrc + cs.srcIdx] * cs.scale;
                         if (cs.posIdx >= 0) { bPtr[cs.posIdx] -= srcVal; }
                         if (cs.negIdx >= 0) { bPtr[cs.negIdx] += srcVal; }
                     }
@@ -5446,7 +5901,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
                     // Voltage Sources
                     for (int32_t k = 0; k < part.vsCount; ++k) {
                         GpuVS&       vs     = allVSs[part.vsStart + k];
-                        const double srcVal = srcAll[(i + 2) * numSrc + vs.srcIdx];
+                        const double srcVal = srcAll[(i + 2) * numSrc + vs.srcIdx] * vs.scale;
                         if (atyp_ == AnalysisType::Voltage) {
                             bPtr[vs.curIdx] = srcVal;
                         } else {
@@ -5462,12 +5917,12 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
                     // Phase Sources
                     for (int32_t k = 0; k < part.psCount; ++k) {
                         const GpuPS& ps = allPSs[part.psStart + k];
-                        const double s0 = srcAll[(i + 2) * numSrc + ps.srcIdx];
+                        const double s0 = srcAll[(i + 2) * numSrc + ps.srcIdx] * ps.scale;
                         if (atyp_ == AnalysisType::Phase) {
                             bPtr[ps.curIdx] = s0;
                         } else {
-                            const double s1 = srcAll[(i + 1) * numSrc + ps.srcIdx];
-                            const double s2 = srcAll[i * numSrc + ps.srcIdx];
+                            const double s1 = srcAll[(i + 1) * numSrc + ps.srcIdx] * ps.scale;
+                            const double s2 = srcAll[i * numSrc + ps.srcIdx] * ps.scale;
                             if (i == 0) {
                                 bPtr[ps.curIdx] = (Constants::SIGMA / stepSize_) * (1.5 * s0);
                             } else if (i == 1) {
@@ -5595,6 +6050,673 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             auto&         dst  = *results.xVector[globR];
             const double* src  = results.mcTraceOut.data() + static_cast<size_t>(slot) * numKeptSteps_;
             dst.assign(src, src + numKeptSteps_);
+        }
+    }
+    results.mcRuns         = B;
+    results.mcNumRows      = nBaseTraces;
+    results.mcNumKeptSteps = numKeptSteps_;
+
+    if (!minOut_) {
+        bar.complete();
+        std::cout << "\n";
+    }
+#else
+    (void) mObj;
+#endif
+}
+
+void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
+#ifndef SLU
+    const int64_t B    = mcRuns_;
+    const int64_t N    = static_cast<int64_t>(mObj.rp.size()) - 1;
+    const int64_t nRed = nodalNRed_;
+
+    results.timeAxis.clear();
+    results.timeAxis.reserve(static_cast<size_t>(numKeptSteps_));
+    for (int64_t i = 0; i < simSize_; ++i) {
+        if (keptSlot_[i] >= 0) { results.timeAxis.push_back(i * stepSize_); }
+    }
+
+    results.mcRowToSlot.assign(static_cast<size_t>(N), -1);
+    std::vector<int64_t> traceGlobRows;
+    traceGlobRows.reserve(nodalRelTraces_.size());
+    if (!mObj.relevantTraces.empty()) {
+        for (int64_t globR : mObj.relevantIndices) {
+            if (globR >= 0 && globR < N) {
+                results.mcRowToSlot[globR] = static_cast<int32_t>(traceGlobRows.size());
+                traceGlobRows.push_back(globR);
+            }
+        }
+    } else {
+        for (int64_t globR = 0; globR < N; ++globR) {
+            results.mcRowToSlot[globR] = static_cast<int32_t>(traceGlobRows.size());
+            traceGlobRows.push_back(globR);
+        }
+    }
+    const int64_t nBaseTraces = static_cast<int64_t>(nodalRelTraces_.size());
+
+    std::vector<TrialDeviceScales> trialScales;
+    compute_trial_scales(mObj, trialScales);
+
+    const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
+    std::vector<double> srcAll(static_cast<size_t>((simSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
+    if (numSrc > 0) {
+        for (int64_t i = 0; i < simSize_; ++i) {
+            const double t   = i * stepSize_;
+            double*      row = srcAll.data() + (i + 2) * numSrc;
+            for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) { row[srcIdx] = mObj.sourcegen[srcIdx].value(t); }
+        }
+    }
+
+    if (verb_ >= 1) {
+        std::cout << "JoSIM: Running Batched Tier 4 Schur-Complement Nodal Solver (" << B << " trials, N = " << N
+                  << " -> N_red = " << nRed << ")\n";
+    }
+    ProgressBar bar;
+    if (!minOut_) {
+        bar.create_thread();
+        bar.set_bar_width(30);
+        bar.fill_bar_progress_with("O");
+        bar.fill_bar_remainder_with(" ");
+        bar.set_status_text(parallel_ ? "Simulating MC Nodal (OMP)" : "Simulating MC Nodal");
+        bar.set_total(static_cast<float>(B));
+    }
+
+    results.mcTraceOut.assign(static_cast<size_t>(B * nBaseTraces * numKeptSteps_), 0.0);
+    bool anyNeedsTR = false;
+    bool anySingErr = false;
+
+    const int64_t nJJ  = static_cast<int64_t>(nodalJJs_.size());
+    const int64_t nRes = static_cast<int64_t>(nodalRess_.size());
+    const int64_t nInd = static_cast<int64_t>(nodalInds_.size());
+    const int64_t nCap = static_cast<int64_t>(nodalCaps_.size());
+    const int64_t nVS  = static_cast<int64_t>(nodalVSs_.size());
+    const int64_t nPS  = static_cast<int64_t>(nodalPSs_.size());
+    const int64_t nCS  = static_cast<int64_t>(nodalCSs_.size());
+    const int64_t nCC  = static_cast<int64_t>(nodalCCVSs_.size());
+    const int64_t nVC  = static_cast<int64_t>(nodalVCCSs_.size());
+    const int64_t nTH  = static_cast<int64_t>(nodalTxHalves_.size());
+
+#ifdef _OPENMP
+    const int nThreads = parallel_ ? std::min<int>(omp_get_max_threads(), static_cast<int>(B)) : 1;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) if (parallel_) reduction(|| : anyNeedsTR, anySingErr)
+#endif
+    for (int64_t b = 0; b < B; ++b) {
+        if (anyNeedsTR || anySingErr) { continue; }
+        if (!minOut_ && (!parallel_ || b % 4 == 0)) { bar.update(static_cast<float>(b)); }
+
+        const auto&         ts      = trialScales[b];
+        std::vector<double> trialNz = nodalFixedNz_;
+        for (const auto& kv : nodalScaleH_) { trialNz[kv.first] += kv.second; }
+        for (const auto& kv : nodalScaleInvH_) { trialNz[kv.first] += kv.second; }
+
+        std::vector<GpuJJ>            trialJJs       = nodalJJs_;
+        std::vector<GpuRes>           trialRess      = nodalRess_;
+        std::vector<GpuInd>           trialInds      = nodalInds_;
+        std::vector<GpuMut>           trialMuts      = nodalMuts_;
+        std::vector<GpuCap>           trialCaps      = nodalCaps_;
+        std::vector<GpuVS>            trialVSs       = nodalVSs_;
+        std::vector<GpuPS>            trialPSs       = nodalPSs_;
+        std::vector<GpuCS>            trialCSs       = nodalCSs_;
+        std::vector<GpuCCVS>          trialCCVSs     = nodalCCVSs_;
+        std::vector<GpuVCCS>          trialVCCSs     = nodalVCCSs_;
+        std::vector<GpuTxHalf>        trialTxHalves  = nodalTxHalves_;
+        std::vector<GpuRelTrace>      trialRelTraces = nodalRelTraces_;
+        std::vector<TransmissionLine> trialTxLines   = txlines_;
+
+        auto add_stamp = [&](int32_t pp, int32_t qq, int32_t pq, int32_t qp, double g) {
+            if (pp >= 0) { trialNz[pp] += g; }
+            if (qq >= 0) { trialNz[qq] += g; }
+            if (pq >= 0) { trialNz[pq] -= g; }
+            if (qp >= 0) { trialNz[qp] -= g; }
+        };
+
+        for (size_t jIdx = 0; jIdx < trialJJs.size(); ++jIdx) {
+            const auto&  jj   = jjs_[jIdx];
+            GpuJJ&       gj   = trialJJs[jIdx];
+            const double area = std::max(1e-30, jj.area_ * ts.jjScale[jIdx]);
+            gj.ic             = jj.baseModel_.ic() * area;
+            gj.rn             = jj.baseModel_.rn() / area;
+            gj.r0             = (jj.baseModel_.rtype() == 0) ? gj.rn : (jj.baseModel_.r0() / area);
+            gj.c              = jj.baseModel_.c() * area;
+            gj.gLarge         = gj.ic / (jj.baseModel_.icFct() * jj.baseModel_.deltaV());
+            gj.negInvSubgap   = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + (1.0 / gj.r0)));
+            gj.negInvNormal   = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + (1.0 / gj.rn)));
+            gj.negInvTrans    = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + gj.gLarge));
+            gj.curNzVal       = (gj.rtype == 1) ? gj.negInvSubgap : gj.negInvNormal;
+            add_stamp(gj.nzIdxPP, gj.nzIdxQQ, gj.nzIdxPQ, gj.nzIdxQP, gj.gScale * (-1.0 / gj.curNzVal));
+        }
+
+        for (const auto& es : nodalRLEdges_) {
+            const double rScale = (es.origResIdx >= 0) ? ts.resScale[es.origResIdx] : 1.0;
+            const double lScale = (es.origIndIdx >= 0) ? ts.indScale[es.origIndIdx] : 1.0;
+            const double zR     = es.zR0 * rScale;
+            const double zL     = es.zL0 * lScale;
+            const double zTot   = std::max(1e-30, zR + zL);
+            const double gEff   = 1.0 / zTot;
+            add_stamp(es.nzIdxPP, es.nzIdxQQ, es.nzIdxPQ, es.nzIdxQP, gEff);
+            if (es.nodalResIdx >= 0) {
+                trialRess[es.nodalResIdx].g     = gEff;
+                trialRess[es.nodalResIdx].alpha = zR / zTot;
+            }
+            if (es.nodalIndIdx >= 0) {
+                trialInds[es.nodalIndIdx].g  = gEff;
+                trialInds[es.nodalIndIdx].L *= lScale;
+            }
+        }
+
+        for (const auto& cis : nodalCoupledIndStamps_) {
+            const double lScale = ts.indScale[cis.origIndIdx];
+            if (cis.diagCsrIdx >= 0) { trialNz[cis.diagCsrIdx] += (lScale - 1.0) * cis.diagBaseVal; }
+            trialInds[cis.nodalIndIdx].L *= lScale;
+        }
+        for (const auto& cms : nodalCoupledMutStamps_) {
+            const double mScale
+                    = std::sqrt(std::max(0.0, ts.indScale[cms.origIndIdx1] * ts.indScale[cms.origIndIdx2]));
+            if (cms.csrIdx >= 0) { trialNz[cms.csrIdx] += (mScale - 1.0) * cms.baseVal; }
+            trialMuts[cms.nodalMutIdx].M *= mScale;
+        }
+
+        for (size_t cIdx = 0; cIdx < trialCaps.size(); ++cIdx) {
+            const auto&  cs   = nodalCapStamps_[cIdx];
+            const double gCap = cs.g0 * ts.capScale[cIdx];
+            trialCaps[cIdx].g = gCap;
+            add_stamp(cs.nzIdxPP, cs.nzIdxQQ, cs.nzIdxPQ, cs.nzIdxQP, gCap);
+        }
+
+        for (size_t thIdx = 0; thIdx < trialTxHalves.size(); ++thIdx) {
+            const auto& tsTx = nodalTxStamps_[thIdx];
+            trialTxHalves[thIdx].g = tsTx.g0;
+            add_stamp(tsTx.nzIdxPP, tsTx.nzIdxQQ, tsTx.nzIdxPQ, tsTx.nzIdxQP, tsTx.g0);
+        }
+
+        for (size_t vIdx = 0; vIdx < trialVSs.size(); ++vIdx) { trialVSs[vIdx].scale = ts.vsScale[vIdx]; }
+        for (size_t pIdx = 0; pIdx < trialPSs.size(); ++pIdx) { trialPSs[pIdx].scale = ts.psScale[pIdx]; }
+        for (size_t cIdx = 0; cIdx < trialCSs.size(); ++cIdx) { trialCSs[cIdx].scale = ts.csScale[cIdx]; }
+
+        for (size_t tIdx = 0; tIdx < trialRelTraces.size(); ++tIdx) {
+            GpuRelTrace& tr = trialRelTraces[tIdx];
+            if (tr.traceType == 3 && tIdx < nodalRelTraceRefs_.size()) {
+                const auto& ref = nodalRelTraceRefs_[tIdx];
+                if (ref.devKind == 1 && ref.devIdx >= 0) {
+                    tr.gBranch = trialRess[ref.devIdx].g;
+                } else if (ref.devKind == 2 && ref.devIdx >= 0) {
+                    tr.gBranch = trialInds[ref.devIdx].g;
+                } else if (ref.devKind == 3 && ref.devIdx >= 0) {
+                    tr.gBranch = trialCaps[ref.devIdx].g;
+                } else if (ref.devKind == 4 && ref.devIdx >= 0) {
+                    tr.gBranch = trialTxHalves[ref.devIdx].g;
+                }
+            }
+        }
+
+        klu_l_common   trialCommon = CommonRed_;
+        klu_l_numeric* trialNum
+                = klu_l_factor(nodalRp_.data(), nodalCi_.data(), trialNz.data(), SymbolicRed_, &trialCommon);
+        if (!trialNum || trialCommon.status != KLU_OK) {
+            if (trialNum) { klu_l_free_numeric(&trialNum, &trialCommon); }
+            anySingErr = true;
+            continue;
+        }
+
+        const size_t        stateSize = std::max<size_t>(mObj.rp.size(), x_.size());
+        std::vector<double> trialB(stateSize, 0.0);
+        std::vector<double> trialX      = x_;
+        std::vector<double> trialNodalX = nodalX_;
+        std::vector<double> trialNodalB(static_cast<size_t>(nRed), 0.0);
+
+        auto read_nx = [&](int32_t idx) -> double {
+            if (idx >= 0) { return trialNodalX[idx]; }
+            if (idx <= -2) { return trialNodalX[-idx - 2]; }
+            return 0.0;
+        };
+
+        for (int64_t i = 0; i < simSize_; ++i) {
+            if (anyNeedsTR || anySingErr) { break; }
+            const bool checkPhase = (static_cast<double>(i) / static_cast<double>(simSize_) > 0.01);
+            std::fill(trialNodalB.begin(), trialNodalB.end(), 0.0);
+
+            bool stepNeedsRLU = false;
+            bool stepNeedsTR  = false;
+
+            for (int64_t jIdx = 0; jIdx < nJJ; ++jIdx) {
+                GpuJJ& gj  = trialJJs[jIdx];
+                double pn1 = read_nx(gj.posIdx) - read_nx(gj.negIdx);
+                double vn1 = gj.vn1;
+                if (i > 0) {
+                    if (atyp_ == AnalysisType::Voltage) {
+                        vn1 = pn1;
+                        pn1 = gj.gVar * (pn1 - trialB[gj.varIdx]);
+                    } else {
+                        vn1 = gj.gVar * (pn1 - trialB[gj.varIdx]);
+                    }
+                }
+                gj.pn1            = pn1;
+                gj.vn1            = vn1;
+                const double v0   = (5.0 / 2.0) * vn1 - 2.0 * gj.vn2 + (1.0 / 2.0) * gj.vn3;
+                const double phi0 = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gj.pn2
+                                    + ((1.0 / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0)) * v0;
+                gj.phi0           = phi0;
+                if (checkPhase && std::abs(phi0 - pn1) > (0.20 * 2.0 * Constants::PI)) {
+                    stepNeedsTR = true;
+                    break;
+                }
+                double bVar = 0.0;
+                if (atyp_ == AnalysisType::Voltage) {
+                    bVar = Constants::SIGMA * (-(2.0 / stepSize_) * pn1 + (1.0 / (2.0 * stepSize_)) * gj.pn2);
+                } else {
+                    bVar = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gj.pn2;
+                }
+                trialB[gj.varIdx] = bVar;
+                gj.pn4            = gj.pn3;
+                gj.pn3            = gj.pn2;
+                gj.pn2            = pn1;
+                gj.vn6            = gj.vn5;
+                gj.vn5            = gj.vn4;
+                gj.vn4            = gj.vn3;
+                gj.vn3            = gj.vn2;
+
+                if (gj.rtype == 1) {
+                    bool         updated = false;
+                    const double absV    = std::abs(v0);
+                    double       newNz   = gj.curNzVal;
+                    if (absV < gj.lowerB) {
+                        gj.it = 0.0;
+                        if (gj.curNzVal != gj.negInvSubgap) {
+                            newNz   = gj.negInvSubgap;
+                            updated = true;
+                        }
+                    } else if (absV < gj.upperB) {
+                        gj.it = gj.lowerB * ((1.0 / gj.r0) - gj.gLarge);
+                        if (v0 < 0.0) { gj.it = -gj.it; }
+                        if (gj.curNzVal != gj.negInvTrans) {
+                            newNz   = gj.negInvTrans;
+                            updated = true;
+                        }
+                    } else {
+                        gj.it = 0.0;
+                        if (gj.curNzVal != gj.negInvNormal) {
+                            newNz   = gj.negInvNormal;
+                            updated = true;
+                        }
+                    }
+                    if (updated) {
+                        const double oldG   = -gj.gScale / gj.curNzVal;
+                        const double newG   = -gj.gScale / newNz;
+                        const double deltaG = newG - oldG;
+                        gj.curNzVal         = newNz;
+                        if (gj.nzIdxPP >= 0) { trialNz[gj.nzIdxPP] += deltaG; }
+                        if (gj.nzIdxQQ >= 0) { trialNz[gj.nzIdxQQ] += deltaG; }
+                        if (gj.nzIdxPQ >= 0) { trialNz[gj.nzIdxPQ] -= deltaG; }
+                        if (gj.nzIdxQP >= 0) { trialNz[gj.nzIdxQP] -= deltaG; }
+                        stepNeedsRLU = true;
+                    }
+                }
+
+                double ic_sin_phi = 0.0;
+                if (gj.cprLen == 1) {
+                    ic_sin_phi = gj.ic * (gj.cpr[0] * std::sin(phi0 - gj.phiOff));
+                } else {
+                    for (int harm = 0; harm < gj.cprLen; ++harm) {
+                        ic_sin_phi += gj.ic * (gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff)));
+                    }
+                }
+                double bCur = 0.0;
+                if (gj.tDep == 0) {
+                    bCur = gj.curNzVal
+                           * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
+                              + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                } else {
+                    double sin2_half_phi = 0.0;
+                    double sin_phi       = 0.0;
+                    for (int harm = 0; harm < gj.cprLen; ++harm) {
+                        sin2_half_phi += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff) / 2.0);
+                        sin_phi       += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff));
+                    }
+                    sin2_half_phi          = sin2_half_phi * sin2_half_phi;
+                    const double sqrt_part = std::sqrt(1.0 - gj.d * sin2_half_phi);
+                    bCur                   = gj.curNzVal
+                           * ((((Constants::PI * gj.del) / (2.0 * Constants::EV * gj.rn)) * (sin_phi / sqrt_part)
+                               * std::tanh(gj.del / (2.0 * Constants::BOLTZMANN * gj.t) * sqrt_part))
+                              - (((2.0 * gj.c) / stepSize_) * vn1) + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                }
+                trialB[gj.curIdx] = bCur;
+                gj.vn2            = vn1;
+                const double gCur = -1.0 / gj.curNzVal;
+                const double gJ   = gj.gScale * gCur;
+                const double jJJ  = (atyp_ == AnalysisType::Voltage) ? (gCur * bCur) : (gCur * bCur + gJ * bVar);
+                if (gj.posIdx >= 0) { trialNodalB[gj.posIdx] += jJJ; }
+                if (gj.negIdx >= 0) { trialNodalB[gj.negIdx] -= jJJ; }
+            }
+
+            if (stepNeedsTR) {
+                anyNeedsTR = true;
+                break;
+            }
+            if (stepNeedsRLU) {
+                int64_t ok = klu_l_refactor(
+                        nodalRp_.data(), nodalCi_.data(), trialNz.data(), SymbolicRed_, trialNum, &trialCommon);
+                if (!ok) {
+                    klu_l_free_numeric(&trialNum, &trialCommon);
+                    trialNum = klu_l_factor(
+                            nodalRp_.data(), nodalCi_.data(), trialNz.data(), SymbolicRed_, &trialCommon);
+                    if (!trialNum || trialCommon.status != KLU_OK) {
+                        anySingErr = true;
+                        break;
+                    }
+                }
+            }
+
+            // Resistors (Phase mode)
+            if (atyp_ == AnalysisType::Phase) {
+                for (int64_t rIdx = 0; rIdx < nRes; ++rIdx) {
+                    GpuRes&      gr    = trialRess[rIdx];
+                    const double vDiff = read_nx(gr.posIdx) - read_nx(gr.negIdx);
+                    const double pn1   = gr.alpha * vDiff + (1.0 - gr.alpha) * gr.pn1;
+                    const double bRes  = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gr.pn2;
+                    trialB[gr.curIdx]  = bRes;
+                    gr.pn2             = pn1;
+                    gr.pn1             = bRes;
+                    const double jRes  = gr.g * bRes;
+                    if (gr.posIdx >= 0) { trialNodalB[gr.posIdx] += jRes; }
+                    if (gr.negIdx >= 0) { trialNodalB[gr.negIdx] -= jRes; }
+                }
+            }
+
+            // Inductors (Voltage mode)
+            if (atyp_ == AnalysisType::Voltage) {
+                const double h = stepSize_;
+                for (int64_t lIdx = 0; lIdx < nInd; ++lIdx) {
+                    GpuInd&      gi    = trialInds[lIdx];
+                    const double iPrev = (gi.g > 0.0) ? trialX[gi.curIdx] : trialNodalX[gi.curIdx];
+                    double       bVal  = -(2.0 * gi.L / h) * iPrev + (gi.L / (2.0 * h)) * gi.In2;
+                    if (gi.g > 0.0) {
+                        trialB[gi.curIdx] = bVal;
+                        const double jInd = gi.g * bVal;
+                        if (gi.posIdx >= 0) { trialNodalB[gi.posIdx] += jInd; }
+                        if (gi.negIdx >= 0) { trialNodalB[gi.negIdx] -= jInd; }
+                    } else {
+                        for (int32_t m = gi.mutStart; m < gi.mutStart + gi.mutCount; ++m) {
+                            const GpuMut& gm    = trialMuts[m];
+                            const GpuInd& other = trialInds[gm.targetIndIdx];
+                            const double  oPrev = (other.g > 0.0) ? trialX[other.curIdx] : trialNodalX[other.curIdx];
+                            bVal               += -(2.0 * gm.M / h) * oPrev + (gm.M / (2.0 * h)) * other.In2;
+                        }
+                        trialNodalB[gi.curIdx] = bVal;
+                    }
+                }
+                for (int64_t lIdx = 0; lIdx < nInd; ++lIdx) {
+                    GpuInd& gi = trialInds[lIdx];
+                    gi.In4     = gi.In3;
+                    gi.In3     = gi.In2;
+                    gi.In2     = (gi.g > 0.0) ? trialX[gi.curIdx] : trialNodalX[gi.curIdx];
+                }
+            }
+
+            // Capacitors
+            for (int64_t cIdx = 0; cIdx < nCap; ++cIdx) {
+                GpuCap&      gc   = trialCaps[cIdx];
+                const double pn1  = read_nx(gc.posIdx) - read_nx(gc.negIdx);
+                double       bCap = 0.0;
+                if (atyp_ == AnalysisType::Voltage) {
+                    bCap = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gc.pn2;
+                } else {
+                    bCap   = (8.0 / 3.0) * pn1 - (22.0 / 9.0) * gc.pn2 + (8.0 / 9.0) * gc.pn3 - (1.0 / 9.0) * gc.pn4;
+                    gc.pn4 = gc.pn3;
+                    gc.pn3 = gc.pn2;
+                }
+                gc.pn2            = pn1;
+                gc.pn1            = pn1;
+                trialB[gc.curIdx] = bCap;
+                const double jCap = gc.g * bCap;
+                if (gc.posIdx >= 0) { trialNodalB[gc.posIdx] += jCap; }
+                if (gc.negIdx >= 0) { trialNodalB[gc.negIdx] -= jCap; }
+            }
+
+            // Current Sources
+            for (int64_t cIdx = 0; cIdx < nCS; ++cIdx) {
+                const GpuCS& cs     = trialCSs[cIdx];
+                const double srcVal = srcAll[(i + 2) * numSrc + cs.srcIdx] * cs.scale;
+                if (cs.posIdx >= 0) { trialNodalB[cs.posIdx] -= srcVal; }
+                if (cs.negIdx >= 0) { trialNodalB[cs.negIdx] += srcVal; }
+            }
+
+            // Voltage Sources
+            for (int64_t vIdx = 0; vIdx < nVS; ++vIdx) {
+                GpuVS&       vs     = trialVSs[vIdx];
+                const double srcVal = srcAll[(i + 2) * numSrc + vs.srcIdx] * vs.scale;
+                if (atyp_ == AnalysisType::Voltage) {
+                    trialNodalB[vs.curIdx] = srcVal;
+                } else {
+                    const double pn1       = read_nx(vs.posIdx) - read_nx(vs.negIdx);
+                    trialNodalB[vs.curIdx] = ((2.0 * stepSize_) / (3.0 * Constants::SIGMA)) * srcVal
+                                             + (4.0 / 3.0) * pn1 - (1.0 / 3.0) * vs.pn2;
+                    vs.pn2 = pn1;
+                    vs.pn1 = pn1;
+                }
+            }
+
+            // Phase Sources
+            for (int64_t pIdx = 0; pIdx < nPS; ++pIdx) {
+                const GpuPS& ps = trialPSs[pIdx];
+                const double s0 = srcAll[(i + 2) * numSrc + ps.srcIdx] * ps.scale;
+                if (atyp_ == AnalysisType::Phase) {
+                    trialNodalB[ps.curIdx] = s0;
+                } else {
+                    const double s1 = srcAll[(i + 1) * numSrc + ps.srcIdx] * ps.scale;
+                    const double s2 = srcAll[i * numSrc + ps.srcIdx] * ps.scale;
+                    if (i == 0) {
+                        trialNodalB[ps.curIdx] = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0);
+                    } else if (i == 1) {
+                        trialNodalB[ps.curIdx] = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0 - 2.0 * s1);
+                    } else {
+                        trialNodalB[ps.curIdx]
+                                = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0 - 2.0 * s1 + 0.5 * s2);
+                    }
+                }
+            }
+
+            // CCVS & VCCS (Phase mode)
+            if (atyp_ == AnalysisType::Phase) {
+                for (int64_t idx = 0; idx < nCC; ++idx) {
+                    GpuCCVS&     cc        = trialCCVSs[idx];
+                    const double pn1       = read_nx(cc.posIdx) - read_nx(cc.negIdx);
+                    trialNodalB[cc.curIdx] = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * cc.pn2;
+                    cc.pn2                 = pn1;
+                    cc.pn1                 = pn1;
+                }
+                for (int64_t idx = 0; idx < nVC; ++idx) {
+                    GpuVCCS&     vc        = trialVCCSs[idx];
+                    const double pn1       = read_nx(vc.posIdx2) - read_nx(vc.negIdx2);
+                    trialNodalB[vc.curIdx] = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * vc.pn2;
+                    vc.pn2                 = pn1;
+                    vc.pn1                 = pn1;
+                }
+            }
+
+            // Transmission Lines
+            for (int64_t thIdx = 0; thIdx < nTH; ++thIdx) {
+                const GpuTxHalf& th      = trialTxHalves[thIdx];
+                const auto&      tx      = trialTxLines[th.txIdx];
+                const double     Z       = tx.netlistInfo.value_;
+                const int64_t    k       = tx.timestepDelay_;
+                const int64_t    hSize   = tx.histSize_;
+                const double     cZPhi   = (Z / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0);
+                const auto&      hist    = tx.hist_;
+                const double     alpha   = tx.fracDelay_;
+                const double     oma     = 1.0 - alpha;
+                const int64_t    effStep = tx.loadedSteps_ + i;
+                double           rem     = 0.0;
+                if (effStep >= k) {
+                    const int64_t m = effStep - k;
+                    if (alpha > 0.0) {
+                        auto interp_v1 = [&](int64_t idx) -> double {
+                            if (idx < 0) { return 0.0; }
+                            const double s0 = hist[idx % hSize].v1;
+                            const double s1 = (idx >= 1) ? hist[(idx - 1) % hSize].v1 : 0.0;
+                            return oma * s0 + alpha * s1;
+                        };
+                        auto interp_v2 = [&](int64_t idx) -> double {
+                            if (idx < 0) { return 0.0; }
+                            const double s0 = hist[idx % hSize].v2;
+                            const double s1 = (idx >= 1) ? hist[(idx - 1) % hSize].v2 : 0.0;
+                            return oma * s0 + alpha * s1;
+                        };
+                        auto interp_i1 = [&](int64_t idx) -> double {
+                            if (idx < 0) { return 0.0; }
+                            const double s0 = hist[idx % hSize].i1;
+                            const double s1 = (idx >= 1) ? hist[(idx - 1) % hSize].i1 : 0.0;
+                            return oma * s0 + alpha * s1;
+                        };
+                        auto interp_i2 = [&](int64_t idx) -> double {
+                            if (idx < 0) { return 0.0; }
+                            const double s0 = hist[idx % hSize].i2;
+                            const double s1 = (idx >= 1) ? hist[(idx - 1) % hSize].i2 : 0.0;
+                            return oma * s0 + alpha * s1;
+                        };
+                        if (th.isPort2 == 0) {
+                            const double nk_2 = interp_v2(m);
+                            const double I2nk = interp_i2(m);
+                            if (atyp_ == AnalysisType::Voltage) {
+                                rem = Z * I2nk + nk_2;
+                            } else {
+                                rem = cZPhi * I2nk + nk_2 - (4.0 / 3.0) * interp_v2(m - 1)
+                                      + (1.0 / 3.0) * interp_v2(m - 2);
+                            }
+                        } else {
+                            const double nk_1 = interp_v1(m);
+                            const double I1nk = interp_i1(m);
+                            if (atyp_ == AnalysisType::Voltage) {
+                                rem = Z * I1nk + nk_1;
+                            } else {
+                                rem = cZPhi * I1nk + nk_1 - (4.0 / 3.0) * interp_v1(m - 1)
+                                      + (1.0 / 3.0) * interp_v1(m - 2);
+                            }
+                        }
+                    } else {
+                        const auto& h_k = hist[m % hSize];
+                        if (th.isPort2 == 0) {
+                            if (atyp_ == AnalysisType::Voltage) {
+                                rem = Z * h_k.i2 + h_k.v2;
+                            } else if (effStep == k) {
+                                rem = cZPhi * h_k.i2 + h_k.v2;
+                            } else if (effStep == k + 1) {
+                                rem = cZPhi * h_k.i2 + h_k.v2 - (4.0 / 3.0) * hist[(m - 1) % hSize].v2;
+                            } else {
+                                rem = cZPhi * h_k.i2 + h_k.v2 - (4.0 / 3.0) * hist[(m - 1) % hSize].v2
+                                      + (1.0 / 3.0) * hist[(m - 2) % hSize].v2;
+                            }
+                        } else {
+                            if (atyp_ == AnalysisType::Voltage) {
+                                rem = Z * h_k.i1 + h_k.v1;
+                            } else if (effStep == k) {
+                                rem = cZPhi * h_k.i1 + h_k.v1;
+                            } else if (effStep == k + 1) {
+                                rem = cZPhi * h_k.i1 + h_k.v1 - (4.0 / 3.0) * hist[(m - 1) % hSize].v1;
+                            } else {
+                                rem = cZPhi * h_k.i1 + h_k.v1 - (4.0 / 3.0) * hist[(m - 1) % hSize].v1
+                                      + (1.0 / 3.0) * hist[(m - 2) % hSize].v1;
+                            }
+                        }
+                    }
+                }
+                double bTx = rem;
+                if (atyp_ == AnalysisType::Phase) { bTx += (4.0 / 3.0) * th.n1 - (1.0 / 3.0) * th.n2; }
+                trialB[th.curIdx] = bTx;
+                const double jTx  = th.g * bTx;
+                if (th.posIdx >= 0) { trialNodalB[th.posIdx] += jTx; }
+                if (th.negIdx >= 0) { trialNodalB[th.negIdx] -= jTx; }
+            }
+
+            std::copy(trialNodalB.begin(), trialNodalB.end(), trialNodalX.begin());
+            const int64_t ok
+                    = klu_l_tsolve(SymbolicRed_, trialNum, nodalNRed_, 1, trialNodalX.data(), &trialCommon);
+            if (!ok) {
+                anySingErr = true;
+                break;
+            }
+
+            if (atyp_ == AnalysisType::Voltage) {
+                for (int64_t lIdx = 0; lIdx < nInd; ++lIdx) {
+                    const GpuInd& gi = trialInds[lIdx];
+                    if (gi.g > 0.0) {
+                        const double vDiff = read_nx(gi.posIdx) - read_nx(gi.negIdx);
+                        trialX[gi.curIdx]  = gi.g * (vDiff - trialB[gi.curIdx]);
+                    }
+                }
+            }
+
+            for (int64_t thIdx = 0; thIdx < nTH; ++thIdx) {
+                GpuTxHalf&    th    = trialTxHalves[thIdx];
+                auto&         tx    = trialTxLines[th.txIdx];
+                const double  vPort = read_nx(th.posIdx) - read_nx(th.negIdx);
+                const double  iPort = th.g * (vPort - trialB[th.curIdx]);
+                const int64_t slot  = (tx.loadedSteps_ + i) % tx.histSize_;
+                if (th.isPort2 == 0) {
+                    tx.hist_[slot].v1 = vPort;
+                    tx.hist_[slot].i1 = iPort;
+                } else {
+                    tx.hist_[slot].v2 = vPort;
+                    tx.hist_[slot].i2 = iPort;
+                }
+                if (atyp_ == AnalysisType::Phase) {
+                    th.n2 = th.n1;
+                    th.n1 = vPort;
+                }
+            }
+
+            const int32_t kSlot = keptSlot_[i];
+            if (kSlot >= 0) {
+                for (int64_t tIdx = 0; tIdx < nBaseTraces; ++tIdx) {
+                    const GpuRelTrace& tr  = trialRelTraces[tIdx];
+                    double             val = 0.0;
+                    if (tr.traceType == 0) {
+                        val = (tr.localAbsIdx >= 0 && tr.localAbsIdx < nRed) ? trialNodalX[tr.localAbsIdx] : 0.0;
+                    } else {
+                        const double vDiff = read_nx(tr.posIdx) - read_nx(tr.negIdx);
+                        if (tr.traceType == 1) {
+                            const GpuJJ& jj = trialJJs[tr.jjIdx];
+                            val             = jj.gVar * (vDiff - trialB[jj.varIdx]);
+                        } else if (tr.traceType == 2) {
+                            const GpuJJ& jj   = trialJJs[tr.jjIdx];
+                            const double gCur = -1.0 / jj.curNzVal;
+                            const double gJ   = jj.gScale * gCur;
+                            const double jJJ  = (atyp_ == AnalysisType::Voltage)
+                                                        ? (gCur * trialB[jj.curIdx])
+                                                        : (gCur * trialB[jj.curIdx] + gJ * trialB[jj.varIdx]);
+                            val               = gJ * vDiff - jJJ;
+                        } else if (tr.traceType == 3) {
+                            val = tr.gBranch * (vDiff - trialB[tr.localAbsIdx]);
+                        } else if (tr.traceType == 4) {
+                            val = vDiff;
+                        }
+                    }
+                    results.mcTraceOut[static_cast<size_t>(b * nBaseTraces + tIdx) * numKeptSteps_ + kSlot] = val;
+                }
+            }
+        }
+
+        if (b == 0 && !anyNeedsTR && !anySingErr) {
+            nodalX_ = trialNodalX;
+        }
+        klu_l_free_numeric(&trialNum, &trialCommon);
+    }
+
+    if (anySingErr) { Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR); }
+    if (anyNeedsTR) {
+        needsTR_ = true;
+        if (!minOut_) {
+            bar.complete();
+            std::cout << "\n";
+        }
+        return;
+    }
+
+    for (size_t tIdx = 0; tIdx < traceGlobRows.size(); ++tIdx) {
+        const int64_t globR = traceGlobRows[tIdx];
+        if (globR >= 0 && globR < static_cast<int64_t>(results.xVector.size()) && results.xVector[globR]) {
+            const double* src = results.mcTraceOut.data() + tIdx * static_cast<size_t>(numKeptSteps_);
+            results.xVector[globR]->assign(src, src + numKeptSteps_);
         }
     }
     results.mcRuns         = B;
@@ -7831,6 +8953,18 @@ void Simulation::trans_sim(Matrix& mObj) {
     }
 
 #ifndef SLU
+    if (mcRuns_ > 1 && nodal_ && !gpu_ && !hasJJThermalNoise_ && !hasResistorThermalNoise_
+        && correctorIter_ == 0 && !saveStateFile_.has_value() && setup_cpu_nodal(mObj) && SymbolicRed_
+        && NumericRed_) {
+        trans_sim_mc_nodal(mObj);
+        return;
+    }
+    if (mcRuns_ > 1 && !usePartitions_ && !hasJJThermalNoise_ && !hasResistorThermalNoise_
+        && correctorIter_ == 0 && !saveStateFile_.has_value()) {
+        nodal_ = false;
+        setup_partitions(mObj);
+        if (usePartitions_) { factorize_lu(mObj); }
+    }
     if (mcRuns_ > 1 && usePartitions_ && windowSize_ >= 1 && !hasJJThermalNoise_ && !hasResistorThermalNoise_
         && correctorIter_ == 0 && !saveStateFile_.has_value()) {
         trans_sim_mc(mObj);

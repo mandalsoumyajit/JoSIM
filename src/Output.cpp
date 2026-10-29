@@ -607,10 +607,15 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
         }
 
         struct McStat {
-            double peakMean = 0.0;
-            double peakStd  = 0.0;
-            double peakMin  = 0.0;
-            double peakMax  = 0.0;
+            double  peakMean = 0.0;
+            double  peakStd  = 0.0;
+            double  peakMin  = 0.0;
+            double  peakMax  = 0.0;
+            int64_t nomSfq   = 0;
+            int64_t passCnt  = 0;
+            int64_t bLow     = 0;
+            int64_t bHigh    = 0;
+            bool    isPhase  = false;
         };
         std::vector<McStat> stats(nTraces);
 
@@ -637,12 +642,13 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                                          : -1;
             const size_t xsize = std::min<size_t>(t.size(), static_cast<size_t>(nKept));
 
-            std::vector<double> meanVec(nPrint, 0.0);
-            std::vector<double> m2Vec(nPrint, 0.0);
-            std::vector<double> vMin(nPrint, 1e300);
-            std::vector<double> vMax(nPrint, -1e300);
-            std::vector<double> trialWave(nPrint, 0.0);
-            std::vector<double> vectphase;
+            std::vector<double>  meanVec(nPrint, 0.0);
+            std::vector<double>  m2Vec(nPrint, 0.0);
+            std::vector<double>  vMin(nPrint, 1e300);
+            std::vector<double>  vMax(nPrint, -1e300);
+            std::vector<double>  trialWave(nPrint, 0.0);
+            std::vector<int64_t> trialSfq(B, 0);
+            std::vector<double>  vectphase;
             if (st == StorageType::Phase && iObj.argAnal == AnalysisType::Voltage
                 && !(i.deviceLabel.value().at(3) == 'B' && sv >= 0)) {
                 vectphase.resize(xsize, 0.0);
@@ -774,6 +780,10 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                 }
 
                 if (iObj.argMcAll) { traces[baseSlot + 4 + b].data_ = trialWave; }
+                if (st == StorageType::Phase && nPrint > 0) {
+                    const double dPhi = trialWave.back() - trialWave.front();
+                    trialSfq[b]       = static_cast<int64_t>(std::llround(dPhi / (2.0 * Constants::PI)));
+                }
                 const double invCount = 1.0 / static_cast<double>(b + 1);
                 for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
                     const double v      = trialWave[pIdx];
@@ -803,6 +813,44 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                 stats[idx].peakMin  = trMin[pk];
                 stats[idx].peakMax  = trMax[pk];
             }
+            if (st == StorageType::Phase && nPrint > 0 && B > 0) {
+                stats[idx].isPhase = true;
+                int64_t bNom       = B / 2;
+                if (iObj.argSweep && !iObj.sweeps.empty()) {
+                    auto find_nom = [](const SweepDim& sd) -> int64_t {
+                        if (sd.values.empty()) { return 0; }
+                        if (sd.isRelative) {
+                            int64_t best = 0;
+                            for (size_t k = 1; k < sd.values.size(); ++k) {
+                                if (std::abs(sd.values[k] - 1.0) < std::abs(sd.values[best] - 1.0)) {
+                                    best = static_cast<int64_t>(k);
+                                }
+                            }
+                            return best;
+                        }
+                        return static_cast<int64_t>(sd.values.size() / 2);
+                    };
+                    if (iObj.sweeps.size() == 1) {
+                        bNom = std::clamp<int64_t>(find_nom(iObj.sweeps[0]), 0, B - 1);
+                    } else if (iObj.sweeps.size() >= 2) {
+                        const int64_t n1 = static_cast<int64_t>(iObj.sweeps[1].values.size());
+                        bNom = std::clamp<int64_t>(find_nom(iObj.sweeps[0]) * n1 + find_nom(iObj.sweeps[1]), 0, B - 1);
+                    }
+                }
+                const int64_t refSfq = trialSfq[bNom];
+                stats[idx].nomSfq    = refSfq;
+                int64_t passCnt      = 0;
+                for (int64_t b = 0; b < B; ++b) {
+                    if (trialSfq[b] == refSfq) { ++passCnt; }
+                }
+                stats[idx].passCnt = passCnt;
+                int64_t lo         = bNom;
+                int64_t hi         = bNom;
+                while (lo > 0 && trialSfq[lo - 1] == refSfq) { --lo; }
+                while (hi + 1 < B && trialSfq[hi + 1] == refSfq) { ++hi; }
+                stats[idx].bLow  = lo;
+                stats[idx].bHigh = hi;
+            }
         };
 
 #ifdef _OPENMP
@@ -817,25 +865,71 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
         }
 
         if (!iObj.argMin && nTraces > 0) {
-            std::cout << "\nJoSIM Monte Carlo Robustness Summary (" << B << " trials):\n";
-            std::cout << "  " << std::left << std::setw(22) << "Trace" << std::right << std::setw(14) << "Peak Mean"
-                      << std::setw(14) << "Peak 1-Sigma" << std::setw(14) << "Peak Min" << std::setw(14) << "Peak Max"
-                      << std::setw(12) << "CV (%)" << "\n";
-            const int64_t maxShow = std::min<int64_t>(nTraces, 16);
-            for (int64_t idx = 0; idx < maxShow; ++idx) {
-                const auto&  st = stats[idx];
-                const double cv = (std::abs(st.peakMean) > 1e-18)
-                                          ? (100.0 * st.peakStd / std::abs(st.peakMean))
-                                          : 0.0;
-                std::cout << "  " << std::left << std::setw(22) << mObj.relevantTraces[idx].deviceLabel.value()
-                          << std::right << std::scientific << std::setprecision(4) << std::setw(14) << st.peakMean
-                          << std::setw(14) << st.peakStd << std::setw(14) << st.peakMin << std::setw(14) << st.peakMax
-                          << std::fixed << std::setprecision(2) << std::setw(11) << cv << "%\n";
+            if (iObj.argSweep && !iObj.sweeps.empty()) {
+                std::cout << "\nJoSIM Parameter Sweep / Margin Summary (" << B << " sweep points):\n";
+                for (size_t d = 0; d < iObj.sweeps.size(); ++d) {
+                    const auto& sd = iObj.sweeps[d];
+                    if (!sd.values.empty()) {
+                        std::cout << "  Dim " << d << " (" << sd.target << "): " << sd.values.size() << " pts ["
+                                  << std::defaultfloat << std::setprecision(4) << sd.values.front() << " .. "
+                                  << sd.values.back() << "]" << (sd.isRelative ? " (relative scale)" : "") << "\n";
+                    }
+                }
+                const bool is1D = (iObj.sweeps.size() == 1 && static_cast<int64_t>(iObj.sweeps[0].values.size()) == B);
+                std::cout << "  " << std::left << std::setw(22) << "Trace" << std::right << std::setw(14) << "Peak Mean"
+                          << std::setw(14) << "Peak Min" << std::setw(14) << "Peak Max" << std::setw(10) << "Nom SFQ"
+                          << std::setw(12) << "Pass Pts" << (is1D ? "  Operating Window" : "") << "\n";
+                const int64_t maxShow = std::min<int64_t>(nTraces, 16);
+                for (int64_t idx = 0; idx < maxShow; ++idx) {
+                    const auto& st = stats[idx];
+                    std::cout << "  " << std::left << std::setw(22) << mObj.relevantTraces[idx].deviceLabel.value()
+                              << std::right << std::scientific << std::setprecision(4) << std::setw(14) << st.peakMean
+                              << std::setw(14) << st.peakMin << std::setw(14) << st.peakMax;
+                    if (st.isPhase) {
+                        std::ostringstream passStr;
+                        passStr << st.passCnt << "/" << B;
+                        std::cout << std::setw(10) << st.nomSfq << std::setw(12) << passStr.str();
+                        if (is1D) {
+                            const auto&  vals = iObj.sweeps[0].values;
+                            const double vLo  = vals[st.bLow];
+                            const double vHi  = vals[st.bHigh];
+                            std::cout << "  [" << std::defaultfloat << std::setprecision(4) << vLo << ", " << vHi
+                                      << "]";
+                            if (iObj.sweeps[0].isRelative) {
+                                std::cout << " (" << std::showpos << std::fixed << std::setprecision(1)
+                                          << (vLo - 1.0) * 100.0 << "%, " << (vHi - 1.0) * 100.0 << "%"
+                                          << std::noshowpos << ")";
+                            }
+                        }
+                    } else {
+                        std::cout << std::setw(10) << "-" << std::setw(12) << "-";
+                    }
+                    std::cout << "\n";
+                }
+                if (nTraces > maxShow) {
+                    std::cout << "  ... (" << (nTraces - maxShow) << " additional traces written to output)\n";
+                }
+                std::cout << "\n";
+            } else {
+                std::cout << "\nJoSIM Monte Carlo Robustness Summary (" << B << " trials):\n";
+                std::cout << "  " << std::left << std::setw(22) << "Trace" << std::right << std::setw(14) << "Peak Mean"
+                          << std::setw(14) << "Peak 1-Sigma" << std::setw(14) << "Peak Min" << std::setw(14)
+                          << "Peak Max" << std::setw(12) << "CV (%)" << "\n";
+                const int64_t maxShow = std::min<int64_t>(nTraces, 16);
+                for (int64_t idx = 0; idx < maxShow; ++idx) {
+                    const auto&  st = stats[idx];
+                    const double cv = (std::abs(st.peakMean) > 1e-18) ? (100.0 * st.peakStd / std::abs(st.peakMean))
+                                                                      : 0.0;
+                    std::cout << "  " << std::left << std::setw(22) << mObj.relevantTraces[idx].deviceLabel.value()
+                              << std::right << std::scientific << std::setprecision(4) << std::setw(14) << st.peakMean
+                              << std::setw(14) << st.peakStd << std::setw(14) << st.peakMin << std::setw(14)
+                              << st.peakMax << std::fixed << std::setprecision(2) << std::setw(11) << cv << "%\n";
+                }
+                if (nTraces > maxShow) {
+                    std::cout << "  ... (" << (nTraces - maxShow) << " additional traces written to output)\n";
+                }
+                std::cout << "\n";
             }
-            if (nTraces > maxShow) {
-                std::cout << "  ... (" << (nTraces - maxShow) << " additional traces written to output)\n";
-            }
-            std::cout << "\n";
         }
     } else if (mObj.relevantTraces.size() != 0) {
         // Create progress bar

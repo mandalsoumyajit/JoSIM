@@ -336,6 +336,33 @@ struct NodalRLEdgeStamp {
     int32_t nzIdxQP     = -1;
     int32_t nodalResIdx = -1;
     int32_t nodalIndIdx = -1;
+    int32_t origResIdx  = -1;
+    int32_t origIndIdx  = -1;
+};
+
+struct NodalCoupledIndStamp {
+    int32_t origIndIdx  = -1;
+    int32_t nodalIndIdx = -1;
+    int32_t diagCsrIdx  = -1;
+    double  diagBaseVal = 0.0;
+};
+
+struct NodalCoupledMutStamp {
+    int32_t origIndIdx1 = -1;
+    int32_t origIndIdx2 = -1;
+    int32_t nodalMutIdx = -1;
+    int32_t csrIdx      = -1;
+    double  baseVal     = 0.0;
+};
+
+struct TrialDeviceScales {
+    std::vector<double> indScale;
+    std::vector<double> resScale;
+    std::vector<double> capScale;
+    std::vector<double> jjScale;
+    std::vector<double> vsScale;
+    std::vector<double> psScale;
+    std::vector<double> csScale;
 };
 
 struct Nodal2TermStamp {
@@ -409,6 +436,7 @@ struct RollingCheckpoint {
 class Simulation {
   private:
     bool                SLU = false;
+    Input*              input_ = nullptr;
     std::vector<double> x_, b_;
     int64_t             simSize_;
     JoSIM::AnalysisType atyp_;
@@ -506,6 +534,8 @@ class Simulation {
     std::vector<std::pair<int32_t, double>> nodalScaleH_;
     std::vector<std::pair<int32_t, double>> nodalScaleInvH_;
     std::vector<NodalRLEdgeStamp>        nodalRLEdges_;
+    std::vector<NodalCoupledIndStamp>    nodalCoupledIndStamps_;
+    std::vector<NodalCoupledMutStamp>    nodalCoupledMutStamps_;
     std::vector<Nodal2TermStamp>         nodalCapStamps_;
     std::vector<Nodal2TermStamp>         nodalTxStamps_;
     std::vector<NodalRelTraceRef>        nodalRelTraceRefs_;
@@ -541,7 +571,9 @@ class Simulation {
     void solve_lu(Matrix& mObj);
     void free_lu();
     void trans_sim(Matrix& mObj);
+    void compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScales>& outScales);
     void trans_sim_mc(Matrix& mObj);
+    void trans_sim_mc_nodal(Matrix& mObj);
     void trans_sim_nodal(Matrix& mObj);
     void trans_sim_nodal_omp_windowed(Matrix& mObj);
     void trans_sim_omp_windowed(Matrix& mObj);

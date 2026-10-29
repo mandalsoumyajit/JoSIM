@@ -44,6 +44,18 @@ class Function {
 
     std::vector<double>&       ampValues() noexcept { return ampValues_; }
     const std::vector<double>& ampValues() const noexcept { return ampValues_; }
+    FunctionType               fType() const noexcept { return fType_; }
+
+    bool                       is_bias_like() const noexcept {
+        if (ampValues_.empty()) { return false; }
+        if (fType_ == FunctionType::DC) { return std::abs(ampValues_[0]) > 0.0; }
+        if (fType_ == FunctionType::PWL || fType_ == FunctionType::PWS) {
+            double maxA = 0.0;
+            for (double a : ampValues_) { maxA = std::max(maxA, std::abs(a)); }
+            return (maxA > 0.0 && std::abs(ampValues_.back()) >= 0.99 * maxA);
+        }
+        return false;
+    }
 
     void                       clearMisc() {
         miscValues_.clear();

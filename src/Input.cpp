@@ -260,6 +260,7 @@ void Input::parse_input(string_o fileName) {
     }
     // Sanity check all conrols for syntax and functionality
     syntax_check_controls(controls);
+    if (!parameters.empty()) { parse_parameters(parameters); }
     parse_options_and_state_controls();
     // Seed deterministic RNG streams (noise + spread) once per parsed run.
     if (auto seed = find_seed_option(); seed.has_value()) {
@@ -287,6 +288,7 @@ void Input::syntax_check_controls(std::vector<tokens_t>& controls) {
                                   "TEMP",
                                   "NEB",
                                   "SPREAD",
+                                  "SWEEP",
                                   "FILE",
                                   "IV",
                                   "OPTION",
@@ -341,6 +343,184 @@ uint32_t Input::parse_event_metrics(const std::string& spec, uint32_t currentMas
     return mask;
 }
 
+void Input::parse_sweep_tokens(const tokens_t& c) {
+    if (c.size() < 3) { return; }
+    SweepDim dim;
+    dim.target = c.at(1);
+    std::transform(dim.target.begin(), dim.target.end(), dim.target.begin(), ::toupper);
+
+    tokens_t t = c;
+    for (auto& s : t) {
+        std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+    }
+
+    size_t startIdx  = 2;
+    int64_t explicitN = 0;
+    if (t.at(2) == "MARGIN" || t.at(2) == "REL" || t.at(2) == "SCALE" || t.at(2) == "MULT") {
+        dim.mode       = SweepMode::Margin;
+        dim.isRelative = true;
+        startIdx       = 3;
+    } else if (t.at(2) == "LIST") {
+        dim.mode       = SweepMode::List;
+        dim.isRelative = (!dim.target.empty() && dim.target.front() == '@');
+        startIdx       = 3;
+    } else if (t.at(2) == "LIN") {
+        dim.mode       = SweepMode::Linear;
+        dim.isRelative = (!dim.target.empty() && dim.target.front() == '@');
+        startIdx       = 3;
+    } else {
+        dim.mode       = SweepMode::Linear;
+        dim.isRelative = (!dim.target.empty() && dim.target.front() == '@');
+        startIdx       = 2;
+    }
+
+    std::vector<double> numArgs;
+    for (size_t k = startIdx; k < t.size(); ++k) {
+        const std::string& tok = t.at(k);
+        if (tok == "REL" || tok == "MARGIN" || tok == "SCALE" || tok == "MULT") {
+            dim.isRelative = true;
+            continue;
+        }
+        if (tok == "ABS") {
+            dim.isRelative = false;
+            continue;
+        }
+        if (tok.rfind("N=", 0) == 0) {
+            explicitN = std::max<int64_t>(2, static_cast<int64_t>(std::llround(parse_param(tok.substr(2), parameters))));
+            continue;
+        }
+        if (tok.rfind("COUNT=", 0) == 0) {
+            explicitN = std::max<int64_t>(2, static_cast<int64_t>(std::llround(parse_param(tok.substr(6), parameters))));
+            continue;
+        }
+        if (tok.rfind("POINTS=", 0) == 0) {
+            explicitN = std::max<int64_t>(2, static_cast<int64_t>(std::llround(parse_param(tok.substr(7), parameters))));
+            continue;
+        }
+        double v = parse_param(tok, parameters);
+        if (std::isfinite(v)) { numArgs.push_back(v); }
+    }
+
+    auto push_linspace = [&](double a, double b, int64_t nPts) {
+        nPts = std::max<int64_t>(2, nPts);
+        dim.values.reserve(static_cast<size_t>(nPts));
+        for (int64_t idx = 0; idx < nPts; ++idx) {
+            dim.values.push_back(a + (b - a) * static_cast<double>(idx) / static_cast<double>(nPts - 1));
+        }
+    };
+    auto push_steps = [&](double a, double b, double st) {
+        if (std::abs(st) <= 0.0) {
+            dim.values.push_back(a);
+            return;
+        }
+        if ((b >= a && st < 0.0) || (b < a && st > 0.0)) { st = -st; }
+        const double tol = 1e-9 * std::abs(st);
+        for (int64_t idx = 0; idx < 100000; ++idx) {
+            const double v = a + static_cast<double>(idx) * st;
+            if ((st > 0.0 && v > b + tol) || (st < 0.0 && v < b - tol)) { break; }
+            dim.values.push_back(v);
+        }
+    };
+
+    if (dim.mode == SweepMode::List) {
+        dim.values = std::move(numArgs);
+    } else if (dim.mode == SweepMode::Margin) {
+        if (numArgs.size() == 1) {
+            const double  d    = std::abs(numArgs[0]);
+            const int64_t nPts = (explicitN > 0) ? explicitN : (argMcRuns > 1 ? argMcRuns : 11);
+            push_linspace(1.0 - d, 1.0 + d, nPts);
+        } else if (numArgs.size() == 2) {
+            if (explicitN == 0 && numArgs[1] >= 2.0 && std::floor(numArgs[1]) == numArgs[1]
+                && std::abs(numArgs[0]) < 1.0) {
+                const double  d    = std::abs(numArgs[0]);
+                const int64_t nPts = static_cast<int64_t>(std::llround(numArgs[1]));
+                push_linspace(1.0 - d, 1.0 + d, nPts);
+            } else {
+                double minVal = numArgs[0];
+                double maxVal = numArgs[1];
+                if (minVal < 0.0 && maxVal > 0.0 && std::abs(minVal) < 1.0 && maxVal < 1.0) {
+                    minVal += 1.0;
+                    maxVal += 1.0;
+                }
+                const int64_t nPts = (explicitN > 0) ? explicitN : (argMcRuns > 1 ? argMcRuns : 11);
+                push_linspace(minVal, maxVal, nPts);
+            }
+        } else if (numArgs.size() >= 3) {
+            double minVal = numArgs[0];
+            double maxVal = numArgs[1];
+            if (minVal < 0.0 && maxVal > 0.0 && std::abs(minVal) < 1.0 && maxVal < 1.0) {
+                minVal += 1.0;
+                maxVal += 1.0;
+            }
+            const double third = numArgs[2];
+            if (explicitN > 0) {
+                push_linspace(minVal, maxVal, explicitN);
+            } else if (third >= 2.0 && std::floor(third) == third) {
+                push_linspace(minVal, maxVal, static_cast<int64_t>(std::llround(third)));
+            } else {
+                push_steps(minVal, maxVal, third);
+            }
+        }
+    } else if (t.at(2) == "LIN") {
+        if (numArgs.size() >= 3) {
+            const double a = numArgs[0], b = numArgs[1], cVal = numArgs[2];
+            if (a >= 2.0 && std::floor(a) == a && !(cVal >= 2.0 && std::floor(cVal) == cVal && a < b)) {
+                push_linspace(b, cVal, static_cast<int64_t>(std::llround(a)));
+            } else {
+                push_linspace(a, b, static_cast<int64_t>(std::llround(cVal)));
+            }
+        } else if (numArgs.size() == 2) {
+            const int64_t nPts = (explicitN > 0) ? explicitN : (argMcRuns > 1 ? argMcRuns : 11);
+            push_linspace(numArgs[0], numArgs[1], nPts);
+        }
+    } else {
+        if (numArgs.size() >= 3) {
+            const double a = numArgs[0], b = numArgs[1], st = numArgs[2];
+            if (explicitN > 0) {
+                push_linspace(a, b, explicitN);
+            } else if (std::abs(st) > std::abs(b - a) && st >= 2.0 && std::floor(st) == st) {
+                push_linspace(a, b, static_cast<int64_t>(std::llround(st)));
+            } else {
+                push_steps(a, b, st);
+            }
+        } else if (numArgs.size() == 2) {
+            const int64_t nPts = (explicitN > 0) ? explicitN : (argMcRuns > 1 ? argMcRuns : 11);
+            push_linspace(numArgs[0], numArgs[1], nPts);
+        } else if (numArgs.size() == 1) {
+            dim.values.push_back(numArgs[0]);
+        }
+    }
+
+    if (dim.values.empty()) { return; }
+    for (auto& existing : sweeps) {
+        if (existing.target == dim.target) {
+            existing = std::move(dim);
+            argSweep = true;
+            return;
+        }
+    }
+    if (sweeps.size() < 2) {
+        sweeps.push_back(std::move(dim));
+        argSweep = true;
+    }
+}
+
+void Input::parse_sweep_spec(const std::string& spec) {
+    if (spec.empty()) { return; }
+    std::string cleaned = spec;
+    for (char& ch : cleaned) {
+        if (ch == ':' || ch == ',' || ch == ';') { ch = ' '; }
+    }
+    tokens_t toks = Misc::tokenize(cleaned);
+    if (toks.empty()) { return; }
+    std::string firstUpper = toks.front();
+    std::transform(firstUpper.begin(), firstUpper.end(), firstUpper.begin(), ::toupper);
+    if (firstUpper != "SWEEP") {
+        toks.insert(toks.begin(), "SWEEP");
+    }
+    parse_sweep_tokens(toks);
+}
+
 void Input::parse_options_and_state_controls() {
     auto resolve_path = [&](const std::string& raw) -> std::string {
         auto p = std::filesystem::path(raw);
@@ -359,6 +539,8 @@ void Input::parse_options_and_state_controls() {
             }
         } else if (c.front() == "LOADSTATE" || c.front() == "LOADBIAS") {
             if (c.size() >= 2) { loadStateFile = resolve_path(c.at(1)); }
+        } else if (c.front() == "SWEEP") {
+            parse_sweep_tokens(c);
         } else if (c.front() == "OPTION") {
             for (size_t k = 1; k < c.size(); ++k) {
                 const std::string& tok = c.at(k);
@@ -422,10 +604,13 @@ void Input::parse_options_and_state_controls() {
                     argMcRuns = std::max<int64_t>(1, static_cast<int64_t>(parse_param(tok.substr(6), parameters)));
                 } else if (tok.rfind("RUNS=", 0) == 0) {
                     argMcRuns = std::max<int64_t>(1, static_cast<int64_t>(parse_param(tok.substr(5), parameters)));
-                } else if (tok == "MCALL" || tok == "MCALL=1" || tok == "MCALL=TRUE") {
+                } else if (tok == "MCALL" || tok == "MCALL=1" || tok == "MCALL=TRUE" || tok == "SWEEPALL"
+                           || tok == "SWEEPALL=1" || tok == "SWEEPALL=TRUE") {
                     argMcAll = true;
-                } else if (tok == "MCALL=0" || tok == "MCALL=FALSE") {
+                } else if (tok == "MCALL=0" || tok == "MCALL=FALSE" || tok == "SWEEPALL=0" || tok == "SWEEPALL=FALSE") {
                     argMcAll = false;
+                } else if (tok.rfind("SWEEP=", 0) == 0) {
+                    parse_sweep_spec(tok.substr(6));
                 } else if (tok == "LUMPPTL" || tok == "LUMPPTL=1" || tok == "LUMPPTL=TRUE") {
                     argLumpPtl = true;
                 } else if (tok == "LUMPPTL=0" || tok == "LUMPPTL=FALSE" || tok == "NOLUMPPTL") {
@@ -487,6 +672,17 @@ void Input::parse_options_and_state_controls() {
                 }
             }
         }
+    }
+    for (const auto& s : cliSweeps) {
+        parse_sweep_spec(s);
+    }
+    if (!sweeps.empty()) {
+        int64_t totalSweepRuns = 1;
+        for (const auto& sd : sweeps) {
+            totalSweepRuns *= static_cast<int64_t>(sd.values.size());
+        }
+        argMcRuns = std::max<int64_t>(1, totalSweepRuns);
+        argSweep  = true;
     }
     if (argEvents) {
         bool hasFileControl = false;

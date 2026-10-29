@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace JoSIM {
 
@@ -35,6 +36,7 @@ struct CliOptions {
     bool                            events        = false;
     std::optional<std::string>      events_file;
     std::optional<std::string>      event_metrics;
+    std::vector<std::string>        sweeps;
     int64_t                         corrector     = 0;
     int64_t                         batchRuns     = 1;
     bool                            sanityCheck   = false;

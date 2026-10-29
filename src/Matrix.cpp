@@ -102,6 +102,7 @@ void Matrix::create_matrix(Input& iObj) {
             }
         }
     }
+    iObj.netlist.rawExpNetlist = iObj.netlist.expNetlist;
     while (needsTR_) {
         // Rewind RNG
         Rng::rewind();

@@ -27,9 +27,10 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
    - Drops unused JJ `variableIndex_` trace vectors from `relevantIndices`, folds exclusive `V(n1, n2)` and `P(n1, n2)` node-difference pairs into single difference vectors (`traceType = 4`), parallelizes NUMA trace allocation across OpenMP threads, and streams `.npy`/`.bin`/`.rawb` directly from `results.xVector` via a 64×8 L1 cache-tiled transpose without allocating `Output::traces`.
    - Cuts `adder` full-waveform peak RSS memory from **`26.5 GB` (`v2.6.5`) / `8.04 GB` to `1.72 GB` (`15.4x` lower vs `v2.6.5`, `4.67x` vs pre-Item 4)** and `coupler` peak RSS from **`7.4 GB` (`v2.6.5`) / `4.3 GB` to `1.42 GB`**.
    - **Built-In SFQ Switching Event & Pulse Metric Extractor (`-e [file]`, `-E [spec]`, `.option events`, `.option eventmetrics`):** Detects $2\pi$ Josephson phase-slip crossings across $(2k-1)\pi$ barriers with sub-step linear interpolation (`time`, `polarity`, `winding`, `phase`) and user-selectable pulse metrics (`t_peak`, `v_peak`, `fwhm`, `dt_pi`, `area`, and `time=peak` vs `time=cross`). When invoked without `-o` (**Events-Only Mode**), tracks events in-loop without allocating `results.xVector`, cutting `adder -p -n -e` to **`4.63 s` wall / `195 MB` RSS / `606 KB` `.events.npy` (`5,250x` smaller than `.npy`, `117.1x` faster than `v2.6.5`)** and `coupler -p -n -e` to **`2.58 s` wall / `216 MB` RSS / `512 KB` `.events.npy` (`2,503x` smaller)**.
-5. **Tier 2 Batched Monte Carlo (`.spread`) Robustness Solver (`-b <N>`, `.option mc=<N>`, `.option mcall`):**
-   - Parses and symbolically analyzes the netlist **once**, then executes $B = 32\text{–}4,096$ perturbed fabrication-yield trials simultaneously across OpenMP threads (`-p -b <N>`, **up to `31.1x` speedup**) or in a coalesced CUDA kernel (`-g -b <N>`, **up to `19.7x` speedup**).
-   - Computes Welford online ensemble statistics (`<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`) and prints a **Monte Carlo Robustness Summary** table. Fixed an upstream bug in `JJ.cpp` where default `area=1.0` junctions ignored `.spread`.
+5. **Tier 2 + Phase 5 Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Solver (`-b <N>`, `-p -n`, `-g`):**
+   - Parses and symbolically analyzes the netlist **once**, then executes $B = 2\text{–}4,096$ perturbed fabrication-yield trials (`.spread`) or deterministic 1D/2D parameter/margin sweep points (`.sweep`, `.option sweep=...`, `-S <spec>`) simultaneously across OpenMP threads with Batched Tier 4 Schur-Complement Nodal reduction (`-p -n`, **up to `83.7x` Monte Carlo speedup** and **`33.3x–51.8x` sweep speedup vs sequential MNA**), OpenMP MNA (`-p`, **up to `31.1x` speedup**), or a coalesced CUDA kernel (`-g`, **up to `19.7x` speedup**).
+   - Supports sweeping `.param` identifiers (re-evaluating all dependent parameter expressions and inline `{...}` expressions per sweep point), device categories (`@BIAS`, `@JJ`/`@B`, `@IND`/`@L`, `@RES`/`@R`, `@CAP`/`@C`, `@SRC`, `@ISRC`, `@VSRC`, `@PSRC`, `@GLOBAL`), and specific device labels or glob wildcards (`IB*`, `VBIAS*`, `B01*`, `L*`, `R*`) via linear steps (`<start> <stop> <step>` or `LIN <count> <start> <stop>`), relative margin windows (`MARGIN <delta> [<count>]`), explicit value lists (`LIST <v1> ... <vB>`), and 2D Cartesian products (two `.sweep` cards or two `-S` flags).
+   - Computes Welford online ensemble statistics (`<Trace>`, `<Trace>_STD`, `<Trace>_MIN`, `<Trace>_MAX`), optional per-point waveforms (`<Trace>_MC0 .. <Trace>_MC{B-1}` via `.option mcall` / `.option sweepall`), and prints a **Monte Carlo Robustness Summary** or **Parameter Sweep / Margin Summary** table with automatic SFQ operating pass/fail margin window detection around nominal $N_{\text{SFQ}} = \text{round}(\Delta\phi / 2\pi)$. Fixed an upstream bug in `JJ.cpp` where default `area=1.0` junctions ignored `.spread`.
 6. **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`, `.option gpu=3`):**
    - Keeps the entire transient loop in GPU VRAM with zero per-timestep PCIe transfers (**`2.5x–4.2x` GPU speedup** on 2D JJ arrays up to `65,536` JJs).
 7. **Single-Core Engine, Memory Footprint & Local Rollback Optimizations:**
@@ -75,12 +76,14 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
   ```
   Runs the entire transient loop in GPU VRAM via `cuSolverRF` (**`2.5x–4.2x` speedup** on `14k–65k` JJ 2D grids; `-g 4` is **`1.98x` faster than `-g 3`** when `RTYPE=1` junctions switch dynamically).
 
-- **5. Batched Monte Carlo (`.spread`) Yield Sweep (`-p -b <N>` or `-g -b <N>`):**
+- **5. Batched Monte Carlo (`.spread`) Yield Sweep & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`):**
   ```bash
-  JOSIM_SEED=42 josim-cli -p -b 256 -o yield.npy spread_deck.cir
+  JOSIM_SEED=42 josim-cli -p -n -b 256 -o yield.npy spread_deck.cir
   JOSIM_SEED=42 josim-cli -g -b 256 -o yield.npy spread_deck.cir
+  josim-cli -p -n -S "@BIAS:MARGIN:0.3:21" -o margin.npy deck.cir
+  josim-cli -p -n -S "Scaling:LIN:21:0.7:1.3" -o sweep.npy deck.cir
   ```
-  Solves $N$ perturbed fabrication-yield trials simultaneously in a single invocation (**`23x–31x` OpenMP speedup**, **`12x–20x` GPU speedup**—even on $P = 1$ monolithic circuits).
+  Solves $N$ perturbed fabrication-yield trials or deterministic 1D/2D parameter/margin sweep points simultaneously in a single invocation (**`23x–84x` OpenMP CPU speedup (`-p -n`)**, **`33x–52x` deterministic sweep speedup vs sequential MNA**, **`12x–20x` GPU speedup**—even on $P = 1$ monolithic circuits).
 
 ---
 
@@ -94,7 +97,8 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 | **`-n` / `--nodal`** | **New (`v2.8`)** | Tier 4 Schur-Complement Nodal Admittance solver ($2\times–6\times$ smaller matrix). |
 | **`-p` / `--parallel`** | **Enhanced (`v2.8`)** | Multi-core OpenMP solver (Windowed PTL blocks, large meshes, batched MC). Combine as `-p -n`. |
 | **`-g [1\|2\|3\|4]` / `--gpu=`** | **New (`v2.8`)** | CUDA GPU solver: `1` = Auto, `2` = Hybrid, `3` = `cuSolverRF` MNA, `4` = `cuSolverRF` Nodal. |
-| **`-b <N>` / `--batch=<N>`** | **New (`v2.8`)** | Tier 2 Batched Monte Carlo solver ($N$ simultaneous `.spread` trials). |
+| **`-b <N>` / `--batch=<N>`** | **New (`v2.8`)** | Tier 2 Batched Monte Carlo solver ($N$ simultaneous `.spread` trials; combine with `-p -n` for Batched Nodal). |
+| **`-S <spec>` / `--sweep=<spec>`** | **New (`v2.8`)** | Deterministic parameter/margin sweep (e.g. `-S "@BIAS:MARGIN:0.3:21"` or `-S "Scaling:LIN:21:0.7:1.3"`). Pass twice for 2D Cartesian grid. |
 | **`-o <file>` / `--output=`** | **Enhanced (`v2.8`)** | Output file: **`.npy`**, **`.bin`**, **`.rawb`** *(New binary formats)* or `.csv`, `.dat`, `.raw` *(Inherited)*. |
 | **`-e [file]` / `--events=`** | **New (`v2.8`)** | Extracts $2\pi$ SFQ phase-slip events to `.npy` or `.csv`. Without `-o`, runs in zero-allocation **Events-Only Mode**. |
 | **`-E [spec]` / `--event-metrics=`** | **New (`v2.8`)** | Selects SFQ pulse metrics: `pulse` (default: `t_peak,v_peak,fwhm,dt_pi`), `all` (`+area`), or comma-separated list including `time=peak` / `time=cross`. |
@@ -119,7 +123,10 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 | **`.option bypass`** | **New (`v2.8`)** | Skips `klu_l_tsolve` on quiescent PTL partitions in `-p` mode (alias: `.option latency`). |
 | **`.option bypasstol=<val>`** | **New (`v2.8`)** | Activity threshold for `.option bypass` (default `1e-12`). |
 | **`.option mc=<N>`** | **New (`v2.8`)** | Same as `-b <N>` or `.spread ... runs=<N>`. Runs `N` batched Monte Carlo trials. |
-| **`.option mcall`** | **New (`v2.8`)** | Appends individual `<Trace>_MC0 .. MC{N-1}` waveforms to batched Monte Carlo output. |
+| **`.option mcall`** | **New (`v2.8`)** | Appends individual `<Trace>_MC0 .. MC{N-1}` waveforms to batched Monte Carlo or `.sweep` output (alias: `.option sweepall`). |
+| **`.sweep <target> ...`** | **New (`v2.8`)** | Deterministic parameter/margin sweep card: `.sweep <target> <start> <stop> <step>`, `.sweep <target> LIN <count> <start> <stop>`, `.sweep <target> MARGIN <delta> [<count>]`, or `.sweep <target> LIST <v1> ... <vB>`. Use two `.sweep` cards for a 2D Cartesian grid. |
+| **`.option sweep=<spec>`** | **New (`v2.8`)** | Same as `-S <spec>` / `.sweep` (e.g. `.option sweep=@BIAS:MARGIN:0.3:21`). |
+| **`.option sweepall`** | **New (`v2.8`)** | Same as `.option mcall`. Appends individual `<Trace>_MC0 .. MC{B-1}` sweep waveforms to output. |
 | **`.savestate <f> [t]`** | **New (`v2.8`)** | Saves full simulator & PTL state to binary file `<f>` at time `t` (alias: `.savebias`). |
 | **`.loadstate <f>`** | **New (`v2.8`)** | Restores simulator & PTL state from `<f>` at $t=0$ (alias: `.loadbias`). |
 | **`.option txinterp`** | **New (`v2.8`)** | Linearly interpolates fractional PTL delays (or per-line `interp=1`; alias: `.option fractx`). |
@@ -214,7 +221,7 @@ Reproducible via [`scripts/benchmark_gpu_exxact.py`](../scripts/benchmark_gpu_ex
 
 ---
 
-### D. Tier 2 Batched Monte Carlo (`.spread`) Yield Benchmarks (`BNL exxact`)
+### D. Tier 2 + Phase 5 Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Benchmarks (`BNL exxact`)
 
 Reproducible via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxact.py):
 
@@ -227,3 +234,14 @@ Reproducible via [`scripts/benchmark_mc_exxact.py`](../scripts/benchmark_mc_exxa
 | **`ex_ksa4bit`** (4-bit KSA Adder, 695 JJs) | 66 | 64 | 51.25 s | **2.04 s** | **4.31 s** | **25.07x** | **11.89x** |
 | **`ex_ksa4bit`** (4-bit KSA Adder, 695 JJs) | 66 | 256 | 204.24 s | **6.56 s** | **10.39 s** | **31.14x** | **19.65x** |
 | **`RSFQ-Pipeline-64B`** (2,048 JJs, 4.85M eqns) | 64 | 256 | 48.57 s | **1.68 s** | **3.19 s** | **28.87x** | **15.21x** |
+
+#### Batched Tier 4 Nodal (`-p -n`) & 64-Point Deterministic Parameter/Margin Sweeps (`.sweep`, `-S`) (`BNL exxact`)
+
+Combining Batched Nodal reduction (`Simulation::trans_sim_mc_nodal`, `-p -n`) with deterministic parameter/margin sweeps (`-S "@BIAS:MARGIN:0.25:64"`, `.sweep Scaling LIN 21 0.7 1.3`) or Monte Carlo (`-b 64`) achieves **`0.000e+00`–`1.000e-14` waveform parity** across MNA, Nodal, and GPU, automatically extracts the SFQ operating margin window (`Nom SFQ`, `Pass Pts`, `[vLo, vHi]`), and accelerates 64-point sweeps by **`33.3x–51.8x` over 64 sequential MNA runs** (**`1.46x–1.84x` faster than Batched MNA**):
+
+| Circuit | 1x MNA | 1x Nodal (`-n`) | 64x Seq MNA Est. | **64-pt Sweep MNA (`-p`)** | **64-pt Sweep Nodal (`-p -n`)** | **64-trial MC MNA (`-p -b 64`)** | **64-trial MC Nodal (`-p -n -b 64`)** | **Sweep Speedup vs 64x Seq MNA** | **Nodal vs Batched MNA** |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :---: |
+| **`ex_mitll_dff_wr` (`23` JJs)** | `67.7 ms` | `59.7 ms` | `4,330.2 ms` | `122.1 ms` (`35.5x`) | **`83.6 ms`** | `127.7 ms` | **`93.0 ms`** | **`51.8x`** | **`1.46x` / `1.37x`** |
+| **`ex_ksa4bit` (`518` JJs)** | `1,508.5 ms` | `709.2 ms` | `96,542.2 ms` | `5,011.3 ms` (`19.3x`) | **`2,779.9 ms`** | `2,001.9 ms` | **`1,087.7 ms`** | **`34.7x`** | **`1.80x` / `1.84x`** |
+| **`ex_jtl_string` (`2,000` JJs)** | `2,363.7 ms` | `1,103.6 ms` | `151,274.6 ms` | — | **`4,541.0 ms`** | — | **`1,807.6 ms`** (`83.7x`) | **`33.3x`** | **`15.6x` vs 64x Seq Nodal** |
+

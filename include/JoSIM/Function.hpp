@@ -46,16 +46,38 @@ class Function {
     const std::vector<double>& ampValues() const noexcept { return ampValues_; }
     FunctionType               fType() const noexcept { return fType_; }
 
-    bool                       is_bias_like() const noexcept {
-        if (ampValues_.empty()) { return false; }
-        if (fType_ == FunctionType::DC) { return std::abs(ampValues_[0]) > 0.0; }
+    const char*                bias_rule() const noexcept {
+        if (ampValues_.empty()) { return nullptr; }
+        if (fType_ == FunctionType::DC) { return (std::abs(ampValues_[0]) > 0.0) ? "dc" : nullptr; }
         if (fType_ == FunctionType::PWL || fType_ == FunctionType::PWS) {
             double maxA = 0.0;
             for (double a : ampValues_) { maxA = std::max(maxA, std::abs(a)); }
-            return (maxA > 0.0 && std::abs(ampValues_.back()) >= 0.99 * maxA);
+            if (maxA <= 0.0) { return nullptr; }
+            if (ampValues_.size() >= 2 && std::abs(ampValues_.back()) > 0.0
+                && std::abs(ampValues_.back() - ampValues_[ampValues_.size() - 2])
+                           <= 1e-12 * std::abs(ampValues_.back())) {
+                return "waveform-plateau";
+            }
+            if (std::abs(ampValues_.back()) >= 0.99 * maxA) { return "waveform-peak"; }
+            if (ampValues_.size() >= 3 && std::abs(ampValues_.back()) >= 0.75 * maxA) {
+                const double sign    = (ampValues_.back() >= 0.0) ? 1.0 : -1.0;
+                bool         seenOn  = false;
+                bool         staysOn = true;
+                for (double a : ampValues_) {
+                    if (!seenOn) {
+                        if (sign * a >= 0.5 * maxA) { seenOn = true; }
+                    } else if (sign * a < 0.5 * maxA) {
+                        staysOn = false;
+                        break;
+                    }
+                }
+                if (seenOn && staysOn) { return "waveform-sustained"; }
+            }
         }
-        return false;
+        return nullptr;
     }
+
+    bool                       is_bias_like() const noexcept { return bias_rule() != nullptr; }
 
     void                       clearMisc() {
         miscValues_.clear();

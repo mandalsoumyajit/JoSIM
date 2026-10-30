@@ -65,6 +65,7 @@ class Input {
     bool                                                         argGpu          = false;
     int64_t                                                      argGpuMode      = 1;
     bool                                                         argNodal        = false;
+    int64_t                                                      argNodalLevel   = 0;
     bool                                                         argBypass       = false;
     double                                                       argBypassTol    = 1e-6;
     bool                                                         argFixedStep    = false;

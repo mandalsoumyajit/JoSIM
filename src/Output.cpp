@@ -512,6 +512,8 @@ Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
         }
     }
     if (!iObj.cli_output_file && iObj.output_files.empty()) { format_cout(iObj.argMin); }
+    sObj.results.mcTraceOut.clear();
+    sObj.results.mcTraceOut.shrink_to_fit();
 }
 
 void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
@@ -594,17 +596,20 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                 traces.emplace_back(make_mc_label(label, suffixes[s]));
                 traces.back().fileIndex = i.fIndex;
                 traces.back().type_     = tChar;
-                traces.back().data_.resize(nPrint, 0.0);
             }
             if (iObj.argMcAll) {
                 for (int64_t b = 0; b < B; ++b) {
                     traces.emplace_back(make_mc_label(label, "_MC" + std::to_string(b)));
                     traces.back().fileIndex = i.fIndex;
                     traces.back().type_     = tChar;
-                    traces.back().data_.resize(nPrint, 0.0);
                 }
             }
         }
+
+        const bool isIdentityPrint = (firsize == 1 && nPrint == static_cast<size_t>(nKept)
+                                      && (nPrint == 0
+                                          || (result_indices.front() == 0
+                                              && result_indices.back() == static_cast<int64_t>(nKept - 1))));
 
         struct McStat {
             double  peakMean = 0.0;
@@ -627,6 +632,10 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
             auto&         trStd    = traces[baseSlot + 1].data_;
             auto&         trMin    = traces[baseSlot + 2].data_;
             auto&         trMax    = traces[baseSlot + 3].data_;
+            trMean.resize(nPrint, 0.0);
+            trStd.resize(nPrint, 0.0);
+            trMin.resize(nPrint, 0.0);
+            trMax.resize(nPrint, 0.0);
 
             const int64_t i1   = i.index1.has_value() ? i.index1.value() : -1;
             const int64_t i2   = i.index2.has_value() ? i.index2.value() : -1;
@@ -642,11 +651,32 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                                          : -1;
             const size_t xsize = std::min<size_t>(t.size(), static_cast<size_t>(nKept));
 
+            Function localSrc;
+            bool     isISrc = (st == StorageType::Current && i.deviceLabel.value().at(3) == 'I');
+            if (isISrc) { localSrc = mObj.sourcegen.at(i.sourceIndex.value()); }
+
+            int32_t directSlot = -1;
+            if (isIdentityPrint) {
+                if (st == StorageType::Phase && iObj.argAnal == AnalysisType::Phase && s1 >= 0 && s2 < 0) {
+                    directSlot = s1;
+                } else if (st == StorageType::Phase && iObj.argAnal == AnalysisType::Voltage
+                           && i.deviceLabel.value().at(3) == 'B' && sv >= 0) {
+                    directSlot = sv;
+                } else if (st == StorageType::Voltage && iObj.argAnal == AnalysisType::Voltage && s1 >= 0 && s2 < 0) {
+                    directSlot = s1;
+                } else if (st == StorageType::Voltage && iObj.argAnal == AnalysisType::Phase
+                           && i.deviceLabel.value().at(3) == 'B' && sv >= 0) {
+                    directSlot = sv;
+                } else if (st == StorageType::Current && !isISrc && s1 >= 0) {
+                    directSlot = s1;
+                }
+            }
+
             std::vector<double>  meanVec(nPrint, 0.0);
             std::vector<double>  m2Vec(nPrint, 0.0);
             std::vector<double>  vMin(nPrint, 1e300);
             std::vector<double>  vMax(nPrint, -1e300);
-            std::vector<double>  trialWave(nPrint, 0.0);
+            std::vector<double>  trialWave(directSlot >= 0 ? 0 : nPrint, 0.0);
             std::vector<int64_t> trialSfq(B, 0);
             std::vector<double>  vectphase;
             if (st == StorageType::Phase && iObj.argAnal == AnalysisType::Voltage
@@ -654,14 +684,16 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                 vectphase.resize(xsize, 0.0);
             }
 
-            Function localSrc;
-            bool     isISrc = (st == StorageType::Current && i.deviceLabel.value().at(3) == 'I');
-            if (isISrc) { localSrc = mObj.sourcegen.at(i.sourceIndex.value()); }
-
             for (int64_t b = 0; b < B; ++b) {
                 const double* p1 = (s1 >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + s1) * nKept) : nullptr;
                 const double* p2 = (s2 >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + s2) * nKept) : nullptr;
                 const double* pv = (sv >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + sv) * nKept) : nullptr;
+
+                const double* wavePtr = nullptr;
+                if (directSlot >= 0) {
+                    wavePtr = sObj.results.mcTraceOut.data() + (b * nRows + directSlot) * nKept;
+                    if (iObj.argMcAll) { traces[baseSlot + 4 + b].extData_ = wavePtr; }
+                } else {
 
                 if (st == StorageType::Voltage) {
                     for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
@@ -778,15 +810,17 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                         trialWave[pIdx] = acc;
                     }
                 }
-
+                wavePtr = trialWave.data();
                 if (iObj.argMcAll) { traces[baseSlot + 4 + b].data_ = trialWave; }
+                }
+
                 if (st == StorageType::Phase && nPrint > 0) {
-                    const double dPhi = trialWave.back() - trialWave.front();
+                    const double dPhi = wavePtr[nPrint - 1] - wavePtr[0];
                     trialSfq[b]       = static_cast<int64_t>(std::llround(dPhi / (2.0 * Constants::PI)));
                 }
                 const double invCount = 1.0 / static_cast<double>(b + 1);
                 for (size_t pIdx = 0; pIdx < nPrint; ++pIdx) {
-                    const double v      = trialWave[pIdx];
+                    const double v      = wavePtr[pIdx];
                     const double delta  = v - meanVec[pIdx];
                     meanVec[pIdx]      += delta * invCount;
                     const double delta2 = v - meanVec[pIdx];
@@ -862,6 +896,11 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
 #endif
         {
             for (int64_t idx = 0; idx < nTraces; ++idx) { process_mc_trace(idx); }
+        }
+
+        if (!iObj.argMcAll) {
+            sObj.results.mcTraceOut.clear();
+            sObj.results.mcTraceOut.shrink_to_fit();
         }
 
         if (!iObj.argMin && nTraces > 0) {
@@ -1234,7 +1273,7 @@ void Output::format_csv_or_dat(const std::string& filename, const char& delimite
         }
         outfile << std::scientific << std::setprecision(6);
         std::vector<const double*> colPtrs(numCols);
-        for (size_t i = 0; i < numCols; ++i) { colPtrs[i] = traces[tIndices[i]].data_.data(); }
+        for (size_t i = 0; i < numCols; ++i) { colPtrs[i] = traces[tIndices[i]].data_ptr(); }
         for (size_t j = 0; j < numRows; ++j) {
             if (!argmin) { bar.update(static_cast<float>(j)); }
             for (size_t i = 0; i < numCols - 1; ++i) {
@@ -1297,7 +1336,7 @@ void Output::format_bin(const std::string& filename, bool argmin, int64_t fIndex
     const std::streamsize colBytes = static_cast<std::streamsize>(numRows * sizeof(double));
     for (size_t c = 0; c < numCols; ++c) {
         if (!argmin) { bar.update(static_cast<float>(c)); }
-        outfile.write(reinterpret_cast<const char*>(traces[tIndices[c]].data_.data()), colBytes);
+        outfile.write(reinterpret_cast<const char*>(traces[tIndices[c]].data_ptr()), colBytes);
     }
     if (!argmin) {
         bar.complete();
@@ -1362,7 +1401,7 @@ void Output::format_npy(const std::string& filename, bool argmin, int64_t fIndex
     outfile.write(dict.data(), static_cast<std::streamsize>(dict.size()));
 
     std::vector<const double*> colPtrs(numCols);
-    for (size_t c = 0; c < numCols; ++c) { colPtrs[c] = traces[tIndices[c]].data_.data(); }
+    for (size_t c = 0; c < numCols; ++c) { colPtrs[c] = traces[tIndices[c]].data_ptr(); }
 
     constexpr size_t    R_TILE       = 64;
     constexpr size_t    C_TILE       = 8;
@@ -1435,7 +1474,7 @@ void Output::format_raw_bin(const std::string& filename, bool argmin, int64_t fI
     outfile << "Binary:\n";
 
     std::vector<const double*> colPtrs(numCols);
-    for (size_t c = 0; c < numCols; ++c) { colPtrs[c] = traces[tIndices[c]].data_.data(); }
+    for (size_t c = 0; c < numCols; ++c) { colPtrs[c] = traces[tIndices[c]].data_ptr(); }
 
     constexpr size_t    R_TILE       = 64;
     constexpr size_t    C_TILE       = 8;
@@ -1531,8 +1570,8 @@ void Output::format_raw(const std::string& filename, bool argmin, int64_t fIndex
                 outfile << std::left << std::setw(pointSizeSpacing) << i << traces.at(0).data_.at(i) << "\n";
                 // Fill in rest of variable values
                 for (auto j = 1; j < tIndices.size(); ++j) {
-                    outfile << std::left << std::setw(pointSizeSpacing) << "" << traces.at(tIndices.at(j)).data_.at(i)
-                            << "\n";
+                    outfile << std::left << std::setw(pointSizeSpacing) << ""
+                            << traces.at(tIndices.at(j)).data_ptr()[i] << "\n";
                 }
             }
             if (!argmin) {
@@ -1558,11 +1597,11 @@ void Output::format_cout(const bool& argMin) {
         std::cout << traces.at(traces.size() - 1).name_ << "\n";
         for (auto j = 0; j < traces.at(0).data_.size(); ++j) {
             for (auto i = 0; i < traces.size() - 1; ++i) {
-                std::cout << std::setw(15) << std::scientific << std::setprecision(6) << traces.at(i).data_.at(j)
+                std::cout << std::setw(15) << std::scientific << std::setprecision(6) << traces.at(i).data_ptr()[j]
                           << " ";
             }
             std::cout << std::setw(15) << std::scientific << std::setprecision(6)
-                      << traces.at(traces.size() - 1).data_.at(j) << "\n";
+                      << traces.at(traces.size() - 1).data_ptr()[j] << "\n";
         }
     }
 }
@@ -1619,63 +1658,204 @@ void Output::write_events(const Input& iObj, Matrix& mObj, Simulation& sObj) {
     std::vector<SfqEvent>    allEvents;
     size_t                   maxNameLen = 1;
 
-    for (size_t tIdx = 0; tIdx < traceListPtr->size(); ++tIdx) {
-        const auto& tr = (*traceListPtr)[tIdx];
-        if (tr.storageType != StorageType::Phase) { continue; }
-        std::string name = tr.deviceLabel.value_or("P");
-        name.erase(std::remove(name.begin(), name.end(), '\"'), name.end());
-        const int32_t phaseTraceId = static_cast<int32_t>(traceNames.size());
-        traceNames.push_back(name);
-        maxNameLen = std::max(maxNameLen, name.size());
-
-        int64_t singleRow = -1;
-        if (tr.variableIndex.has_value() && !tr.index1.has_value() && !tr.index2.has_value()) {
-            singleRow = *tr.variableIndex;
-        } else if (tr.index1.has_value() && !tr.index2.has_value() && !tr.variableIndex.has_value()) {
-            singleRow = *tr.index1;
-        } else if (!tr.index1.has_value() && tr.index2.has_value() && !tr.variableIndex.has_value()) {
-            singleRow = *tr.index2;
-        }
-
-        if (sObj.eventsOnly_ && singleRow >= 0 && singleRow < static_cast<int64_t>(sObj.useEventTracker_.size())
-            && sObj.useEventTracker_[singleRow]) {
-            const auto& evs = sObj.eventTrackers_[singleRow].events;
-            for (const auto& ev : evs) {
-                SfqEvent copyEv = ev;
-                copyEv.traceId  = phaseTraceId;
-                allEvents.push_back(copyEv);
+    const int64_t B = sObj.results.mcRuns;
+    if (B > 1 && sObj.eventsOnly_ && !sObj.mcEventTrackers_.empty()) {
+        for (size_t tIdx = 0; tIdx < traceListPtr->size(); ++tIdx) {
+            const auto& tr = (*traceListPtr)[tIdx];
+            if (tr.storageType != StorageType::Phase) { continue; }
+            std::string baseName = tr.deviceLabel.value_or("P");
+            baseName.erase(std::remove(baseName.begin(), baseName.end(), '\"'), baseName.end());
+            for (int64_t b = 0; b < B; ++b) {
+                std::string   name         = baseName + "_MC" + std::to_string(b);
+                const int32_t phaseTraceId = static_cast<int32_t>(traceNames.size());
+                traceNames.push_back(name);
+                maxNameLen = std::max(maxNameLen, name.size());
+                if (static_cast<size_t>(b) < sObj.mcEventTrackers_.size()
+                    && tIdx < sObj.mcEventTrackers_[b].size()) {
+                    const auto& evs = sObj.mcEventTrackers_[b][tIdx].events;
+                    for (const auto& ev : evs) {
+                        SfqEvent copyEv = ev;
+                        copyEv.traceId  = phaseTraceId;
+                        allEvents.push_back(copyEv);
+                    }
+                }
             }
-            continue;
         }
-
-        const double* p1 = (tr.index1 && *tr.index1 >= 0 && *tr.index1 < static_cast<int64_t>(x.size()) && x[*tr.index1])
-                                   ? x[*tr.index1]->data()
-                                   : nullptr;
-        const double* p2 = (tr.index2 && *tr.index2 >= 0 && *tr.index2 < static_cast<int64_t>(x.size()) && x[*tr.index2])
-                                   ? x[*tr.index2]->data()
-                                   : nullptr;
-        const double* pv = (tr.variableIndex && *tr.variableIndex >= 0
-                            && *tr.variableIndex < static_cast<int64_t>(x.size()) && x[*tr.variableIndex])
-                                   ? x[*tr.variableIndex]->data()
-                                   : nullptr;
-
-        if (result_indices.empty()) { continue; }
-        InLoopEventTracker trk;
-        trk.traceId = phaseTraceId;
-        trk.sign    = 1;
-        trk.init_metrics(iObj.argEventMetrics);
-        for (size_t r = 0; r < result_indices.size(); ++r) {
-            const int64_t j   = result_indices[r];
-            double        phi = 0.0;
-            if (iObj.argAnal == AnalysisType::Voltage && pv != nullptr) {
-                phi = pv[j];
-            } else {
-                phi = (p1 ? p1[j] : 0.0) - (p2 ? p2[j] : 0.0);
+        if (iObj.argEventsOnly && !iObj.argMin && iObj.argSweep && !iObj.sweeps.empty()) {
+            std::cout << "\nJoSIM Parameter Sweep / Margin Summary (" << B << " sweep points, events-only):\n";
+            for (size_t d = 0; d < iObj.sweeps.size(); ++d) {
+                const auto& sd = iObj.sweeps[d];
+                if (!sd.values.empty()) {
+                    std::cout << "  Dim " << d << " (" << sd.target << "): " << sd.values.size() << " pts ["
+                              << std::defaultfloat << std::setprecision(4) << sd.values.front() << " .. "
+                              << sd.values.back() << "]" << (sd.isRelative ? " (relative scale)" : "") << "\n";
+                }
             }
-            trk.step(t[j], phi, iObj.argEventMetrics);
+            const bool is1D = (iObj.sweeps.size() == 1 && static_cast<int64_t>(iObj.sweeps[0].values.size()) == B);
+            int64_t    bNom = B / 2;
+            auto       find_nom = [](const SweepDim& sd) -> int64_t {
+                if (sd.values.empty()) { return 0; }
+                if (sd.isRelative) {
+                    int64_t best = 0;
+                    for (size_t k = 1; k < sd.values.size(); ++k) {
+                        if (std::abs(sd.values[k] - 1.0) < std::abs(sd.values[best] - 1.0)) {
+                            best = static_cast<int64_t>(k);
+                        }
+                    }
+                    return best;
+                }
+                return static_cast<int64_t>(sd.values.size() / 2);
+            };
+            if (iObj.sweeps.size() == 1) {
+                bNom = std::clamp<int64_t>(find_nom(iObj.sweeps[0]), 0, B - 1);
+            } else if (iObj.sweeps.size() >= 2) {
+                const int64_t n1 = static_cast<int64_t>(iObj.sweeps[1].values.size());
+                bNom = std::clamp<int64_t>(find_nom(iObj.sweeps[0]) * n1 + find_nom(iObj.sweeps[1]), 0, B - 1);
+            }
+            std::cout << "  " << std::left << std::setw(22) << "Trace" << std::right << std::setw(10) << "Nom SFQ"
+                      << std::setw(12) << "Pass Pts" << (is1D ? "  Operating Window" : "") << "\n";
+            int64_t shown = 0;
+            for (size_t tIdx = 0; tIdx < traceListPtr->size() && shown < 16; ++tIdx) {
+                const auto& tr = (*traceListPtr)[tIdx];
+                if (tr.storageType != StorageType::Phase) { continue; }
+                ++shown;
+                std::vector<int64_t> trialSfq(B, 0);
+                for (int64_t b = 0; b < B; ++b) {
+                    const auto&  trk  = sObj.mcEventTrackers_[b][tIdx];
+                    const double dPhi = trk.initialized ? (trk.prevPhi - trk.firstPhi) : 0.0;
+                    trialSfq[b]       = static_cast<int64_t>(std::llround(dPhi / (2.0 * Constants::PI)));
+                }
+                const int64_t refSfq  = trialSfq[bNom];
+                int64_t       passCnt = 0;
+                for (int64_t b = 0; b < B; ++b) {
+                    if (trialSfq[b] == refSfq) { ++passCnt; }
+                }
+                int64_t lo = bNom, hi = bNom;
+                while (lo > 0 && trialSfq[lo - 1] == refSfq) { --lo; }
+                while (hi + 1 < B && trialSfq[hi + 1] == refSfq) { ++hi; }
+                std::ostringstream passStr;
+                passStr << passCnt << "/" << B;
+                std::cout << "  " << std::left << std::setw(22) << tr.deviceLabel.value() << std::right
+                          << std::setw(10) << refSfq << std::setw(12) << passStr.str();
+                if (is1D) {
+                    const auto&  vals = iObj.sweeps[0].values;
+                    const double vLo  = vals[lo];
+                    const double vHi  = vals[hi];
+                    std::cout << "  [" << std::defaultfloat << std::setprecision(4) << vLo << ", " << vHi << "]";
+                    if (iObj.sweeps[0].isRelative) {
+                        std::cout << " (" << std::showpos << std::fixed << std::setprecision(1) << (vLo - 1.0) * 100.0
+                                  << "%, " << (vHi - 1.0) * 100.0 << "%" << std::noshowpos << ")";
+                    }
+                }
+                std::cout << "\n";
+            }
+            std::cout << "\n";
         }
-        trk.finalize(iObj.argEventMetrics);
-        allEvents.insert(allEvents.end(), trk.events.begin(), trk.events.end());
+    } else if (B > 1 && !sObj.results.mcTraceOut.empty() && !result_indices.empty()) {
+        const int64_t nRows = sObj.results.mcNumRows;
+        const int64_t nKept = sObj.results.mcNumKeptSteps;
+        for (size_t tIdx = 0; tIdx < traceListPtr->size(); ++tIdx) {
+            const auto& tr = (*traceListPtr)[tIdx];
+            if (tr.storageType != StorageType::Phase) { continue; }
+            std::string baseName = tr.deviceLabel.value_or("P");
+            baseName.erase(std::remove(baseName.begin(), baseName.end(), '\"'), baseName.end());
+            const int32_t s1 = (tr.index1 && *tr.index1 >= 0
+                                && *tr.index1 < static_cast<int64_t>(sObj.results.mcRowToSlot.size()))
+                                       ? sObj.results.mcRowToSlot[*tr.index1]
+                                       : -1;
+            const int32_t s2 = (tr.index2 && *tr.index2 >= 0
+                                && *tr.index2 < static_cast<int64_t>(sObj.results.mcRowToSlot.size()))
+                                       ? sObj.results.mcRowToSlot[*tr.index2]
+                                       : -1;
+            const int32_t sv = (tr.variableIndex && *tr.variableIndex >= 0
+                                && *tr.variableIndex < static_cast<int64_t>(sObj.results.mcRowToSlot.size()))
+                                       ? sObj.results.mcRowToSlot[*tr.variableIndex]
+                                       : -1;
+            for (int64_t b = 0; b < B; ++b) {
+                std::string   name         = baseName + "_MC" + std::to_string(b);
+                const int32_t phaseTraceId = static_cast<int32_t>(traceNames.size());
+                traceNames.push_back(name);
+                maxNameLen = std::max(maxNameLen, name.size());
+                const double* p1 = (s1 >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + s1) * nKept) : nullptr;
+                const double* p2 = (s2 >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + s2) * nKept) : nullptr;
+                const double* pv = (sv >= 0) ? (sObj.results.mcTraceOut.data() + (b * nRows + sv) * nKept) : nullptr;
+                InLoopEventTracker trk;
+                trk.traceId = phaseTraceId;
+                trk.sign    = 1;
+                trk.init_metrics(iObj.argEventMetrics);
+                for (size_t r = 0; r < result_indices.size(); ++r) {
+                    const int64_t j   = result_indices[r];
+                    double        phi = 0.0;
+                    if (iObj.argAnal == AnalysisType::Voltage && pv != nullptr) {
+                        phi = pv[j];
+                    } else {
+                        phi = (p1 ? p1[j] : 0.0) - (p2 ? p2[j] : 0.0);
+                    }
+                    trk.step(t[j], phi, iObj.argEventMetrics);
+                }
+                trk.finalize(iObj.argEventMetrics);
+                allEvents.insert(allEvents.end(), trk.events.begin(), trk.events.end());
+            }
+        }
+    } else {
+        for (size_t tIdx = 0; tIdx < traceListPtr->size(); ++tIdx) {
+            const auto& tr = (*traceListPtr)[tIdx];
+            if (tr.storageType != StorageType::Phase) { continue; }
+            std::string name = tr.deviceLabel.value_or("P");
+            name.erase(std::remove(name.begin(), name.end(), '\"'), name.end());
+            const int32_t phaseTraceId = static_cast<int32_t>(traceNames.size());
+            traceNames.push_back(name);
+            maxNameLen = std::max(maxNameLen, name.size());
+
+            int64_t singleRow = -1;
+            if (tr.variableIndex.has_value() && !tr.index1.has_value() && !tr.index2.has_value()) {
+                singleRow = *tr.variableIndex;
+            } else if (tr.index1.has_value() && !tr.index2.has_value() && !tr.variableIndex.has_value()) {
+                singleRow = *tr.index1;
+            } else if (!tr.index1.has_value() && tr.index2.has_value() && !tr.variableIndex.has_value()) {
+                singleRow = *tr.index2;
+            }
+
+            if (sObj.eventsOnly_ && singleRow >= 0 && singleRow < static_cast<int64_t>(sObj.useEventTracker_.size())
+                && sObj.useEventTracker_[singleRow]) {
+                const auto& evs = sObj.eventTrackers_[singleRow].events;
+                for (const auto& ev : evs) {
+                    SfqEvent copyEv = ev;
+                    copyEv.traceId  = phaseTraceId;
+                    allEvents.push_back(copyEv);
+                }
+                continue;
+            }
+
+            const double* p1 = (tr.index1 && *tr.index1 >= 0 && *tr.index1 < static_cast<int64_t>(x.size()) && x[*tr.index1])
+                                       ? x[*tr.index1]->data()
+                                       : nullptr;
+            const double* p2 = (tr.index2 && *tr.index2 >= 0 && *tr.index2 < static_cast<int64_t>(x.size()) && x[*tr.index2])
+                                       ? x[*tr.index2]->data()
+                                       : nullptr;
+            const double* pv = (tr.variableIndex && *tr.variableIndex >= 0
+                                && *tr.variableIndex < static_cast<int64_t>(x.size()) && x[*tr.variableIndex])
+                                       ? x[*tr.variableIndex]->data()
+                                       : nullptr;
+
+            if (result_indices.empty()) { continue; }
+            InLoopEventTracker trk;
+            trk.traceId = phaseTraceId;
+            trk.sign    = 1;
+            trk.init_metrics(iObj.argEventMetrics);
+            for (size_t r = 0; r < result_indices.size(); ++r) {
+                const int64_t j   = result_indices[r];
+                double        phi = 0.0;
+                if (iObj.argAnal == AnalysisType::Voltage && pv != nullptr) {
+                    phi = pv[j];
+                } else {
+                    phi = (p1 ? p1[j] : 0.0) - (p2 ? p2[j] : 0.0);
+                }
+                trk.step(t[j], phi, iObj.argEventMetrics);
+            }
+            trk.finalize(iObj.argEventMetrics);
+            allEvents.insert(allEvents.end(), trk.events.begin(), trk.events.end());
+        }
     }
 
     std::stable_sort(allEvents.begin(), allEvents.end(), [](const SfqEvent& a, const SfqEvent& b) {

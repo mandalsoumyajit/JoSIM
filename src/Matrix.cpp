@@ -198,14 +198,17 @@ void Matrix::create_components(Input& iObj) {
         bar.set_status_text("Creating Matrix");
         bar.set_total((float) iObj.netlist.expNetlist.size());
     }
-    // Map from (source function specification + subckt) to index in sourcegen for deterministic deduplication
+    // Map from (raw source function specification + subckt) to index in sourcegen for deterministic deduplication
     std::unordered_map<std::string, size_t> sourceDedup;
     auto get_or_create_source = [&](const std::pair<tokens_t, string_o>& line) -> size_t {
         std::string fullLine = Misc::vector_to_string(line.first);
         if (fullLine.find("NOISE") == std::string::npos && line.first.size() > 3) {
+            const auto& rawToks = (static_cast<size_t>(cc) < iObj.netlist.rawExpNetlist.size())
+                                          ? iObj.netlist.rawExpNetlist[cc].first
+                                          : line.first;
             std::string key;
-            for (size_t k = 3; k < line.first.size(); ++k) {
-                key.append(line.first[k]);
+            for (size_t k = 3; k < rawToks.size(); ++k) {
+                key.append(rawToks[k]);
                 key.push_back(' ');
             }
             if (line.second) {
@@ -217,7 +220,7 @@ void Matrix::create_components(Input& iObj) {
             const size_t newIdx = sourcegen.size();
             sourcegen.emplace_back();
             sourcegen.back().parse_function(fullLine, iObj, line.second);
-            sourceDedup.emplace( std::move(key), newIdx );
+            sourceDedup.emplace(std::move(key), newIdx);
             return newIdx;
         }
         const size_t newIdx = sourcegen.size();

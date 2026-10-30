@@ -15,8 +15,11 @@ class Trace {
     char                type_;
     int64_t             fileIndex = -1;
     std::vector<double> data_;
+    const double*       extData_  = nullptr;
 
     Trace(const std::string& name) { name_ = name; }
+
+    const double* data_ptr() const { return extData_ ? extData_ : data_.data(); }
 
     ~Trace() {};
 };

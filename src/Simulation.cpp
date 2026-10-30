@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <unordered_map>
@@ -58,6 +59,7 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     gpu_                     = iObj.argGpu;
     gpuMode_                 = iObj.argGpuMode;
     nodal_                   = iObj.argNodal;
+    nodalLevel_              = iObj.argNodalLevel;
     nodalActive_             = false;
     bypass_                  = iObj.argBypass;
     bypassTol_               = iObj.argBypassTol;
@@ -160,8 +162,9 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     }
 
     // Determine whether in-loop print windowing / decimation can be used
-    eventsOnly_ = iObj.argEventsOnly && (mcRuns_ <= 1) && (iObj.transSim.prfirwindow() <= 0.0)
-                  && (atyp_ == AnalysisType::Phase) && !gpu_;
+    mcEventTrackers_.clear();
+    eventsOnly_ = iObj.argEventsOnly && !mObj.relevantTraces.empty() && (mcRuns_ <= 1 || nodal_)
+                  && (iObj.transSim.prfirwindow() <= 0.0) && (atyp_ == AnalysisType::Phase) && !gpu_;
     eventMetrics_  = iObj.argEventMetrics;
     useDecimation_ = false;
     keepStep_.clear();
@@ -176,7 +179,7 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
             if (atyp_ == AnalysisType::Voltage && tr.storageType == StorageType::Phase && !isJJ) {
                 needsFullHistoryPhase = true;
             }
-            if (atyp_ == AnalysisType::Phase && tr.storageType == StorageType::Voltage && !isJJ) {
+            if (!eventsOnly_ && atyp_ == AnalysisType::Phase && tr.storageType == StorageType::Voltage && !isJJ) {
                 needsBDF2Lookback = true;
             }
         }
@@ -2025,14 +2028,17 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
     }
 
     struct RLSuperEdge {
-        int64_t posNode = -1;
-        int64_t negNode = -1;
-        double  zR      = 0.0;
-        double  zL      = 0.0;
-        double  Ltot    = 0.0;
-        int32_t resIdx  = -1;
-        int32_t indIdx  = -1;
-        bool    active  = true;
+        int64_t                                 posNode = -1;
+        int64_t                                 negNode = -1;
+        double                                  zR      = 0.0;
+        double                                  zL      = 0.0;
+        double                                  Ltot    = 0.0;
+        int32_t                                 resIdx  = -1;
+        int32_t                                 indIdx  = -1;
+        bool                                    active  = true;
+        std::vector<std::pair<int32_t, double>> resParts;
+        std::vector<std::pair<int32_t, double>> indParts;
+        std::vector<std::pair<int32_t, double>> indLParts;
     };
     std::vector<RLSuperEdge> rlEdges;
     rlEdges.reserve(resistors_.size() + inductors_.size());
@@ -2051,10 +2057,10 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
     std::vector<double>  indEffL(inductors_.size(), 0.0);
 
     for (size_t idx = 0; idx < resistors_.size(); ++idx) {
-        const auto& res = resistors_[idx];
-        resEffPos[idx]  = res.indexInfo.posIndex_;
-        resEffNeg[idx]  = res.indexInfo.negIndex_;
-        resEffG[idx]    = -1.0 / res.matrixInfo.nonZeros_.back();
+        const auto& res  = resistors_[idx];
+        resEffPos[idx]   = res.indexInfo.posIndex_;
+        resEffNeg[idx]   = res.indexInfo.negIndex_;
+        resEffG[idx]     = -1.0 / res.matrixInfo.nonZeros_.back();
         resEffAlpha[idx] = 1.0;
 
         RLSuperEdge e;
@@ -2062,6 +2068,7 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
         e.negNode = res.indexInfo.negIndex_ ? res.indexInfo.negIndex_.value() : -1;
         e.zR      = -res.matrixInfo.nonZeros_.back();
         e.resIdx  = static_cast<int32_t>(idx);
+        e.resParts.emplace_back(static_cast<int32_t>(idx), e.zR);
         const int32_t eIdx = static_cast<int32_t>(rlEdges.size());
         rlEdges.push_back(e);
         if (e.posNode >= 0) { nodeRLEdges[e.posNode].push_back(eIdx); }
@@ -2081,6 +2088,8 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
             e.zL      = -ind.matrixInfo.nonZeros_.back();
             e.Ltot    = ind.netlistInfo.value_;
             e.indIdx  = static_cast<int32_t>(idx);
+            e.indParts.emplace_back(static_cast<int32_t>(idx), e.zL);
+            e.indLParts.emplace_back(static_cast<int32_t>(idx), e.Ltot);
             const int32_t eIdx = static_cast<int32_t>(rlEdges.size());
             rlEdges.push_back(e);
             if (e.posNode >= 0) { nodeRLEdges[e.posNode].push_back(eIdx); }
@@ -2091,177 +2100,295 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
         }
     }
 
-    for (int64_t m = 0; m < nNodes; ++m) {
-        if (isDirichletNode[m] || isRelevantRow[m] || nodeTotalDeg[m] != 2) { continue; }
-        int32_t e1Idx = -1;
-        int32_t e2Idx = -1;
-        int32_t activeCount = 0;
-        for (int32_t eIdx : nodeRLEdges[m]) {
-            if (rlEdges[eIdx].active) {
-                if (activeCount == 0) { e1Idx = eIdx; }
-                else if (activeCount == 1) { e2Idx = eIdx; }
-                activeCount++;
+    const auto rlEdgesInit     = rlEdges;
+    const auto nodeRLEdgesInit = nodeRLEdges;
+    const auto isElimRowInit   = isElimRow;
+    const auto resEffPosInit   = resEffPos;
+    const auto resEffNegInit   = resEffNeg;
+    const auto resEffGInit     = resEffG;
+    const auto indEffPosInit   = indEffPos;
+    const auto indEffNegInit   = indEffNeg;
+    const auto indEffGInit     = indEffG;
+    const auto indEffLInit     = indEffL;
+
+    auto build_reduced_graph = [&](int level, int64_t& outPureLLCount) -> bool {
+        outPureLLCount = 0;
+        rlEdges        = rlEdgesInit;
+        nodeRLEdges    = nodeRLEdgesInit;
+        isElimRow      = isElimRowInit;
+        resEffPos      = resEffPosInit;
+        resEffNeg      = resEffNegInit;
+        resEffG        = resEffGInit;
+        resEffAlpha.assign(resistors_.size(), 1.0);
+        resSuppressed.assign(resistors_.size(), 0);
+        indEffPos = indEffPosInit;
+        indEffNeg = indEffNegInit;
+        indEffG   = indEffGInit;
+        indEffL   = indEffLInit;
+        indSuppressed.assign(inductors_.size(), 0);
+
+        for (int64_t m = 0; m < nNodes; ++m) {
+            if (isDirichletNode[m] || isRelevantRow[m] || nodeTotalDeg[m] != 2) { continue; }
+            int32_t e1Idx       = -1;
+            int32_t e2Idx       = -1;
+            int32_t activeCount = 0;
+            for (int32_t eIdx : nodeRLEdges[m]) {
+                if (rlEdges[eIdx].active) {
+                    if (activeCount == 0) {
+                        e1Idx = eIdx;
+                    } else if (activeCount == 1) {
+                        e2Idx = eIdx;
+                    }
+                    activeCount++;
+                }
+            }
+            if (activeCount != 2 || e1Idx < 0 || e2Idx < 0 || e1Idx == e2Idx) { continue; }
+            RLSuperEdge& e1 = rlEdges[e1Idx];
+            RLSuperEdge& e2 = rlEdges[e2Idx];
+            if (e1.posNode == e1.negNode || e2.posNode == e2.negNode) { continue; }
+
+            const int64_t u        = (e1.posNode == m) ? e1.negNode : e1.posNode;
+            const int64_t v        = (e2.posNode == m) ? e2.negNode : e2.posNode;
+            if (u == v) { continue; }
+            const bool    uCoupled = (u >= 0) && (nodeHasCoupledInd[u] != 0);
+            const bool    vCoupled = (v >= 0) && (nodeHasCoupledInd[v] != 0);
+            if (level <= 1) {
+                if (e1.resIdx < 0 && e2.resIdx < 0) { continue; }
+                if (e1.indIdx >= 0 && e2.indIdx >= 0 && uCoupled && vCoupled) { continue; }
+            } else {
+                if (e1.resIdx < 0 && e2.resIdx < 0 && (uCoupled || vCoupled)) { continue; }
+                if (e1.indIdx >= 0 && e2.indIdx >= 0 && uCoupled && vCoupled) { continue; }
+            }
+            // Do not merge across m if either incident branch's current is directly requested by .print
+            if (e1.resIdx >= 0 && isRelevantRow[resistors_[e1.resIdx].indexInfo.currentIndex_.value()]) { continue; }
+            if (e2.resIdx >= 0 && isRelevantRow[resistors_[e2.resIdx].indexInfo.currentIndex_.value()]) { continue; }
+            if (e1.indIdx >= 0 && isRelevantRow[inductors_[e1.indIdx].indexInfo.currentIndex_.value()]) { continue; }
+            if (e2.indIdx >= 0 && isRelevantRow[inductors_[e2.indIdx].indexInfo.currentIndex_.value()]) { continue; }
+
+            if (e1.resIdx < 0 && e2.resIdx < 0) { ++outPureLLCount; }
+
+            // Merge e2 into e1 across node m (oriented from u -> v)
+            if (e1.resIdx >= 0 && e2.resIdx >= 0) {
+                resSuppressed[e2.resIdx] = 1;
+            } else if (e1.resIdx < 0 && e2.resIdx >= 0) {
+                e1.resIdx = e2.resIdx;
+            }
+            if (e1.indIdx >= 0 && e2.indIdx >= 0) {
+                indSuppressed[e2.indIdx] = 1;
+            } else if (e1.indIdx < 0 && e2.indIdx >= 0) {
+                e1.indIdx = e2.indIdx;
+            }
+            if (!e2.resParts.empty()) { e1.resParts.insert(e1.resParts.end(), e2.resParts.begin(), e2.resParts.end()); }
+            if (!e2.indParts.empty()) {
+                e1.indParts.insert(e1.indParts.end(), e2.indParts.begin(), e2.indParts.end());
+                e1.indLParts.insert(e1.indLParts.end(), e2.indLParts.begin(), e2.indLParts.end());
+            }
+
+            e1.posNode   = u;
+            e1.negNode   = v;
+            e1.zR       += e2.zR;
+            e1.zL       += e2.zL;
+            e1.Ltot     += e2.Ltot;
+            e2.active    = false;
+            isElimRow[m] = true;
+
+            if (v >= 0) { nodeRLEdges[v].push_back(e1Idx); }
+        }
+
+        for (const auto& e : rlEdges) {
+            if (!e.active) { continue; }
+            const double zTot = e.zR + e.zL;
+            if (zTot <= 0.0) { continue; }
+            const double gEff = 1.0 / zTot;
+            const int_o  pOpt = (e.posNode >= 0) ? int_o(e.posNode) : std::nullopt;
+            const int_o  qOpt = (e.negNode >= 0) ? int_o(e.negNode) : std::nullopt;
+            if (e.resIdx >= 0) {
+                resEffPos[e.resIdx]   = pOpt;
+                resEffNeg[e.resIdx]   = qOpt;
+                resEffG[e.resIdx]     = gEff;
+                resEffAlpha[e.resIdx] = e.zR / zTot;
+            }
+            if (e.indIdx >= 0) {
+                indEffPos[e.indIdx] = pOpt;
+                indEffNeg[e.indIdx] = qOpt;
+                indEffG[e.indIdx]   = gEff;
+                indEffL[e.indIdx]   = e.Ltot;
             }
         }
-        if (activeCount != 2 || e1Idx < 0 || e2Idx < 0 || e1Idx == e2Idx) { continue; }
-        RLSuperEdge& e1 = rlEdges[e1Idx];
-        RLSuperEdge& e2 = rlEdges[e2Idx];
-        if (e1.posNode == e1.negNode || e2.posNode == e2.negNode) { continue; }
 
-        const int64_t u = (e1.posNode == m) ? e1.negNode : e1.posNode;
-        const int64_t v = (e2.posNode == m) ? e2.negNode : e2.posNode;
-        if (u == v) { continue; }
-        // Do not bridge a coupled inductor node across a pure L+L pair (which
-        // increases KLU AMD fill-in on coupled-inductor macro blocks).
-        if (e1.resIdx < 0 && e2.resIdx < 0 && (nodeHasCoupledInd[u] || nodeHasCoupledInd[v])) { continue; }
-        // Do not merge across m if either incident branch's current is directly requested by .print
-        if (e1.resIdx >= 0 && isRelevantRow[resistors_[e1.resIdx].indexInfo.currentIndex_.value()]) { continue; }
-        if (e2.resIdx >= 0 && isRelevantRow[resistors_[e2.resIdx].indexInfo.currentIndex_.value()]) { continue; }
-        if (e1.indIdx >= 0 && isRelevantRow[inductors_[e1.indIdx].indexInfo.currentIndex_.value()]) { continue; }
-        if (e2.indIdx >= 0 && isRelevantRow[inductors_[e2.indIdx].indexInfo.currentIndex_.value()]) { continue; }
-        if (mcRuns_ > 1 && ((e1.resIdx >= 0 && e2.resIdx >= 0) || (e1.indIdx >= 0 && e2.indIdx >= 0))) { continue; }
-
-        // Merge e2 into e1 across node m (oriented from u -> v)
-        if (e1.resIdx >= 0 && e2.resIdx >= 0) {
-            resSuppressed[e2.resIdx] = 1;
-        } else if (e1.resIdx < 0 && e2.resIdx >= 0) {
-            e1.resIdx = e2.resIdx;
+        nodalPermToSolver_.assign(static_cast<size_t>(N), -1);
+        int32_t nextRed = 0;
+        for (int64_t r = 0; r < N; ++r) {
+            if (!isElimRow[r]) { nodalPermToSolver_[r] = nextRed++; }
         }
-        if (e1.indIdx >= 0 && e2.indIdx >= 0) {
-            indSuppressed[e2.indIdx] = 1;
-        } else if (e1.indIdx < 0 && e2.indIdx >= 0) {
-            e1.indIdx = e2.indIdx;
+        nodalNRed_       = nextRed;
+        int32_t nextElim = nodalNRed_;
+        for (int64_t r = 0; r < N; ++r) {
+            if (isElimRow[r]) { nodalPermToSolver_[r] = nextElim++; }
         }
 
-        e1.posNode = u;
-        e1.negNode = v;
-        e1.zR     += e2.zR;
-        e1.zL     += e2.zL;
-        e1.Ltot   += e2.Ltot;
-        e2.active  = false;
-        isElimRow[m] = true;
-
-        if (v >= 0) {
-            nodeRLEdges[v].push_back(e1Idx);
-        }
-    }
-
-    for (const auto& e : rlEdges) {
-        if (!e.active) { continue; }
-        const double zTot = e.zR + e.zL;
-        if (zTot <= 0.0) { continue; }
-        const double gEff = 1.0 / zTot;
-        const int_o  pOpt = (e.posNode >= 0) ? int_o(e.posNode) : std::nullopt;
-        const int_o  qOpt = (e.negNode >= 0) ? int_o(e.negNode) : std::nullopt;
-        if (e.resIdx >= 0) {
-            resEffPos[e.resIdx]   = pOpt;
-            resEffNeg[e.resIdx]   = qOpt;
-            resEffG[e.resIdx]     = gEff;
-            resEffAlpha[e.resIdx] = e.zR / zTot;
-        }
-        if (e.indIdx >= 0) {
-            indEffPos[e.indIdx] = pOpt;
-            indEffNeg[e.indIdx] = qOpt;
-            indEffG[e.indIdx]   = gEff;
-            indEffL[e.indIdx]   = e.Ltot;
-        }
-    }
-
-    nodalPermToSolver_.assign(static_cast<size_t>(N), -1);
-    int32_t nextRed = 0;
-    for (int64_t r = 0; r < N; ++r) {
-        if (!isElimRow[r]) { nodalPermToSolver_[r] = nextRed++; }
-    }
-    nodalNRed_       = nextRed;
-    int32_t nextElim = nodalNRed_;
-    for (int64_t r = 0; r < N; ++r) {
-        if (isElimRow[r]) { nodalPermToSolver_[r] = nextElim++; }
-    }
-
-    nodalIsDirichletRed_.assign(static_cast<size_t>(nodalNRed_), 0);
-    nodalDirichletSign_.assign(static_cast<size_t>(nodalNRed_), 1.0);
-    for (int64_t n = 0; n < nNodes; ++n) {
-        if (!isElimRow[n] && isDirichletNode[n]) {
-            const int32_t redR = nodalPermToSolver_[n];
-            nodalIsDirichletRed_[redR] = 1;
-            nodalDirichletSign_[redR]  = dirichletSign[n];
-        }
-    }
-
-    std::vector<std::vector<std::pair<int32_t, double>>> rowEntries(static_cast<size_t>(nodalNRed_));
-    for (int64_t origR = 0; origR < N; ++origR) {
-        if (isElimRow[origR]) { continue; }
-        const int32_t redR = nodalPermToSolver_[origR];
-        if (origR < nNodes && isDirichletNode[origR]) {
-            rowEntries[redR].emplace_back(redR, dirichletSign[origR]);
-            continue;
-        }
-        const int64_t kStart = mObj.rp[origR];
-        const int64_t kEnd   = mObj.rp[origR + 1];
-        for (int64_t k = kStart; k < kEnd; ++k) {
-            const int64_t origC = mObj.ci[k];
-            if (origC >= 0 && origC < N && !isElimRow[origC]) {
-                rowEntries[redR].emplace_back(nodalPermToSolver_[origC], mObj.nz[k]);
+        nodalIsDirichletRed_.assign(static_cast<size_t>(nodalNRed_), 0);
+        nodalDirichletSign_.assign(static_cast<size_t>(nodalNRed_), 1.0);
+        for (int64_t n = 0; n < nNodes; ++n) {
+            if (!isElimRow[n] && isDirichletNode[n]) {
+                const int32_t redR         = nodalPermToSolver_[n];
+                nodalIsDirichletRed_[redR] = 1;
+                nodalDirichletSign_[redR]  = dirichletSign[n];
             }
         }
-    }
 
-    auto stamp_nodal_conductance = [&](const int_o& posOpt, const int_o& negOpt, double g) {
-        const int64_t pOrig = posOpt ? posOpt.value() : -1;
-        const int64_t qOrig = negOpt ? negOpt.value() : -1;
-        const int32_t p     = (pOrig >= 0) ? nodalPermToSolver_[pOrig] : -1;
-        const int32_t q     = (qOrig >= 0) ? nodalPermToSolver_[qOrig] : -1;
-        if (pOrig >= 0 && !isDirichletNode[pOrig]) {
-            rowEntries[p].emplace_back(p, g);
-            if (q >= 0) { rowEntries[p].emplace_back(q, -g); }
+        std::vector<std::vector<std::pair<int32_t, double>>> rowEntries(static_cast<size_t>(nodalNRed_));
+        for (int64_t origR = 0; origR < N; ++origR) {
+            if (isElimRow[origR]) { continue; }
+            const int32_t redR = nodalPermToSolver_[origR];
+            if (origR < nNodes && isDirichletNode[origR]) {
+                rowEntries[redR].emplace_back(redR, dirichletSign[origR]);
+                continue;
+            }
+            const int64_t kStart = mObj.rp[origR];
+            const int64_t kEnd   = mObj.rp[origR + 1];
+            for (int64_t k = kStart; k < kEnd; ++k) {
+                const int64_t origC = mObj.ci[k];
+                if (origC >= 0 && origC < N && !isElimRow[origC]) {
+                    rowEntries[redR].emplace_back(nodalPermToSolver_[origC], mObj.nz[k]);
+                }
+            }
         }
-        if (qOrig >= 0 && !isDirichletNode[qOrig]) {
-            rowEntries[q].emplace_back(q, g);
-            if (p >= 0) { rowEntries[q].emplace_back(p, -g); }
+
+        auto stamp_nodal_conductance = [&](const int_o& posOpt, const int_o& negOpt, double g) {
+            const int64_t pOrig = posOpt ? posOpt.value() : -1;
+            const int64_t qOrig = negOpt ? negOpt.value() : -1;
+            const int32_t p     = (pOrig >= 0) ? nodalPermToSolver_[pOrig] : -1;
+            const int32_t q     = (qOrig >= 0) ? nodalPermToSolver_[qOrig] : -1;
+            if (pOrig >= 0 && !isDirichletNode[pOrig]) {
+                rowEntries[p].emplace_back(p, g);
+                if (q >= 0) { rowEntries[p].emplace_back(q, -g); }
+            }
+            if (qOrig >= 0 && !isDirichletNode[qOrig]) {
+                rowEntries[q].emplace_back(q, g);
+                if (p >= 0) { rowEntries[q].emplace_back(p, -g); }
+            }
+        };
+
+        for (const auto& jj : jjs_) {
+            const double gVar   = 1.0 / jj.phaseConst_;
+            const double gScale = (atyp_ == AnalysisType::Phase) ? gVar : 1.0;
+            const double gCur   = -1.0 / jj.matrixInfo.nonZeros_.back();
+            stamp_nodal_conductance(jj.indexInfo.posIndex_, jj.indexInfo.negIndex_, gScale * gCur);
         }
+        for (const auto& e : rlEdges) {
+            if (!e.active) { continue; }
+            const double zTot = e.zR + e.zL;
+            if (zTot <= 0.0) { continue; }
+            const int_o pOpt = (e.posNode >= 0) ? int_o(e.posNode) : std::nullopt;
+            const int_o qOpt = (e.negNode >= 0) ? int_o(e.negNode) : std::nullopt;
+            stamp_nodal_conductance(pOpt, qOpt, 1.0 / zTot);
+        }
+        for (const auto& cap : capacitors_) {
+            const double gCap = -1.0 / cap.matrixInfo.nonZeros_.back();
+            stamp_nodal_conductance(cap.indexInfo.posIndex_, cap.indexInfo.negIndex_, gCap);
+        }
+        for (const auto& tx : txlines_) {
+            const double gTx = -1.0 / tx.matrixInfo.nonZeros_.back();
+            stamp_nodal_conductance(tx.indexInfo.posIndex_, tx.indexInfo.negIndex_, gTx);
+            stamp_nodal_conductance(tx.posIndex2_, tx.negIndex2_, gTx);
+        }
+
+        nodalCi_.clear();
+        nodalNz_.clear();
+        nodalRp_.assign(static_cast<size_t>(nodalNRed_ + 1), 0);
+        for (int32_t r = 0; r < nodalNRed_; ++r) {
+            nodalRp_[r]   = static_cast<int64_t>(nodalCi_.size());
+            auto& entries = rowEntries[r];
+            if (entries.empty()) { return false; }
+            std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& kv : entries) {
+                if (!nodalCi_.empty() && static_cast<int64_t>(nodalCi_.size()) > nodalRp_[r]
+                    && nodalCi_.back() == static_cast<int64_t>(kv.first)) {
+                    nodalNz_.back() += kv.second;
+                } else {
+                    nodalCi_.push_back(static_cast<int64_t>(kv.first));
+                    nodalNz_.push_back(kv.second);
+                }
+            }
+        }
+        nodalRp_[nodalNRed_] = static_cast<int64_t>(nodalCi_.size());
+        return true;
     };
 
-    for (const auto& jj : jjs_) {
-        const double gVar   = 1.0 / jj.phaseConst_;
-        const double gScale = (atyp_ == AnalysisType::Phase) ? gVar : 1.0;
-        const double gCur   = -1.0 / jj.matrixInfo.nonZeros_.back();
-        stamp_nodal_conductance(jj.indexInfo.posIndex_, jj.indexInfo.negIndex_, gScale * gCur);
-    }
-    for (const auto& e : rlEdges) {
-        if (!e.active) { continue; }
-        const double zTot = e.zR + e.zL;
-        if (zTot <= 0.0) { continue; }
-        const int_o pOpt = (e.posNode >= 0) ? int_o(e.posNode) : std::nullopt;
-        const int_o qOpt = (e.negNode >= 0) ? int_o(e.negNode) : std::nullopt;
-        stamp_nodal_conductance(pOpt, qOpt, 1.0 / zTot);
-    }
-    for (const auto& cap : capacitors_) {
-        const double gCap = -1.0 / cap.matrixInfo.nonZeros_.back();
-        stamp_nodal_conductance(cap.indexInfo.posIndex_, cap.indexInfo.negIndex_, gCap);
-    }
-    for (const auto& tx : txlines_) {
-        const double gTx = -1.0 / tx.matrixInfo.nonZeros_.back();
-        stamp_nodal_conductance(tx.indexInfo.posIndex_, tx.indexInfo.negIndex_, gTx);
-        stamp_nodal_conductance(tx.posIndex2_, tx.negIndex2_, gTx);
-    }
+    int64_t pureLLCount = 0;
+    if (nodalLevel_ == 1) {
+        if (!build_reduced_graph(1, pureLLCount)) { return false; }
+    } else if (nodalLevel_ == 2) {
+        if (!build_reduced_graph(2, pureLLCount)) { return false; }
+    } else {
+        if (!build_reduced_graph(2, pureLLCount)) { return false; }
+        if (pureLLCount > 0 && !gpu_) {
+            klu_l_common c2{};
+            klu_l_defaults(&c2);
+            klu_l_symbolic* sym2 = klu_l_analyze(nodalNRed_, nodalRp_.data(), nodalCi_.data(), &c2);
+            klu_l_numeric*  num2
+                    = sym2 ? klu_l_factor(nodalRp_.data(), nodalCi_.data(), nodalNz_.data(), sym2, &c2) : nullptr;
+            const int64_t nnz2 = (num2 && c2.status == KLU_OK) ? (num2->lnz + num2->unz) : INT64_MAX;
+            if (num2) { klu_l_free_numeric(&num2, &c2); }
+            if (sym2) { klu_l_free_symbolic(&sym2, &c2); }
 
-    nodalRp_.resize(static_cast<size_t>(nodalNRed_ + 1), 0);
-    for (int32_t r = 0; r < nodalNRed_; ++r) {
-        nodalRp_[r] = static_cast<int64_t>(nodalCi_.size());
-        auto& entries = rowEntries[r];
-        if (entries.empty()) { return false; }
-        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-        for (const auto& kv : entries) {
-            if (!nodalCi_.empty() && static_cast<int64_t>(nodalCi_.size()) > nodalRp_[r]
-                && nodalCi_.back() == static_cast<int64_t>(kv.first)) {
-                nodalNz_.back() += kv.second;
-            } else {
-                nodalCi_.push_back(static_cast<int64_t>(kv.first));
-                nodalNz_.push_back(kv.second);
+            auto    rlEdges2             = std::move(rlEdges);
+            auto    nodeRLEdges2         = std::move(nodeRLEdges);
+            auto    isElimRow2           = std::move(isElimRow);
+            auto    resSuppressed2       = std::move(resSuppressed);
+            auto    resEffPos2           = std::move(resEffPos);
+            auto    resEffNeg2           = std::move(resEffNeg);
+            auto    resEffG2             = std::move(resEffG);
+            auto    resEffAlpha2         = std::move(resEffAlpha);
+            auto    indSuppressed2       = std::move(indSuppressed);
+            auto    indEffPos2           = std::move(indEffPos);
+            auto    indEffNeg2           = std::move(indEffNeg);
+            auto    indEffG2             = std::move(indEffG);
+            auto    indEffL2             = std::move(indEffL);
+            int32_t nodalNRed2           = nodalNRed_;
+            auto    nodalPermToSolver2   = std::move(nodalPermToSolver_);
+            auto    nodalIsDirichletRed2 = std::move(nodalIsDirichletRed_);
+            auto    nodalDirichletSign2  = std::move(nodalDirichletSign_);
+            auto    nodalRp2             = std::move(nodalRp_);
+            auto    nodalCi2             = std::move(nodalCi_);
+            auto    nodalNz2             = std::move(nodalNz_);
+
+            int64_t dummyLL = 0;
+            if (!build_reduced_graph(1, dummyLL)) { return false; }
+            klu_l_common c1{};
+            klu_l_defaults(&c1);
+            klu_l_symbolic* sym1 = klu_l_analyze(nodalNRed_, nodalRp_.data(), nodalCi_.data(), &c1);
+            klu_l_numeric*  num1
+                    = sym1 ? klu_l_factor(nodalRp_.data(), nodalCi_.data(), nodalNz_.data(), sym1, &c1) : nullptr;
+            const int64_t nnz1 = (num1 && c1.status == KLU_OK) ? (num1->lnz + num1->unz) : INT64_MAX;
+            if (num1) { klu_l_free_numeric(&num1, &c1); }
+            if (sym1) { klu_l_free_symbolic(&sym1, &c1); }
+
+            if (nnz2 <= nnz1) {
+                rlEdges              = std::move(rlEdges2);
+                nodeRLEdges          = std::move(nodeRLEdges2);
+                isElimRow            = std::move(isElimRow2);
+                resSuppressed        = std::move(resSuppressed2);
+                resEffPos            = std::move(resEffPos2);
+                resEffNeg            = std::move(resEffNeg2);
+                resEffG              = std::move(resEffG2);
+                resEffAlpha          = std::move(resEffAlpha2);
+                indSuppressed        = std::move(indSuppressed2);
+                indEffPos            = std::move(indEffPos2);
+                indEffNeg            = std::move(indEffNeg2);
+                indEffG              = std::move(indEffG2);
+                indEffL              = std::move(indEffL2);
+                nodalNRed_           = nodalNRed2;
+                nodalPermToSolver_   = std::move(nodalPermToSolver2);
+                nodalIsDirichletRed_ = std::move(nodalIsDirichletRed2);
+                nodalDirichletSign_  = std::move(nodalDirichletSign2);
+                nodalRp_             = std::move(nodalRp2);
+                nodalCi_             = std::move(nodalCi2);
+                nodalNz_             = std::move(nodalNz2);
             }
         }
     }
-    nodalRp_[nodalNRed_] = static_cast<int64_t>(nodalCi_.size());
 
     auto find_csr_idx = [&](int64_t origRow, int64_t origCol) -> int32_t {
         if (origRow < 0 || origRow >= nNodes || origCol < 0 || origCol >= nNodes
@@ -2511,7 +2638,10 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
         es.nodalIndIdx = (e.indIdx >= 0) ? indOldToNew[e.indIdx] : -1;
         es.origResIdx  = e.resIdx;
         es.origIndIdx  = e.indIdx;
-        nodalRLEdges_.push_back(es);
+        es.resParts    = e.resParts;
+        es.indParts    = e.indParts;
+        es.indLParts   = e.indLParts;
+        nodalRLEdges_.push_back(std::move(es));
     }
 
     nodalCaps_.resize(capacitors_.size());
@@ -2644,7 +2774,7 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
     }
 
     if (!mObj.relevantTraces.empty()) {
-        if (!gpu_ && mcRuns_ <= 1) {
+        if (!gpu_) {
             struct DiffPair {
                 int64_t n1         = -1;
                 int64_t n2         = -1;
@@ -2731,9 +2861,16 @@ bool Simulation::build_nodal_system(Matrix& mObj) {
                 }
             }
             if (anyFolded) {
+                std::vector<int64_t> activeRelIndices;
+                activeRelIndices.reserve(mObj.relevantIndices.size());
                 for (int64_t r : mObj.relevantIndices) {
-                    if (r >= 0 && r < N && refCount[r] == 0 && !usedAsTarget[r]) { results.xVector[r].reset(); }
+                    if (r >= 0 && r < N && refCount[r] == 0 && !usedAsTarget[r]) {
+                        results.xVector[r].reset();
+                    } else if (r >= 0 && r < N && results.xVector[r].has_value()) {
+                        activeRelIndices.push_back(r);
+                    }
                 }
+                mObj.relevantIndices = std::move(activeRelIndices);
                 for (auto& tr : mObj.relevantTraces) {
                     if (tr.index1 && tr.index2 && !tr.variableIndex) {
                         const int64_t n1 = *tr.index1;
@@ -4396,13 +4533,28 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
         return p == pat.size();
     };
 
-    auto match_label = [&](const std::string& label, const std::string& pat) -> bool {
+    auto match_single_label = [&](const std::string& label, const std::string& pat) -> bool {
         if (pat.find('|') != std::string::npos) { return glob_match(label, pat); }
         if (glob_match(label, pat)) { return true; }
         const size_t pipePos = label.find('|');
         if (pipePos != std::string::npos) {
             if (glob_match(label.substr(0, pipePos), pat)) { return true; }
             if (glob_match(label.substr(pipePos + 1), pat)) { return true; }
+        }
+        return false;
+    };
+
+    auto match_label = [&](const std::string& label, const std::string& patList) -> bool {
+        if (patList.find(',') == std::string::npos) { return match_single_label(label, patList); }
+        size_t pos = 0;
+        while (pos < patList.size()) {
+            size_t next = patList.find(',', pos);
+            if (next == std::string::npos) { next = patList.size(); }
+            if (next > pos) {
+                const std::string item = patList.substr(pos, next - pos);
+                if (match_single_label(label, item)) { return true; }
+            }
+            pos = next + 1;
         }
         return false;
     };
@@ -4425,43 +4577,63 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
         return best;
     };
 
-    auto is_bias_waveform = [&](size_t srcIdx) -> bool {
-        if (srcIdx >= mObj.sourcegen.size()) { return false; }
-        return mObj.sourcegen[srcIdx].is_bias_like();
+    auto bias_waveform_rule = [&](size_t srcIdx) -> const char* {
+        if (srcIdx >= mObj.sourcegen.size()) { return nullptr; }
+        return mObj.sourcegen[srcIdx].bias_rule();
     };
 
-    std::vector<uint8_t> csIsBias(mObj.components.currentsources.size(), 0);
-    std::vector<uint8_t> vsIsBias(vsources_.size(), 0);
-    bool                 anyBiasMatched = false;
+    std::vector<uint8_t>                             csIsBias(mObj.components.currentsources.size(), 0);
+    std::vector<uint8_t>                             vsIsBias(vsources_.size(), 0);
+    std::vector<std::pair<std::string, std::string>> biasMatchedLog;
+    bool                                             anyBiasMatched = false;
     for (size_t idx = 0; idx < mObj.components.currentsources.size(); ++idx) {
-        if (is_bias_name(mObj.components.currentsources[idx].netlistInfo.label_)) {
+        const auto& lbl = mObj.components.currentsources[idx].netlistInfo.label_;
+        if (is_bias_name(lbl)) {
             csIsBias[idx]  = 1;
             anyBiasMatched = true;
+            biasMatchedLog.emplace_back(lbl, "name");
+        } else if (const char* wRule = bias_waveform_rule(mObj.components.currentsources[idx].sourceIndex_)) {
+            csIsBias[idx]  = 1;
+            anyBiasMatched = true;
+            biasMatchedLog.emplace_back(lbl, wRule);
         }
     }
     for (size_t idx = 0; idx < vsources_.size(); ++idx) {
-        if (is_bias_name(vsources_[idx].netlistInfo.label_)) {
+        const auto& lbl = vsources_[idx].netlistInfo.label_;
+        if (is_bias_name(lbl)) {
             vsIsBias[idx]  = 1;
             anyBiasMatched = true;
-        }
-    }
-    if (!anyBiasMatched) {
-        for (size_t idx = 0; idx < mObj.components.currentsources.size(); ++idx) {
-            if (is_bias_waveform(mObj.components.currentsources[idx].sourceIndex_)) {
-                csIsBias[idx]  = 1;
-                anyBiasMatched = true;
-            }
-        }
-        for (size_t idx = 0; idx < vsources_.size(); ++idx) {
-            if (is_bias_waveform(vsources_[idx].sourceIndex_)) {
-                vsIsBias[idx]  = 1;
-                anyBiasMatched = true;
-            }
+            biasMatchedLog.emplace_back(lbl, "name");
+        } else if (const char* wRule = bias_waveform_rule(vsources_[idx].sourceIndex_)) {
+            vsIsBias[idx]  = 1;
+            anyBiasMatched = true;
+            biasMatchedLog.emplace_back(lbl, wRule);
         }
     }
     if (!anyBiasMatched) {
         std::fill(csIsBias.begin(), csIsBias.end(), 1);
         std::fill(vsIsBias.begin(), vsIsBias.end(), 1);
+        for (const auto& cs : mObj.components.currentsources) {
+            biasMatchedLog.emplace_back(cs.netlistInfo.label_, "fallback-all");
+        }
+        for (const auto& vs : vsources_) { biasMatchedLog.emplace_back(vs.netlistInfo.label_, "fallback-all"); }
+    }
+    if (verb_ >= 1 && !minOut_) {
+        bool hasBiasSweep = false;
+        for (const auto& sd : input_->sweeps) {
+            if (sd.target == "@BIAS") {
+                hasBiasSweep = true;
+                break;
+            }
+        }
+        if (hasBiasSweep) {
+            std::cout << "JoSIM: @BIAS selected " << biasMatchedLog.size() << " source(s): ";
+            for (size_t k = 0; k < biasMatchedLog.size(); ++k) {
+                if (k > 0) { std::cout << ", "; }
+                std::cout << biasMatchedLog[k].first << " (" << biasMatchedLog[k].second << ")";
+            }
+            std::cout << "\n";
+        }
     }
 
     auto resolve_scale = [](double val, double nominal, bool isRel) -> double {
@@ -4473,7 +4645,7 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
         return val / nominal;
     };
 
-    auto match_param_target = [&](const ParameterName& pn, const std::string& target) -> bool {
+    auto match_single_param = [&](const ParameterName& pn, const std::string& target) -> bool {
         std::string pName = pn.name();
         std::transform(pName.begin(), pName.end(), pName.begin(), ::toupper);
         const size_t sepPos = target.find_first_of("|.");
@@ -4485,6 +4657,18 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
             return glob_match(subStr, subPat) && glob_match(pName, namePat);
         }
         return glob_match(pName, target);
+    };
+
+    auto match_param_target = [&](const ParameterName& pn, const std::string& targetList) -> bool {
+        if (targetList.find(',') == std::string::npos) { return match_single_param(pn, targetList); }
+        size_t pos = 0;
+        while (pos < targetList.size()) {
+            size_t next = targetList.find(',', pos);
+            if (next == std::string::npos) { next = targetList.size(); }
+            if (next > pos && match_single_param(pn, targetList.substr(pos, next - pos))) { return true; }
+            pos = next + 1;
+        }
+        return false;
     };
 
     for (int64_t b = 0; b < B; ++b) {
@@ -4621,12 +4805,9 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
                             Function fTrial;
                             fTrial.parse_function(Misc::vector_to_string(lineCopy.first), *input_, lineCopy.second);
                             std::swap(input_->parameters, trialParams);
-                            double trialMax = 0.0;
-                            for (double a : fTrial.ampValues()) {
-                                if (std::abs(a) > std::abs(trialMax)) { trialMax = a; }
-                            }
-                            const double nomMax = src_max_amp(mObj.components.currentsources[iOrd].sourceIndex_);
-                            if (std::abs(nomMax) > 1e-30) { ts.csScale[iOrd] *= (trialMax / nomMax); }
+                            const int32_t srcIdx
+                                    = static_cast<int32_t>(mObj.components.currentsources[iOrd].sourceIndex_);
+                            ts.srcOverrides.emplace_back(srcIdx, std::move(fTrial));
                         }
                         ++iOrd;
                         break;
@@ -4638,12 +4819,8 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
                             Function fTrial;
                             fTrial.parse_function(Misc::vector_to_string(lineCopy.first), *input_, lineCopy.second);
                             std::swap(input_->parameters, trialParams);
-                            double trialMax = 0.0;
-                            for (double a : fTrial.ampValues()) {
-                                if (std::abs(a) > std::abs(trialMax)) { trialMax = a; }
-                            }
-                            const double nomMax = src_max_amp(vsources_[vOrd].sourceIndex_);
-                            if (std::abs(nomMax) > 1e-30) { ts.vsScale[vOrd] *= (trialMax / nomMax); }
+                            const int32_t srcIdx = static_cast<int32_t>(vsources_[vOrd].sourceIndex_);
+                            ts.srcOverrides.emplace_back(srcIdx, std::move(fTrial));
                         }
                         ++vOrd;
                         break;
@@ -4655,12 +4832,8 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
                             Function fTrial;
                             fTrial.parse_function(Misc::vector_to_string(lineCopy.first), *input_, lineCopy.second);
                             std::swap(input_->parameters, trialParams);
-                            double trialMax = 0.0;
-                            for (double a : fTrial.ampValues()) {
-                                if (std::abs(a) > std::abs(trialMax)) { trialMax = a; }
-                            }
-                            const double nomMax = src_max_amp(psources_[pOrd].sourceIndex_);
-                            if (std::abs(nomMax) > 1e-30) { ts.psScale[pOrd] *= (trialMax / nomMax); }
+                            const int32_t srcIdx = static_cast<int32_t>(psources_[pOrd].sourceIndex_);
+                            ts.srcOverrides.emplace_back(srcIdx, std::move(fTrial));
                         }
                         ++pOrd;
                         break;
@@ -4708,8 +4881,10 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
             } else if (tgt == "@CAP" || tgt == "@C") {
                 for (double& s : ts.capScale) { s *= val; }
             } else {
-                const bool hasWildcard = (tgt.find('*') != std::string::npos || tgt.find('?') != std::string::npos);
-                const bool useRel      = dim.isRelative || hasWildcard;
+                const bool hasWildcard
+                        = (tgt.find('*') != std::string::npos || tgt.find('?') != std::string::npos
+                           || tgt.find(',') != std::string::npos);
+                const bool useRel = dim.isRelative || hasWildcard;
                 for (size_t idx = 0; idx < inductors_.size(); ++idx) {
                     if (match_label(inductors_[idx].netlistInfo.label_, tgt)) {
                         ts.indScale[idx] *= resolve_scale(val, inductors_[idx].netlistInfo.value_, useRel);
@@ -5493,8 +5668,17 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
         if (keptSlot_[i] >= 0) { results.timeAxis.push_back(i * stepSize_); }
     }
 
+    bool hasSrcOverrides = false;
+    for (int64_t b = 0; b < B; ++b) {
+        if (!trialScales[b].srcOverrides.empty()) {
+            hasSrcOverrides = true;
+            break;
+        }
+    }
+    (void) hasSrcOverrides;
+
 #ifdef JOSIM_CUDA
-    if (gpu_) {
+    if (gpu_ && !hasSrcOverrides) {
         cudaSolver_   = std::make_unique<CudaPartitionSolver>();
         const bool ok = cudaSolver_->initialize(static_cast<int32_t>(nPartsTotal),
                                                 static_cast<int32_t>(B * nBaseRows),
@@ -5618,15 +5802,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
         bar.set_total(static_cast<float>(B));
     }
 
-    const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
-    std::vector<double> srcAll(static_cast<size_t>((simSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
-    if (numSrc > 0) {
-        for (int64_t i = 0; i < simSize_; ++i) {
-            const double t   = i * stepSize_;
-            double*      row = srcAll.data() + (i + 2) * numSrc;
-            for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) { row[srcIdx] = mObj.sourcegen[srcIdx].value(t); }
-        }
-    }
+    const int64_t numSrc = static_cast<int64_t>(mObj.sourcegen.size());
 
     results.mcTraceOut.assign(static_cast<size_t>(B * nBaseTraces * numKeptSteps_), 0.0);
     bool anyNeedsTR = false;
@@ -5639,6 +5815,14 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
     for (int64_t b = 0; b < B; ++b) {
         if (anyNeedsTR || anySingErr) { continue; }
         if (!minOut_ && (!parallel_ || b % 4 == 0)) { bar.update(static_cast<float>(b)); }
+
+        std::vector<Function> trialSrcs = mObj.sourcegen;
+        for (const auto& kv : trialScales[b].srcOverrides) {
+            if (kv.first >= 0 && kv.first < static_cast<int32_t>(trialSrcs.size())) {
+                trialSrcs[kv.first] = kv.second;
+            }
+        }
+        std::vector<double> srcWin(static_cast<size_t>((windowSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
 
         const int32_t       rowOffB    = static_cast<int32_t>(b * nBaseRows);
         const int32_t       txLineOffB = static_cast<int32_t>(b * nBaseTxLines);
@@ -5673,6 +5857,23 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             if (anyNeedsTR || anySingErr) { break; }
             const int64_t i1 = std::min<int64_t>(simSize_, i0 + windowSize_);
             const int64_t w  = i1 - i0;
+
+            if (numSrc > 0) {
+                if (i0 == 0) {
+                    std::fill(srcWin.begin(), srcWin.begin() + 2 * numSrc, 0.0);
+                } else {
+                    std::copy(srcWin.data() + windowSize_ * numSrc,
+                              srcWin.data() + (windowSize_ + 2) * numSrc,
+                              srcWin.data());
+                }
+                for (int64_t s = 0; s < w; ++s) {
+                    const double t   = (i0 + s) * stepSize_;
+                    double*      row = srcWin.data() + (s + 2) * numSrc;
+                    for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) {
+                        row[srcIdx] = trialSrcs[srcIdx].value(t);
+                    }
+                }
+            }
 
             // 1. Precompute remote transmission line delayed history terms for Trial b across [i0, i1)
             for (int64_t tLocal = 0; tLocal < nBaseTxLines; ++tLocal) {
@@ -5844,7 +6045,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
                     // Current Sources
                     for (int32_t k = 0; k < part.csCount; ++k) {
                         const GpuCS& cs     = allCSs[part.csStart + k];
-                        const double srcVal = srcAll[(i + 2) * numSrc + cs.srcIdx] * cs.scale;
+                        const double srcVal = srcWin[(s + 2) * numSrc + cs.srcIdx] * cs.scale;
                         if (cs.posIdx >= 0) { bPtr[cs.posIdx] -= srcVal; }
                         if (cs.negIdx >= 0) { bPtr[cs.negIdx] += srcVal; }
                     }
@@ -5901,7 +6102,7 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
                     // Voltage Sources
                     for (int32_t k = 0; k < part.vsCount; ++k) {
                         GpuVS&       vs     = allVSs[part.vsStart + k];
-                        const double srcVal = srcAll[(i + 2) * numSrc + vs.srcIdx] * vs.scale;
+                        const double srcVal = srcWin[(s + 2) * numSrc + vs.srcIdx] * vs.scale;
                         if (atyp_ == AnalysisType::Voltage) {
                             bPtr[vs.curIdx] = srcVal;
                         } else {
@@ -5917,12 +6118,12 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
                     // Phase Sources
                     for (int32_t k = 0; k < part.psCount; ++k) {
                         const GpuPS& ps = allPSs[part.psStart + k];
-                        const double s0 = srcAll[(i + 2) * numSrc + ps.srcIdx] * ps.scale;
+                        const double s0 = srcWin[(s + 2) * numSrc + ps.srcIdx] * ps.scale;
                         if (atyp_ == AnalysisType::Phase) {
                             bPtr[ps.curIdx] = s0;
                         } else {
-                            const double s1 = srcAll[(i + 1) * numSrc + ps.srcIdx] * ps.scale;
-                            const double s2 = srcAll[i * numSrc + ps.srcIdx] * ps.scale;
+                            const double s1 = srcWin[(s + 1) * numSrc + ps.srcIdx] * ps.scale;
+                            const double s2 = srcWin[s * numSrc + ps.srcIdx] * ps.scale;
                             if (i == 0) {
                                 bPtr[ps.curIdx] = (Constants::SIGMA / stepSize_) * (1.5 * s0);
                             } else if (i == 1) {
@@ -6098,15 +6299,7 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
     std::vector<TrialDeviceScales> trialScales;
     compute_trial_scales(mObj, trialScales);
 
-    const int64_t       numSrc = static_cast<int64_t>(mObj.sourcegen.size());
-    std::vector<double> srcAll(static_cast<size_t>((simSize_ + 2) * std::max<int64_t>(1, numSrc)), 0.0);
-    if (numSrc > 0) {
-        for (int64_t i = 0; i < simSize_; ++i) {
-            const double t   = i * stepSize_;
-            double*      row = srcAll.data() + (i + 2) * numSrc;
-            for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) { row[srcIdx] = mObj.sourcegen[srcIdx].value(t); }
-        }
-    }
+    const int64_t numSrc = static_cast<int64_t>(mObj.sourcegen.size());
 
     if (verb_ >= 1) {
         std::cout << "JoSIM: Running Batched Schur-Complement Nodal Solver (" << B << " trials, N = " << N
@@ -6122,7 +6315,29 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
         bar.set_total(static_cast<float>(B));
     }
 
-    results.mcTraceOut.assign(static_cast<size_t>(B * nBaseTraces * numKeptSteps_), 0.0);
+    struct McEvtTraceDesc {
+        int32_t relTraceIdx = -1;
+        int32_t s1          = -1;
+        int32_t s2          = -1;
+    };
+    std::vector<McEvtTraceDesc> evtTraces;
+    if (eventsOnly_) {
+        results.mcTraceOut.clear();
+        results.mcTraceOut.shrink_to_fit();
+        mcEventTrackers_.assign(
+                static_cast<size_t>(B), std::vector<InLoopEventTracker>(mObj.relevantTraces.size()));
+        for (size_t idx = 0; idx < mObj.relevantTraces.size(); ++idx) {
+            const auto& tr = mObj.relevantTraces[idx];
+            if (tr.storageType != StorageType::Phase) { continue; }
+            McEvtTraceDesc d;
+            d.relTraceIdx = static_cast<int32_t>(idx);
+            d.s1          = (tr.index1 && *tr.index1 >= 0 && *tr.index1 < N) ? results.mcRowToSlot[*tr.index1] : -1;
+            d.s2          = (tr.index2 && *tr.index2 >= 0 && *tr.index2 < N) ? results.mcRowToSlot[*tr.index2] : -1;
+            evtTraces.push_back(d);
+        }
+    } else {
+        results.mcTraceOut.assign(static_cast<size_t>(B * nBaseTraces * numKeptSteps_), 0.0);
+    }
     bool anyNeedsTR = false;
     bool anySingErr = false;
 
@@ -6149,6 +6364,14 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
         std::vector<double> trialNz = nodalFixedNz_;
         for (const auto& kv : nodalScaleH_) { trialNz[kv.first] += kv.second; }
         for (const auto& kv : nodalScaleInvH_) { trialNz[kv.first] += kv.second; }
+
+        std::vector<Function> trialSrcs = mObj.sourcegen;
+        for (const auto& kv : ts.srcOverrides) {
+            if (kv.first >= 0 && kv.first < static_cast<int32_t>(trialSrcs.size())) {
+                trialSrcs[kv.first] = kv.second;
+            }
+        }
+        std::vector<double> srcRing(static_cast<size_t>(3 * std::max<int64_t>(1, numSrc)), 0.0);
 
         std::vector<GpuJJ>            trialJJs       = nodalJJs_;
         std::vector<GpuRes>           trialRess      = nodalRess_;
@@ -6188,20 +6411,31 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
         }
 
         for (const auto& es : nodalRLEdges_) {
-            const double rScale = (es.origResIdx >= 0) ? ts.resScale[es.origResIdx] : 1.0;
-            const double lScale = (es.origIndIdx >= 0) ? ts.indScale[es.origIndIdx] : 1.0;
-            const double zR     = es.zR0 * rScale;
-            const double zL     = es.zL0 * lScale;
-            const double zTot   = std::max(1e-30, zR + zL);
-            const double gEff   = 1.0 / zTot;
+            double zR = 0.0;
+            for (const auto& rp : es.resParts) {
+                const double sc = (rp.first >= 0) ? ts.resScale[rp.first] : 1.0;
+                zR += rp.second * sc;
+            }
+            double zL = 0.0;
+            for (const auto& lp : es.indParts) {
+                const double sc = (lp.first >= 0) ? ts.indScale[lp.first] : 1.0;
+                zL += lp.second * sc;
+            }
+            const double zTot = std::max(1e-30, zR + zL);
+            const double gEff = 1.0 / zTot;
             add_stamp(es.nzIdxPP, es.nzIdxQQ, es.nzIdxPQ, es.nzIdxQP, gEff);
             if (es.nodalResIdx >= 0) {
                 trialRess[es.nodalResIdx].g     = gEff;
                 trialRess[es.nodalResIdx].alpha = zR / zTot;
             }
             if (es.nodalIndIdx >= 0) {
-                trialInds[es.nodalIndIdx].g  = gEff;
-                trialInds[es.nodalIndIdx].L *= lScale;
+                double lTot = 0.0;
+                for (const auto& lp : es.indLParts) {
+                    const double sc = (lp.first >= 0) ? ts.indScale[lp.first] : 1.0;
+                    lTot += lp.second * sc;
+                }
+                trialInds[es.nodalIndIdx].g = gEff;
+                trialInds[es.nodalIndIdx].L = lTot;
             }
         }
 
@@ -6264,6 +6498,22 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
         std::vector<double> trialX      = x_;
         std::vector<double> trialNodalX = nodalX_;
         std::vector<double> trialNodalB(static_cast<size_t>(nRed), 0.0);
+
+        constexpr int32_t   TILE_K = 64;
+        std::vector<double> traceTile(
+                eventsOnly_ ? 0 : static_cast<size_t>(nBaseTraces * TILE_K), 0.0);
+        int32_t             tileStartSlot = 0;
+        int32_t             tileCount     = 0;
+        std::vector<double> stepTraceVals(eventsOnly_ ? static_cast<size_t>(nBaseTraces) : 0, 0.0);
+        if (eventsOnly_) {
+            auto& trialTrackers = mcEventTrackers_[b];
+            for (const auto& ed : evtTraces) {
+                auto& trk   = trialTrackers[ed.relTraceIdx];
+                trk.traceId = ed.relTraceIdx;
+                trk.sign    = 1;
+                trk.init_metrics(eventMetrics_);
+            }
+        }
 
         auto read_nx = [&](int32_t idx) -> double {
             if (idx >= 0) { return trialNodalX[idx]; }
@@ -6473,10 +6723,21 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
                 if (gc.negIdx >= 0) { trialNodalB[gc.negIdx] -= jCap; }
             }
 
+            const double* srcRow0 = srcRing.data() + (i % 3) * numSrc;
+            const double* srcRow1 = (i >= 1) ? (srcRing.data() + ((i - 1) % 3) * numSrc) : nullptr;
+            const double* srcRow2 = (i >= 2) ? (srcRing.data() + ((i - 2) % 3) * numSrc) : nullptr;
+            if (numSrc > 0) {
+                const double t    = i * stepSize_;
+                double*      rCur = srcRing.data() + (i % 3) * numSrc;
+                for (int64_t srcIdx = 0; srcIdx < numSrc; ++srcIdx) {
+                    rCur[srcIdx] = trialSrcs[srcIdx].value(t);
+                }
+            }
+
             // Current Sources
             for (int64_t cIdx = 0; cIdx < nCS; ++cIdx) {
                 const GpuCS& cs     = trialCSs[cIdx];
-                const double srcVal = srcAll[(i + 2) * numSrc + cs.srcIdx] * cs.scale;
+                const double srcVal = srcRow0[cs.srcIdx] * cs.scale;
                 if (cs.posIdx >= 0) { trialNodalB[cs.posIdx] -= srcVal; }
                 if (cs.negIdx >= 0) { trialNodalB[cs.negIdx] += srcVal; }
             }
@@ -6484,7 +6745,7 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
             // Voltage Sources
             for (int64_t vIdx = 0; vIdx < nVS; ++vIdx) {
                 GpuVS&       vs     = trialVSs[vIdx];
-                const double srcVal = srcAll[(i + 2) * numSrc + vs.srcIdx] * vs.scale;
+                const double srcVal = srcRow0[vs.srcIdx] * vs.scale;
                 if (atyp_ == AnalysisType::Voltage) {
                     trialNodalB[vs.curIdx] = srcVal;
                 } else {
@@ -6499,12 +6760,12 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
             // Phase Sources
             for (int64_t pIdx = 0; pIdx < nPS; ++pIdx) {
                 const GpuPS& ps = trialPSs[pIdx];
-                const double s0 = srcAll[(i + 2) * numSrc + ps.srcIdx] * ps.scale;
+                const double s0 = srcRow0[ps.srcIdx] * ps.scale;
                 if (atyp_ == AnalysisType::Phase) {
                     trialNodalB[ps.curIdx] = s0;
                 } else {
-                    const double s1 = srcAll[(i + 1) * numSrc + ps.srcIdx] * ps.scale;
-                    const double s2 = srcAll[i * numSrc + ps.srcIdx] * ps.scale;
+                    const double s1 = srcRow1 ? (srcRow1[ps.srcIdx] * ps.scale) : 0.0;
+                    const double s2 = srcRow2 ? (srcRow2[ps.srcIdx] * ps.scale) : 0.0;
                     if (i == 0) {
                         trialNodalB[ps.curIdx] = (Constants::SIGMA / stepSize_) * ((3.0 / 2.0) * s0);
                     } else if (i == 1) {
@@ -6667,6 +6928,7 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
 
             const int32_t kSlot = keptSlot_[i];
             if (kSlot >= 0) {
+                const int32_t localK = kSlot - tileStartSlot;
                 for (int64_t tIdx = 0; tIdx < nBaseTraces; ++tIdx) {
                     const GpuRelTrace& tr  = trialRelTraces[tIdx];
                     double             val = 0.0;
@@ -6691,11 +6953,43 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
                             val = vDiff;
                         }
                     }
-                    results.mcTraceOut[static_cast<size_t>(b * nBaseTraces + tIdx) * numKeptSteps_ + kSlot] = val;
+                    if (eventsOnly_) {
+                        stepTraceVals[tIdx] = val;
+                    } else {
+                        traceTile[static_cast<size_t>(tIdx) * TILE_K + localK] = val;
+                    }
+                }
+                if (eventsOnly_) {
+                    auto&        trialTrackers = mcEventTrackers_[b];
+                    const double tCur          = results.timeAxis[kSlot];
+                    for (const auto& ed : evtTraces) {
+                        const double phi = (ed.s1 >= 0 ? stepTraceVals[ed.s1] : 0.0)
+                                           - (ed.s2 >= 0 ? stepTraceVals[ed.s2] : 0.0);
+                        trialTrackers[ed.relTraceIdx].step(tCur, phi, eventMetrics_);
+                    }
+                } else {
+                    ++tileCount;
+                    if (tileCount == TILE_K || kSlot + 1 == numKeptSteps_) {
+                        double* baseDst = results.mcTraceOut.data()
+                                          + static_cast<size_t>(b * nBaseTraces) * numKeptSteps_ + tileStartSlot;
+                        for (int64_t tIdx = 0; tIdx < nBaseTraces; ++tIdx) {
+                            std::memcpy(baseDst + static_cast<size_t>(tIdx) * numKeptSteps_,
+                                        traceTile.data() + static_cast<size_t>(tIdx) * TILE_K,
+                                        static_cast<size_t>(tileCount) * sizeof(double));
+                        }
+                        tileStartSlot = kSlot + 1;
+                        tileCount     = 0;
+                    }
                 }
             }
         }
 
+        if (eventsOnly_ && !anyNeedsTR && !anySingErr) {
+            auto& trialTrackers = mcEventTrackers_[b];
+            for (const auto& ed : evtTraces) {
+                trialTrackers[ed.relTraceIdx].finalize(eventMetrics_);
+            }
+        }
         if (b == 0 && !anyNeedsTR && !anySingErr) {
             nodalX_ = trialNodalX;
         }
@@ -6712,11 +7006,13 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
         return;
     }
 
-    for (size_t tIdx = 0; tIdx < traceGlobRows.size(); ++tIdx) {
-        const int64_t globR = traceGlobRows[tIdx];
-        if (globR >= 0 && globR < static_cast<int64_t>(results.xVector.size()) && results.xVector[globR]) {
-            const double* src = results.mcTraceOut.data() + tIdx * static_cast<size_t>(numKeptSteps_);
-            results.xVector[globR]->assign(src, src + numKeptSteps_);
+    if (!eventsOnly_ && mObj.relevantTraces.empty()) {
+        for (size_t tIdx = 0; tIdx < traceGlobRows.size(); ++tIdx) {
+            const int64_t globR = traceGlobRows[tIdx];
+            if (globR >= 0 && globR < static_cast<int64_t>(results.xVector.size()) && results.xVector[globR]) {
+                const double* src = results.mcTraceOut.data() + tIdx * static_cast<size_t>(numKeptSteps_);
+                results.xVector[globR]->assign(src, src + numKeptSteps_);
+            }
         }
     }
     results.mcRuns         = B;

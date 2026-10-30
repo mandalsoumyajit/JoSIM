@@ -42,6 +42,7 @@ struct InLoopEventTracker {
     static constexpr int32_t LOOKBACK  = 1024;
     static constexpr int32_t LOOKAHEAD = 768;
 
+    double                firstPhi         = 0.0;
     double                prevPhi          = 0.0;
     double                prevT            = 0.0;
     int64_t               prevK            = 0;
@@ -211,6 +212,7 @@ struct InLoopEventTracker {
             histPhi[curStep & HIST_MASK] = phi;
         }
         if (!initialized) {
+            firstPhi    = phi;
             prevPhi     = phi;
             prevT       = tCurr;
             prevK       = k;
@@ -328,16 +330,19 @@ struct NodalPartition {
 };
 
 struct NodalRLEdgeStamp {
-    double  zR0         = 0.0;
-    double  zL0         = 0.0;
-    int32_t nzIdxPP     = -1;
-    int32_t nzIdxQQ     = -1;
-    int32_t nzIdxPQ     = -1;
-    int32_t nzIdxQP     = -1;
-    int32_t nodalResIdx = -1;
-    int32_t nodalIndIdx = -1;
-    int32_t origResIdx  = -1;
-    int32_t origIndIdx  = -1;
+    double                                  zR0         = 0.0;
+    double                                  zL0         = 0.0;
+    int32_t                                 nzIdxPP     = -1;
+    int32_t                                 nzIdxQQ     = -1;
+    int32_t                                 nzIdxPQ     = -1;
+    int32_t                                 nzIdxQP     = -1;
+    int32_t                                 nodalResIdx = -1;
+    int32_t                                 nodalIndIdx = -1;
+    int32_t                                 origResIdx  = -1;
+    int32_t                                 origIndIdx  = -1;
+    std::vector<std::pair<int32_t, double>> resParts;
+    std::vector<std::pair<int32_t, double>> indParts;
+    std::vector<std::pair<int32_t, double>> indLParts;
 };
 
 struct NodalCoupledIndStamp {
@@ -356,13 +361,14 @@ struct NodalCoupledMutStamp {
 };
 
 struct TrialDeviceScales {
-    std::vector<double> indScale;
-    std::vector<double> resScale;
-    std::vector<double> capScale;
-    std::vector<double> jjScale;
-    std::vector<double> vsScale;
-    std::vector<double> psScale;
-    std::vector<double> csScale;
+    std::vector<double>                       indScale;
+    std::vector<double>                       resScale;
+    std::vector<double>                       capScale;
+    std::vector<double>                       jjScale;
+    std::vector<double>                       vsScale;
+    std::vector<double>                       psScale;
+    std::vector<double>                       csScale;
+    std::vector<std::pair<int32_t, Function>> srcOverrides;
 };
 
 struct Nodal2TermStamp {
@@ -445,6 +451,7 @@ class Simulation {
     bool                gpu_                     = false;
     int64_t             gpuMode_                 = 1;
     bool                nodal_                   = false;
+    int64_t             nodalLevel_              = 0;
     bool                bypass_                  = false;
     double              bypassTol_               = 1e-6;
     bool                fixedStep_               = false;
@@ -599,11 +606,12 @@ class Simulation {
     void handle_tx(Matrix& mObj, const int64_t& i, double& step, double factor = 1);
 
   public:
-    Results                         results;
-    bool                            eventsOnly_   = false;
-    uint32_t                        eventMetrics_ = 0u;
-    std::vector<uint8_t>            useEventTracker_;
-    std::vector<InLoopEventTracker> eventTrackers_;
+    Results                                      results;
+    bool                                         eventsOnly_   = false;
+    uint32_t                                     eventMetrics_ = 0u;
+    std::vector<uint8_t>                         useEventTracker_;
+    std::vector<InLoopEventTracker>              eventTrackers_;
+    std::vector<std::vector<InLoopEventTracker>> mcEventTrackers_;
 
     Simulation(Input& iObj, Matrix& mObj);
 };

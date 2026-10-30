@@ -345,33 +345,41 @@ uint32_t Input::parse_event_metrics(const std::string& spec, uint32_t currentMas
 
 void Input::parse_sweep_tokens(const tokens_t& c) {
     if (c.size() < 3) { return; }
-    SweepDim dim;
-    dim.target = c.at(1);
-    std::transform(dim.target.begin(), dim.target.end(), dim.target.begin(), ::toupper);
-
     tokens_t t = c;
     for (auto& s : t) {
         std::transform(s.begin(), s.end(), s.begin(), ::toupper);
     }
 
-    size_t startIdx  = 2;
+    SweepDim dim;
+    dim.target     = t.at(1);
+    size_t modeIdx = 2;
+    while (modeIdx < t.size()
+           && ((!dim.target.empty() && dim.target.back() == ',') || (!t.at(modeIdx).empty() && t.at(modeIdx).front() == ','))) {
+        dim.target += t.at(modeIdx);
+        ++modeIdx;
+    }
+    if (modeIdx >= t.size()) { return; }
+
+    const bool isMultiOrGroup
+            = (!dim.target.empty() && (dim.target.front() == '@' || dim.target.find(',') != std::string::npos));
+    size_t  startIdx  = modeIdx;
     int64_t explicitN = 0;
-    if (t.at(2) == "MARGIN" || t.at(2) == "REL" || t.at(2) == "SCALE" || t.at(2) == "MULT") {
+    if (t.at(modeIdx) == "MARGIN" || t.at(modeIdx) == "REL" || t.at(modeIdx) == "SCALE" || t.at(modeIdx) == "MULT") {
         dim.mode       = SweepMode::Margin;
         dim.isRelative = true;
-        startIdx       = 3;
-    } else if (t.at(2) == "LIST") {
+        startIdx       = modeIdx + 1;
+    } else if (t.at(modeIdx) == "LIST") {
         dim.mode       = SweepMode::List;
-        dim.isRelative = (!dim.target.empty() && dim.target.front() == '@');
-        startIdx       = 3;
-    } else if (t.at(2) == "LIN") {
+        dim.isRelative = isMultiOrGroup;
+        startIdx       = modeIdx + 1;
+    } else if (t.at(modeIdx) == "LIN") {
         dim.mode       = SweepMode::Linear;
-        dim.isRelative = (!dim.target.empty() && dim.target.front() == '@');
-        startIdx       = 3;
+        dim.isRelative = isMultiOrGroup;
+        startIdx       = modeIdx + 1;
     } else {
         dim.mode       = SweepMode::Linear;
-        dim.isRelative = (!dim.target.empty() && dim.target.front() == '@');
-        startIdx       = 2;
+        dim.isRelative = isMultiOrGroup;
+        startIdx       = modeIdx;
     }
 
     std::vector<double> numArgs;
@@ -508,8 +516,31 @@ void Input::parse_sweep_tokens(const tokens_t& c) {
 void Input::parse_sweep_spec(const std::string& spec) {
     if (spec.empty()) { return; }
     std::string cleaned = spec;
-    for (char& ch : cleaned) {
-        if (ch == ':' || ch == ',' || ch == ';') { ch = ' '; }
+    for (size_t idx = 0; idx < cleaned.size(); ++idx) {
+        char& ch = cleaned[idx];
+        if (ch == ':' || ch == ';') {
+            ch = ' ';
+        } else if (ch == ',') {
+            size_t next = idx + 1;
+            while (next < cleaned.size() && cleaned[next] == ' ') { ++next; }
+            bool isSep = false;
+            if (next < cleaned.size()) {
+                const char nc = cleaned[next];
+                if ((nc >= '0' && nc <= '9') || nc == '+' || nc == '-' || nc == '.') {
+                    isSep = true;
+                } else {
+                    std::string rem = cleaned.substr(next, 7);
+                    std::transform(rem.begin(), rem.end(), rem.begin(), ::toupper);
+                    if (rem.rfind("LIST", 0) == 0 || rem.rfind("LIN", 0) == 0 || rem.rfind("MARGIN", 0) == 0
+                        || rem.rfind("REL", 0) == 0 || rem.rfind("SCALE", 0) == 0 || rem.rfind("MULT", 0) == 0
+                        || rem.rfind("ABS", 0) == 0 || rem.rfind("N=", 0) == 0 || rem.rfind("COUNT=", 0) == 0
+                        || rem.rfind("POINTS=", 0) == 0) {
+                        isSep = true;
+                    }
+                }
+            }
+            if (isSep) { ch = ' '; }
+        }
     }
     tokens_t toks = Misc::tokenize(cleaned);
     if (toks.empty()) { return; }
@@ -583,10 +614,18 @@ void Input::parse_options_and_state_controls() {
                 } else if (tok == "GPU=0" || tok == "GPU=FALSE") {
                     argGpu     = false;
                     argGpuMode = 0;
-                } else if (tok == "NODAL" || tok == "NODAL=1" || tok == "NODAL=TRUE") {
-                    argNodal = true;
+                } else if (tok == "NODAL" || tok == "NODAL=TRUE" || tok == "NODAL=AUTO") {
+                    argNodal      = true;
+                    argNodalLevel = 0;
+                } else if (tok == "NODAL=1") {
+                    argNodal      = true;
+                    argNodalLevel = 1;
+                } else if (tok == "NODAL=2") {
+                    argNodal      = true;
+                    argNodalLevel = 2;
                 } else if (tok == "NODAL=0" || tok == "NODAL=FALSE") {
-                    argNodal = false;
+                    argNodal      = false;
+                    argNodalLevel = 0;
                 } else if (tok == "BYPASS" || tok == "BYPASS=1" || tok == "BYPASS=TRUE" || tok == "LATENCY"
                            || tok == "LATENCY=1") {
                     argBypass = true;

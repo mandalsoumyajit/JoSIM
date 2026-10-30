@@ -455,49 +455,39 @@ void JoSIM::update_parameters(param_map& parameters) {
 }
 
 void JoSIM::expand_inline_parameters(std::pair<tokens_t, string_o>& s, param_map& parameters) {
-    int_o oPos, cPos;
-    // Loop through all the provided tokens, expanding any parameters
-    for (auto i = 0; i < s.first.size(); ++i) {
-        // If there exists a opening curly parenthesis, an expression exists
-        if (s.first.at(i).find("{") != std::string::npos) { oPos = i; }
-        // If there exists a closing curly parenthesis, an expression exists
-        if (s.first.at(i).find("}") != std::string::npos) { cPos = i; }
-    }
-    // If an expression opening was found
-    if (oPos) {
-        //  Then a closing brace must exist
-        if (!cPos) {
-            // Complain if it doesn't
+    while (true) {
+        int_o oPos, cPos;
+        for (size_t i = 0; i < s.first.size(); ++i) {
+            if (!oPos && s.first.at(i).find('{') != std::string::npos) { oPos = static_cast<int64_t>(i); }
+            if (s.first.at(i).find('}') != std::string::npos) {
+                cPos = static_cast<int64_t>(i);
+                if (oPos) { break; }
+            }
+        }
+        if (!oPos && !cPos) { break; }
+        if (!oPos || !cPos || cPos.value() < oPos.value()) {
             Errors::parsing_errors(ParsingErrors::INVALID_DECLARATION, Misc::vector_to_string(s.first));
+            break;
         }
         if (cPos.value() != oPos.value()) {
             s.first.at(oPos.value()) = Misc::vector_to_string(
                     tokens_t{s.first.begin() + oPos.value(), s.first.begin() + cPos.value() + 1}, "");
             s.first.erase(s.first.begin() + oPos.value() + 1, s.first.begin() + cPos.value() + 1);
         }
-        tokens_t temp  = Misc::tokenize(s.first.at(oPos.value()), "{}", true, true, 2);
-        double   value = parse_param(temp.back(), parameters, s.second, false);
-        // If the returned value is not NaN
+        const std::string& tok    = s.first.at(oPos.value());
+        const size_t       lBrace = tok.find('{');
+        const size_t       rBrace = tok.find('}', lBrace);
+        if (lBrace == std::string::npos || rBrace == std::string::npos || rBrace <= lBrace + 1) {
+            Errors::parsing_errors(ParsingErrors::INVALID_DECLARATION, Misc::vector_to_string(s.first));
+            break;
+        }
+        const std::string prefix = tok.substr(0, lBrace);
+        const std::string expr   = tok.substr(lBrace + 1, rBrace - lBrace - 1);
+        const std::string suffix = tok.substr(rBrace + 1);
+        const double      value  = parse_param(expr, parameters, s.second, false);
         if (std::isnan(value)) {
-            // Complain of invalid parameter expression
             Errors::parsing_errors(ParsingErrors::UNIDENTIFIED_PART, Misc::vector_to_string(s.first));
         }
-        // Erase the expression part of the tokens
-        s.first.erase(s.first.begin() + oPos.value(), s.first.begin() + oPos.value() + 1);
-        if (temp.size() > 1) {
-            // Insert the double value in the place of the expression
-            s.first.insert(s.first.begin() + oPos.value(),
-                           Misc::vector_to_string(tokens_t{temp.front(), Misc::precise_to_string(value)}, ""));
-        } else {
-            s.first.insert(s.first.begin() + oPos.value(), Misc::precise_to_string(value));
-        }
-    }
-    // If an expression closing was found
-    if (cPos) {
-        //  Then a opening brace must exist
-        if (!oPos) {
-            // Complain if it doesn't
-            Errors::parsing_errors(ParsingErrors::INVALID_DECLARATION, Misc::vector_to_string(s.first));
-        }
+        s.first.at(oPos.value()) = prefix + Misc::precise_to_string(value) + suffix;
     }
 }

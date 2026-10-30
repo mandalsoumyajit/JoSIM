@@ -172,7 +172,7 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                         }
                     }
                     break;
-                    // Enable Schur-complement nodal admittance solver (Tier 4)
+                    // Enable Schur-complement nodal admittance solver
                 case 'n':
                     out.nodal = (i.second.value_or("1") != "0");
                     break;

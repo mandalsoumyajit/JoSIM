@@ -39,65 +39,11 @@ The documentation is organized by workflow so you can jump directly to netlist s
 
 JoSIM provides a general-purpose co-simulation framework for simulating **hybrid cryogenic systems** that combine superconducting electronics (**JoSIM**: RSFQ/ERSFQ/AQFP logic, dc-SQUIDs, SNSPDs, and electrothermal `nTron`/`hTron` nanowires) with semiconducting circuits (**SPICE**: 4K Cryo-CMOS, SiGe HBT, or III-V LNA/driver circuits) in **Cadence Spectre**, **`ngspice`**, and **ADI `LTspice`**.
 
-### Co-Simulation Block Diagram
+### Co-Simulation Architecture
 
-```mermaid
-flowchart TB
-    subgraph SPICE["Semiconducting SPICE Simulators (4K Cryo-CMOS / SiGe / BiCMOS)"]
-        direction LR
-        SPECTRE["<b>Cadence Spectre / APS / Spectre X</b><br/><code>josim_cosim_port.va</code><br/>+ <code>libjosim_spectre_dpi.so</code> (<code>-cds_va_dpi</code>)"]
-        NGSPICE["<b>ngspice</b><br/>Native XSPICE Code Model<br/><code>josim_cosim.cm</code> (<code>%gd</code> ports)"]
-        LTSPICE["<b>ADI LTspice / Batch SPICE</b><br/>Multi-Window Branin Wave &amp; Damped PWL<br/><code>scripts/josim_cosim.py</code>"]
-        PYAPP["<b>Python / C Flows</b><br/><code>pyjosim</code> &amp; <code>libjosim_c</code><br/>Zero-Copy NumPy &amp; AST Sessions"]
-    end
-
-    subgraph TRANSPORT["Boundary Coupling & Transport"]
-        direction LR
-        INPROC["<b>In-Process Shared Library</b><br/>Direct C ABI calls into <code>libjosim_c.so</code>"]
-        SERVER["<b>Multiplexed Co-Simulation Server</b><br/><code>josim-cosim-server</code> (<code>poll()</code> UNIX / TCP Sockets)<br/>Hosts 1..N Concurrent Superconducting Partitions"]
-    end
-
-    subgraph JOSIM["JoSIM Superconducting Engine (Phase / Voltage MNA + Nodal KLU)"]
-        direction LR
-        PORT["<b>Exact KLU Boundary Companion</b><br/>• Driving-Point Norton: I_p(V_p) &amp; G_eq = dI_p/dV_p<br/>• Driving-Point Thevenin: V_p(I_p) &amp; R_eq = dV_p/dI_p<br/>• Branin Wave Port: w_in(t) = 2 b(t - Td) (Z0, Td)"]
-        CKPT["<b>2-Slot State Rollback Ring</b><br/><code>ckpt_committed</code> (t_n) &amp; <code>ckpt_eval</code> (t_{n+1})<br/>• Same-time NR re-evaluation<br/>• Automatic SPICE LTE step-rejection rollback"]
-        PHYS["<b>Superconducting Device Physics</b><br/>• RCSJ Josephson Junctions (<code>B</code>, RTYPE=0/1, Thermal Noise)<br/>• Electrothermal Nanowires (<code>N</code>: nTron / hTron / SNSPD)<br/>• Coupled Inductors (<code>L</code>, <code>K</code>) &amp; Lossy/Lossless PTLs (<code>T</code>)"]
-    end
-
-    SPECTRE --> INPROC & SERVER
-    NGSPICE --> INPROC & SERVER
-    LTSPICE --> INPROC & SERVER
-    PYAPP --> INPROC
-    INPROC & SERVER --> PORT
-    PORT <--> CKPT <--> PHYS
-```
-
-```text
-+---------------------------------------------------------------------------------------------------+
-|                   SEMICONDUCTING SPICE SIMULATORS (4K Cryo-CMOS / SiGe / BiCMOS)                  |
-|                                                                                                   |
-|  +-----------------------------+  +-----------------------------+  +---------------------------+  |
-|  |   Cadence Spectre / APS     |  |          ngspice            |  |       ADI LTspice         |  |
-|  |  josim_cosim_port.va        |  |  XSPICE josim_cosim.cm      |  |  Multi-Window Branin Wave |  |
-|  |  + libjosim_spectre_dpi.so  |  |  A_x [%gd(p1 n1 ...)] mod   |  |  & Damped PWL Relaxation  |  |
-|  +--------------+--------------+  +--------------+--------------+  +-------------+-------------+  |
-+-----------------|--------------------------------|-------------------------------|----------------+
-                  | Lockstep V(t) -> I_hist, G_eq  | Lockstep V(t) -> I(V), dI/dV  | Windowed Wave /
-                  | (with DC OP & LTE Rollback)    | (with NR & LTE Rollback)      | PWL Companion
-                  v                                v                               v
-+---------------------------------------------------------------------------------------------------+
-|            IN-PROCESS C API (libjosim_c.so)   OR   MULTIPLEXED IPC DAEMON (josim-cosim-server)    |
-|                        (Supports 1..N Concurrent JoSIM Subcircuit Partitions)                     |
-+---------------------------------------------------------------------------------------------------+
-                                                   |
-                                                   v
-+---------------------------------------------------------------------------------------------------+
-|                                 JoSIM SUPERCONDUCTING SOLVER CORE                                 |
-|  * Exact KLU Driving-Point Norton/Thevenin Jacobian (G_eq = dI_p/dV_p via A * u_p = e_p)          |
-|  * Two-Slot Checkpoint Ring (ckpt_committed, ckpt_eval) for NR Iteration & SPICE Step Rollback    |
-|  * Full RCSJ JJs (B), Electrothermal Nanowires (N: nTron/hTron/SNSPD), Mutual L/K, and PTLs (T)   |
-+---------------------------------------------------------------------------------------------------+
-```
+<p align="center">
+  <img src="docs/img/josim_cosim_arch.svg" width="900" alt="JoSIM-SPICE Co-Simulation Architecture"/>
+</p>
 
 ### Co-Simulation Highlights & Ready-to-Run Example Decks
 - **Lockstep Native MNA Coupling (`ngspice` & Cadence Spectre):** Stamps JoSIM's exact KLU driving-point Norton conductance $G_{\text{eq}} = \partial I_p / \partial V_p$ and companion current directly into the SPICE Jacobian at every Newton–Raphson iteration, with automatic state rollback whenever SPICE rejects a timestep due to local truncation error (LTE).

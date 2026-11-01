@@ -6,36 +6,9 @@ JoSIM (`v2.8`) includes a modular **superconducting/semiconducting co-simulation
 
 ## 1. Co-Simulation Architecture & Block Diagram
 
-```mermaid
-flowchart TB
-    subgraph SPICE["Semiconducting SPICE Simulators (4K Cryo-CMOS / SiGe / BiCMOS)"]
-        direction LR
-        SPECTRE["<b>Cadence Spectre / APS / Spectre X</b><br/><code>josim_cosim_port.va</code><br/>+ <code>libjosim_spectre_dpi.so</code> (<code>-cds_va_dpi</code>)"]
-        NGSPICE["<b>ngspice</b><br/>Native XSPICE Code Model<br/><code>josim_cosim.cm</code> (<code>%gd</code> ports)"]
-        LTSPICE["<b>ADI LTspice / Batch SPICE</b><br/>Multi-Window Branin Wave &amp; Damped PWL<br/><code>scripts/josim_cosim.py</code>"]
-        PYAPP["<b>Python / C Flows</b><br/><code>pyjosim</code> &amp; <code>libjosim_c</code><br/>Zero-Copy NumPy &amp; AST Sessions"]
-    end
-
-    subgraph TRANSPORT["Boundary Coupling & Transport"]
-        direction LR
-        INPROC["<b>In-Process Shared Library</b><br/>Direct C ABI calls into <code>libjosim_c.so</code>"]
-        SERVER["<b>Multiplexed Co-Simulation Server</b><br/><code>josim-cosim-server</code> (<code>poll()</code> UNIX / TCP Sockets)<br/>Hosts 1..N Concurrent Superconducting Partitions"]
-    end
-
-    subgraph JOSIM["JoSIM Superconducting Engine (Phase / Voltage MNA + Nodal KLU)"]
-        direction LR
-        PORT["<b>Exact KLU Boundary Companion</b><br/>• Driving-Point Norton: I_p(V_p) &amp; G_eq = dI_p/dV_p<br/>• Driving-Point Thevenin: V_p(I_p) &amp; R_eq = dV_p/dI_p<br/>• Branin Wave Port: w_in(t) = 2 b(t - Td) (Z0, Td)"]
-        CKPT["<b>2-Slot State Rollback Ring</b><br/><code>ckpt_committed</code> (t_n) &amp; <code>ckpt_eval</code> (t_{n+1})<br/>• Same-time NR re-evaluation<br/>• Automatic SPICE LTE step-rejection rollback"]
-        PHYS["<b>Superconducting Device Physics</b><br/>• RCSJ Josephson Junctions (<code>B</code>, RTYPE=0/1, Thermal Noise)<br/>• Electrothermal Nanowires (<code>N</code>: nTron / hTron / SNSPD)<br/>• Coupled Inductors (<code>L</code>, <code>K</code>) &amp; Lossy/Lossless PTLs (<code>T</code>)"]
-    end
-
-    SPECTRE --> INPROC & SERVER
-    NGSPICE --> INPROC & SERVER
-    LTSPICE --> INPROC & SERVER
-    PYAPP --> INPROC
-    INPROC & SERVER --> PORT
-    PORT <--> CKPT <--> PHYS
-```
+<p align="center">
+  <img src="img/josim_cosim_arch.svg" width="900" alt="JoSIM-SPICE Co-Simulation Architecture"/>
+</p>
 
 | Architectural Component | Target Simulators / Use Cases | Key Files |
 | :--- | :--- | :--- |

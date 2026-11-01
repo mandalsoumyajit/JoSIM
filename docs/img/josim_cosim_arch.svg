@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 276" width="920" height="276" font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow-r" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="#475569"/>
+    </marker>
+    <marker id="arrow-l" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 10 1.5 L 2 5 L 10 8.5 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="920" height="276" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+
+  <!-- ==================== COLUMN 1: SPICE SIMULATORS ==================== -->
+  <rect x="14" y="12" width="284" height="252" rx="6" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="156" y="31" text-anchor="middle" font-size="12" font-weight="700" fill="#1e3a8a">SEMICONDUCTING SPICE (4K Cryo-CMOS / SiGe)</text>
+
+  <!-- Box 1.1: Cadence Spectre -->
+  <rect x="24" y="42" width="264" height="48" rx="4" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+  <text x="34" y="59" font-size="11.5" font-weight="700" fill="#0f172a">Cadence Spectre / APS / Spectre X</text>
+  <text x="34" y="74" font-size="10.2" font-family="Consolas, monospace" fill="#334155">josim_cosim_port.va + libjosim_spectre_dpi.so</text>
+  <text x="34" y="85" font-size="9.5" fill="#475569">Native CDS_VA_DPI (-cds_va_dpi) &amp; Xcelium DPI-C</text>
+
+  <!-- Box 1.2: ngspice -->
+  <rect x="24" y="97" width="264" height="48" rx="4" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+  <text x="34" y="114" font-size="11.5" font-weight="700" fill="#0f172a">ngspice (Lockstep XSPICE)</text>
+  <text x="34" y="129" font-size="10.2" font-family="Consolas, monospace" fill="#334155">josim_cosim.cm : A_x [%gd(p1 n1 ...)] mod</text>
+  <text x="34" y="140" font-size="9.5" fill="#475569">Direct MNA Jacobian stamp &amp; LTE step-rejection hook</text>
+
+  <!-- Box 1.3: ADI LTspice -->
+  <rect x="24" y="152" width="264" height="48" rx="4" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+  <text x="34" y="169" font-size="11.5" font-weight="700" fill="#0f172a">ADI LTspice &amp; Batch SPICE</text>
+  <text x="34" y="184" font-size="10.2" font-family="Consolas, monospace" fill="#334155">scripts/josim_cosim.py (--config job.json)</text>
+  <text x="34" y="195" font-size="9.5" fill="#475569">Multi-Window Branin Wave (W &lt;= Td) &amp; Damped PWL</text>
+
+  <!-- Box 1.4: Python / C API -->
+  <rect x="24" y="207" width="264" height="48" rx="4" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2"/>
+  <text x="34" y="224" font-size="11.5" font-weight="700" fill="#0f172a">Python / C Custom Flows</text>
+  <text x="34" y="239" font-size="10.2" font-family="Consolas, monospace" fill="#334155">pyjosim.Session / libjosim_c.so</text>
+  <text x="34" y="250" font-size="9.5" fill="#475569">Zero-copy NumPy waveforms, SFQ events &amp; AST cache</text>
+
+  <!-- ==================== ARROWS COL 1 <-> COL 2 ==================== -->
+  <line x1="298" y1="66" x2="342" y2="66" stroke="#475569" stroke-width="1.5" marker-start="url(#arrow-l)" marker-end="url(#arrow-r)"/>
+  <line x1="298" y1="121" x2="342" y2="121" stroke="#475569" stroke-width="1.5" marker-start="url(#arrow-l)" marker-end="url(#arrow-r)"/>
+  <line x1="298" y1="176" x2="342" y2="176" stroke="#475569" stroke-width="1.5" marker-start="url(#arrow-l)" marker-end="url(#arrow-r)"/>
+  <line x1="298" y1="231" x2="342" y2="231" stroke="#475569" stroke-width="1.5" marker-start="url(#arrow-l)" marker-end="url(#arrow-r)"/>
+
+  <!-- ==================== COLUMN 2: COUPLING & TRANSPORT ==================== -->
+  <rect x="344" y="12" width="232" height="252" rx="6" fill="#fefce8" stroke="#eab308" stroke-width="1.5"/>
+  <text x="460" y="31" text-anchor="middle" font-size="12" font-weight="700" fill="#854d0e">BOUNDARY &amp; TRANSPORT</text>
+
+  <!-- Box 2.1: Boundary Modes -->
+  <rect x="354" y="42" width="212" height="104" rx="4" fill="#ffffff" stroke="#fde047" stroke-width="1.2"/>
+  <text x="364" y="57" font-size="11.5" font-weight="700" fill="#0f172a">Port Coupling Protocols</text>
+  <text x="364" y="72" font-size="10" fill="#1e293b">• <tspan font-weight="600">Lockstep Norton (Mode 0):</tspan></text>
+  <text x="374" y="84" font-size="9.6" font-family="Consolas, monospace" fill="#334155">V_p -&gt; I_hist, G_eq = dI_p/dV_p</text>
+  <text x="364" y="99" font-size="10" fill="#1e293b">• <tspan font-weight="600">Lockstep Thevenin (Mode 1):</tspan></text>
+  <text x="374" y="111" font-size="9.6" font-family="Consolas, monospace" fill="#334155">I_p -&gt; V_hist, R_eq = dV_p/dI_p</text>
+  <text x="364" y="126" font-size="10" fill="#1e293b">• <tspan font-weight="600">Branin T-Line Wave (Mode 2):</tspan></text>
+  <text x="374" y="138" font-size="9.6" font-family="Consolas, monospace" fill="#334155">w_in(t) = 2*b(t - Td) (Z0, Td)</text>
+
+  <!-- Box 2.2: Transport -->
+  <rect x="354" y="152" width="212" height="103" rx="4" fill="#ffffff" stroke="#fde047" stroke-width="1.2"/>
+  <text x="364" y="169" font-size="11.5" font-weight="700" fill="#0f172a">Execution Transport</text>
+  <text x="364" y="186" font-size="10" fill="#1e293b">• <tspan font-weight="600">In-Process Library:</tspan></text>
+  <text x="374" y="199" font-size="9.8" font-family="Consolas, monospace" fill="#334155">libjosim_c.so (zero-IPC call)</text>
+  <text x="364" y="216" font-size="10" fill="#1e293b">• <tspan font-weight="600">Multiplexed Socket Daemon:</tspan></text>
+  <text x="374" y="229" font-size="9.8" font-family="Consolas, monospace" fill="#334155">josim-cosim-server (poll())</text>
+  <text x="374" y="242" font-size="9.5" fill="#475569">UNIX / TCP; 1..N concurrent chips</text>
+
+  <!-- ==================== ARROWS COL 2 <-> COL 3 ==================== -->
+  <line x1="576" y1="93" x2="620" y2="93" stroke="#475569" stroke-width="1.5" marker-start="url(#arrow-l)" marker-end="url(#arrow-r)"/>
+  <line x1="576" y1="203" x2="620" y2="203" stroke="#475569" stroke-width="1.5" marker-start="url(#arrow-l)" marker-end="url(#arrow-r)"/>
+
+  <!-- ==================== COLUMN 3: JOSIM ENGINE ==================== -->
+  <rect x="622" y="12" width="284" height="252" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="764" y="31" text-anchor="middle" font-size="12" font-weight="700" fill="#14532d">JoSIM SUPERCONDUCTING SOLVER CORE</text>
+
+  <!-- Box 3.1: Exact KLU Companion -->
+  <rect x="632" y="42" width="264" height="64" rx="4" fill="#ffffff" stroke="#86efac" stroke-width="1.2"/>
+  <text x="642" y="59" font-size="11.5" font-weight="700" fill="#0f172a">Exact KLU Driving-Point Jacobian</text>
+  <text x="642" y="75" font-size="10" fill="#334155">Solves <tspan font-family="Consolas, monospace">A * u_p = e_p</tspan> via pre-factored KLU (L, U)</text>
+  <text x="642" y="89" font-size="10" fill="#334155">Stamps exact <tspan font-family="Consolas, monospace">G_eq</tspan> &amp; <tspan font-family="Consolas, monospace">I_hist</tspan> for 2-4 iter NR convergence</text>
+  <text x="642" y="101" font-size="9.5" fill="#15803d">Supports Spectre dcOp dc (skipdc=no) &amp; cmin immunity</text>
+
+  <!-- Box 3.2: Two-Slot Rollback Ring -->
+  <rect x="632" y="114" width="264" height="64" rx="4" fill="#ffffff" stroke="#86efac" stroke-width="1.2"/>
+  <text x="642" y="131" font-size="11.5" font-weight="700" fill="#0f172a">Two-Slot State Checkpoint Ring</text>
+  <text x="642" y="147" font-size="10" font-family="Consolas, monospace" fill="#334155">ckpt_committed (t_n) &lt;-&gt; ckpt_eval (t_{n+1})</text>
+  <text x="642" y="161" font-size="9.8" fill="#334155">• Same-time NR re-eval (t == t_eval) &amp; sub-step interp</text>
+  <text x="642" y="173" font-size="9.8" fill="#334155">• Auto rollback on SPICE LTE step rejection (t &lt; t_eval)</text>
+
+  <!-- Box 3.3: Superconducting Physics -->
+  <rect x="632" y="186" width="264" height="69" rx="4" fill="#ffffff" stroke="#86efac" stroke-width="1.2"/>
+  <text x="642" y="203" font-size="11.5" font-weight="700" fill="#0f172a">Superconducting Device Physics &amp; Solvers</text>
+  <text x="642" y="218" font-size="9.8" fill="#334155">• RCSJ Josephson Junctions (<tspan font-family="Consolas, monospace">B</tspan>, RTYPE=0/1, Noise, CPR)</text>
+  <text x="642" y="232" font-size="9.8" fill="#334155">• Electrothermal Nanowires (<tspan font-family="Consolas, monospace">N</tspan>: nTron, hTron, SNSPD)</text>
+  <text x="642" y="246" font-size="9.8" fill="#334155">• Coupled L/K, Lossy/Lossless PTLs (<tspan font-family="Consolas, monospace">T</tspan>), Nodal KLU (<tspan font-family="Consolas, monospace">-n</tspan>)</text>
+</svg>

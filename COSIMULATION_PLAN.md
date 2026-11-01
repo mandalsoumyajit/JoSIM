@@ -75,26 +75,39 @@ Implemented in [`include/JoSIM/josim_spectre_dpi.h`](include/JoSIM/josim_spectre
 
 We benchmarked our partitioned JoSIM co-simulation architecture against the alternative of embedding a Verilog-A RCSJ Josephson junction model ([`seeqc_jj3.va`](../spec2si-seeqc/models/veriloga/seeqc_jj3.va) from `spec2si-seeqc`) directly inside SPICE/Spectre across three tiers:
 
-### 6.1 Tier 1: Local `ngspice-45.2` + `openvaf 23.5.0` (`seeqc_jj3.osdi` vs. `josim_cosim.cm`)
-Hybrid circuit: **32 Cryo-CMOS MOSFETs** (clocked 16-stage inverter/buffer tree) + **$N_{\text{JJ}}$-stage RSFQ JTL chain** ($90\text{ ps}$ transient, 2 SFQ pulses):
+### 6.1 Tier 1: Local `ngspice-45.2` + `openvaf 23.5.0` (`seeqc_jj3.osdi` vs. 2-Port `josim_cosim.cm`)
+Fair like-for-like hybrid circuit: **32 Cryo-CMOS MOSFETs** (clocked 16-stage inverter/buffer tree) + **$N_{\text{JJ}}$-stage RSFQ JTL chain** with identical junction parameters on both sides (`ic=100u, cap=50f, rqp=4.0`), identical step limit (`0.1 ps`), stop time after both SFQ pulses reach the far end (`jtl_N`), and a 2-port `josim_cosim.cm` returning `jtl_N` to `ngspice` (`Rload jtl_N 0 5.0` on the `ngspice` side):
 
-| $N_{\text{JJ}}$ | $N_{\text{MOSFET}}$ | Monolithic `seeqc_jj3.osdi` Wall (s) | Partitioned `josim_cosim.cm` Wall (s) | **Speedup** | `seeqc_jj3.osdi` SPICE Iters / Pts | `josim_cosim.cm` SPICE Iters / Pts | Extra SPICE Phase Nodes (`seeqc_jj3` vs. Co-Sim) |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **16** | 32 | $0.0677\text{ s}$ | $0.0200\text{ s}$ | **$3.38\times$** | 1,577 / 767 | 1,082 / 503 | $+16$ vs. $0$ |
-| **40** | 32 | $0.1379\text{ s}$ | $0.0357\text{ s}$ | **$3.86\times$** | 1,569 / 767 | 1,082 / 503 | $+40$ vs. $0$ |
-| **80** | 32 | $0.2483\text{ s}$ | $0.0596\text{ s}$ | **$4.16\times$** | 1,562 / 767 | 1,082 / 503 | $+80$ vs. $0$ |
-| **160** | 32 | $4.3583\text{ s}$ | $0.1069\text{ s}$ | **$40.75\times$** | 1,562 / 767 | 1,082 / 503 | $+160$ vs. $0$ |
+| $N_{\text{JJ}}$ ($T_{\text{stop}}$) | Monolithic `seeqc_jj3.osdi` Wall (`0.1 ps` / `0.025 ps`) | Partitioned 2-Port `josim_cosim.cm` Wall (`0.1 ps`) | **Speedup vs. `0.1 ps` (`0.025 ps`)** | `seeqc_jj3.osdi` Far-End Arrival Error (`0.1 ps` / `0.025 ps`) | `josim_cosim.cm` Far-End Arrival Error (`0.1 ps`) |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **16** ($102\text{ ps}$) | $0.119\text{ s}$ | **$0.026\text{ s}$** | **$4.63\times$** | $0.014\text{ ps}$ | **$0.002\text{ ps}$** |
+| **40** ($150\text{ ps}$) | $0.247\text{ s}$ | **$0.051\text{ s}$** | **$4.82\times$** | $0.023\text{ ps}$ | **$0.001\text{ ps}$** |
+| **80** ($230\text{ ps}$) | $0.760\text{ s}$ | **$0.081\text{ s}$** | **$9.33\times$** | $0.037\text{ ps}$ | **$0.003\text{ ps}$** |
+| **100** ($260\text{ ps}$) | $1.18\text{ s}$ / $4.06\text{ s}$ | **$0.36\text{ s}$** | **$3.3\times$** (**$11.3\times$**) | $0.044\text{ ps}$ / $0.0024\text{ ps}$ | **$0.0014\text{ ps}$** |
+| **160** ($390\text{ ps}$) | $2.289\text{ s}$ | **$0.199\text{ s}$** | **$11.49\times$** | $0.066\text{ ps}$ | **$0.003\text{ ps}$** |
+| **1000** ($1.8\text{ ns}$) | $63.0\text{ s}$ / $251.0\text{ s}$ | **$6.69\text{ s}$** | **$9.4\times$** (**$37.5\times$**) | $0.37\text{ ps}$ / $0.029\text{ ps}$ | **$0.0003\text{ ps}$** |
+| **`macro-SPLIT`** (30-JJ macro + 20-JJ PTL testbench, $1.05\text{ ns}$) | $43.0\text{ s}$ (`0.05 ps`) / $66.0\text{ s}$ (`0.025 ps`) | **$21.93\text{ s}$** (`0.1 ps`) / **$33.09\text{ s}$** (`0.025 ps`) | **$1.96\times$** / **$2.00\times$** | $0.0006\text{ ps}$ / $0.0003\text{ ps}$ (80/80 events) | **$0.0021\text{ ps}$** / **$0.0002\text{ ps}$** (80/80 events) |
 
-### 6.2 Tier 2: Live Cadence Spectre 25.1 on `asic2.inst.bnl.gov` (`CMP2`: 32 MOSFETs + 100 JJs, $150\text{ ps}$)
+### 6.2 Tier 2: Live Cadence Spectre 25.1 on `asic2.inst.bnl.gov` (`CMP2`: Fair 2-Port JTLs & `macro-SPLIT`)
+All cases use identical junction parameters (`ic=100u, cap=50f, rqp=4.0`), return the far-end node(s) to Spectre via `josim_cosim_port_2p` / `josim_cosim_port_3p`, and measure whole-run wall time (including ~2 s `asic_tools.csh` Spectre startup), Spectre transient elapsed time, `josim-cosim-server` CPU time + peak RSS, and far-end timing error against monolithic JoSIM at `0.025 ps`:
 
-| Approach in Cadence Spectre 25.1 | `dcOp dc` Convergence | Accepted Spectre Steps | Intrinsic Transient CPU Time | **Transient CPU Speedup** |
-| :--- | :---: | :---: | :---: | :---: |
-| **Monolithic `seeqc_jj3.va` (100 JJs + 32 MOSFETs in Spectre)** | Fails (`skipdc=yes` required) | 2,072 | $0.2383\text{ s}$ | $1.00\times$ (baseline) |
-| **Partitioned `libjosim_spectre_dpi.so` + `josim-cosim-server`** | **Converges (`skipdc=no`)** | **772** ($2.68\times$ fewer) | **$0.0365\text{ s}$** | **$6.53\times$ faster** |
+| Circuit & Mode in Cadence Spectre 25.1 | `dcOp dc` | Spectre `tran` CPU / Elapsed (s) | Whole-Run Wall (s) | JoSIM Server CPU / RSS | Far-End Arrival / Event Error |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **100 JJs + 32 MOSFETs ($260\text{ ps}$): Monolithic `seeqc_jj3.va` (`maxstep=0.1p`)** | Fails (`skipdc=yes`) | $0.332\text{ s}$ / $0.336\text{ s}$ | $1.90\text{ s}$ | — | $0.0595\text{ ps}$ |
+| **100 JJs + 32 MOSFETs ($260\text{ ps}$): Monolithic `seeqc_jj3.va` (`maxstep=0.025p`)** | Fails (`skipdc=yes`) | $1.14\text{ s}$ / $1.15\text{ s}$ | $2.95\text{ s}$ | — | $0.0005\text{ ps}$ |
+| **100 JJs + 32 MOSFETs ($260\text{ ps}$): 2-Port Co-Sim (`maxstep=0.1p`)** | **Converges** | $0.106\text{ s}$ / $0.224\text{ s}$ | $2.38\text{ s}$ | **$0.13\text{ s}$ / $7.5\text{ MB}$** | **$0.0113\text{ ps}$** ($5.3\times$ lower error vs. `0.1p`) |
+| **100 JJs + 32 MOSFETs ($260\text{ ps}$): 2-Port Co-Sim (`maxstep=0.5p`)** | **Converges** | $0.057\text{ s}$ / $0.305\text{ s}$ | $2.50\text{ s}$ | **$0.23\text{ s}$ / $7.5\text{ MB}$** | **$0.0364\text{ ps}$** ($3.4\times$ lower error vs. `0.5p`) |
+| **1000 JJs + 32 MOSFETs ($1.8\text{ ns}$): Monolithic `seeqc_jj3.va` (`maxstep=0.1p`)** | Fails (`skipdc=yes`) | $21.0\text{ s}$ / $21.1\text{ s}$ | $23.1\text{ s}$ | — | $0.630\text{ ps}$ |
+| **1000 JJs + 32 MOSFETs ($1.8\text{ ns}$): Monolithic `seeqc_jj3.va` (`maxstep=0.025p`)** | Fails (`skipdc=yes`) | $72.0\text{ s}$ / $72.2\text{ s}$ | $74.5\text{ s}$ | — | $0.0024\text{ ps}$ |
+| **1000 JJs + 32 MOSFETs ($1.8\text{ ns}$): 2-Port Co-Sim (`maxstep=0.1p`)** | **Converges** | $0.88\text{ s}$ / $8.48\text{ s}$ | **$10.52\text{ s}$** (**$2.2\times\text{–}7.1\times$ faster**) | **$7.60\text{ s}$ / $16.1\text{ MB}$** | **$0.0109\text{ ps}$** ($58\times$ lower error vs. `0.1p`) |
+| **1000 JJs + 32 MOSFETs ($1.8\text{ ns}$): 2-Port Co-Sim (`maxstep=0.5p`)** | **Converges** | $0.76\text{ s}$ / $10.12\text{ s}$ | **$12.13\text{ s}$** (**$1.9\times\text{–}6.1\times$ faster**) | **$9.36\text{ s}$ / $16.1\text{ MB}$** | **$0.0548\text{ ps}$** ($11.5\times$ lower error vs. `0.1p`) |
+| **`macro-SPLIT` (30-JJ macro + 20-JJ PTL TB, $1.05\text{ ns}$): Monolithic Spectre (`0.05p` / `0.025p`)** | Fails (`skipdc=yes`) | $3.4\text{ s}$ / $6.4\text{ s}$ | $5.6\text{ s}$ / $8.6\text{ s}$ | — | $0.015\text{ ps}$ / $0.0061\text{ ps}$ (80/80 events) |
+| **`macro-SPLIT` (30-JJ macro in JoSIM, TB in Spectre): 3-Port Co-Sim (`0.1p` / `0.025p`)** | **Converges** | $0.45\text{ s}$ / $3.9\text{ s}$ | **$2.67\text{ s}$** / $7.15\text{ s}$ | **$0.49\text{ s}$ / $7.0\text{ MB}$** (`0.1p`) | **$0.0025\text{ ps}$** / **$0.0001\text{ ps}$** (80/80 events) |
 
-### 6.3 Tier 3: Empirical BNL Cluster RSFQ Macro & Chip Dataset (`spec2si-seeqc`)
+### 6.3 Tier 3: Standalone Monolithic JoSIM vs. Standalone Monolithic Spectre + `seeqc_jj3.va` (`spec2si-seeqc` Dataset)
+*(Note: This table compares standalone monolithic JoSIM against standalone monolithic Spectre + `seeqc_jj3.va` on pure SFQ circuits, not co-simulation.)*
 
-| Circuit / Benchmark Suite | Junctions & T-Lines | JoSIM Runtime (s) | Spectre + `seeqc_jj3.va` Runtime (s) | **JoSIM Speedup** | Accuracy / Convergence Notes |
+| Circuit / Benchmark Suite | Junctions & T-Lines | Standalone JoSIM Runtime (s) | Standalone Spectre + `seeqc_jj3.va` Runtime (s) | **Standalone JoSIM Speedup** | Accuracy / Convergence Notes |
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **9 `v6` RSFQ Macros Total** (`DCSFQ`, `DROC`, `FA`, `LA`, `MERGE`, `MERGE_SPLIT`, `SPLIT`, `SPLIT2`, `SPLIT3`) | 9 routed PTL macros | **$12.15\text{ s}$** | $62.61\text{ s}$ (at $0.05\text{ ps}$) | **$5.15\times$** ($>9\times$ at $0.025\text{ ps}$) | At `0.05 ps`, Spectre `seeqc_jj3.va` fails the $0.02\text{ rad}$ phase gate on `MERGE` ($0.031\text{ rad}$) and `MERGE_SPLIT` ($0.028\text{ rad}$), requiring `maxstep=0.025 ps` |
 | **Routed 4-Bit Adder Chip (`adder-r3`)** | 1,490 JJs, 629 PTLs ($33\text{ ns}$) | **$1,251\text{ s}$** ($20.8\text{ min}$) | $5,251\text{ s}$ ($87.5\text{ min}$) | **$4.20\times$** | Even at $4.2\times$ longer runtime, Spectre (`maxstep=0.1 ps`) accumulates $1.5\text{ ps}$ carry-chain drift ($0.088\text{ rad}$ vs. $0.02\text{ rad}$ threshold) |

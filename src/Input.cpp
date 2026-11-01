@@ -732,6 +732,16 @@ void Input::parse_margin_tokens(const tokens_t& c) {
                 }
                 continue;
             }
+            if (key == "TRACES" || key == "TRACE" || key == "MARGINTRACES" || key == "MARGIN_TRACES") {
+                size_t pos = 0;
+                while (pos < val.size()) {
+                    size_t next = val.find_first_of(",;", pos);
+                    if (next == std::string::npos) { next = val.size(); }
+                    if (next > pos) { marginTraces.push_back(val.substr(pos, next - pos)); }
+                    pos = next + 1;
+                }
+                continue;
+            }
         }
 
         std::string tokUpper = tok;
@@ -919,7 +929,7 @@ void Input::parse_assert_tokens(const tokens_t& c) {
                 as.bits         = decode_assert_bits(val);
                 hasExplicitKind = true;
             } else if (key == "COUNT" || key == "SFQ" || key == "NPULSES" || key == "PULSES") {
-                as.kind         = AssertKind::COUNT;
+                if (as.bits.empty()) { as.kind = AssertKind::COUNT; }
                 as.expCount     = static_cast<int64_t>(std::llround(parse_param(val, parameters)));
                 hasExplicitKind = true;
             } else if (key == "TIMES" || key == "AT") {
@@ -943,7 +953,7 @@ void Input::parse_assert_tokens(const tokens_t& c) {
                 as.td = parse_param(val, parameters);
             } else if (key == "PER" || key == "TBIT" || key == "PERIOD") {
                 as.per = parse_param(val, parameters);
-            } else if (key == "WINDOW" || key == "W" || key == "PW") {
+            } else if (key == "WINDOW" || key == "WIN" || key == "W" || key == "PW") {
                 as.window = parse_param(val, parameters);
             } else if (key == "TOL") {
                 as.tol = std::abs(parse_param(val, parameters));
@@ -2050,6 +2060,16 @@ void Input::parse_options_and_state_controls() {
                 } else if (tok.rfind("MARGINFILE=", 0) == 0 || tok.rfind("MARGINSFILE=", 0) == 0) {
                     argMargins = true;
                     marginFile = resolve_path(tok.substr(tok.find('=') + 1));
+                } else if (tok.rfind("MARGINTRACES=", 0) == 0 || tok.rfind("MARGIN_TRACES=", 0) == 0
+                           || tok.rfind("MARGINSTRACES=", 0) == 0) {
+                    const std::string raw = tok.substr(tok.find('=') + 1);
+                    size_t            pos = 0;
+                    while (pos < raw.size()) {
+                        size_t next = raw.find_first_of(",;", pos);
+                        if (next == std::string::npos) { next = raw.size(); }
+                        if (next > pos) { marginTraces.push_back(raw.substr(pos, next - pos)); }
+                        pos = next + 1;
+                    }
                 } else if (tok.rfind("VERIFYEVENTS=", 0) == 0 || tok.rfind("VERIFY_EVENTS=", 0) == 0) {
                     verifyEventsFile = resolve_path(tok.substr(tok.find('=') + 1));
                 } else if (tok.rfind("ASSERT=", 0) == 0) {
@@ -2158,6 +2178,11 @@ void Input::parse_options_and_state_controls() {
     for (const auto& ms : cliMarginSpecs) {
         parse_margin_spec(ms);
     }
+    for (const auto& mt : cliMarginTraces) {
+        std::string up = mt;
+        std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+        if (!up.empty()) { marginTraces.push_back(std::move(up)); }
+    }
     for (const auto& as : cliAssertions) {
         parse_assert_spec(as);
     }
@@ -2211,12 +2236,16 @@ void Input::parse_options_and_state_controls() {
         && !cli_output_file.has_value() && !hasFileControl && !argGpu && argAnal == AnalysisType::Phase
         && !hasWaveformMeas) {
         argEventsOnly = true;
-        if ((argMargins || argSens) && !argExplicitNodal) {
-            argNodal = true;
+        if (argMargins || argSens) {
+            if (!argExplicitNodal) { argNodal = true; }
 #ifdef _OPENMP
-            argPar   = true;
+            argPar = true;
 #endif
         }
+    } else if (argMargins || argSens) {
+#ifdef _OPENMP
+        if (!argGpu) { argPar = true; }
+#endif
     }
     if (argEvents) {
         if (!cli_output_file.has_value() && !hasFileControl && !hasWaveformMeas) { argEventsOnly = true; }

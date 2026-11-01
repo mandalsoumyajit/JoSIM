@@ -234,10 +234,12 @@ Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
     } else if (iObj.argSens && !iObj.marginTargets.empty()) {
         write_sensitivity(iObj, mObj, sObj);
     }
-    if (iObj.argEventsOnly
-        || (!iObj.cli_output_file && iObj.output_files.empty() && sObj.results.mcRuns <= 1
-            && (iObj.argMargins || iObj.argSens || iObj.verifyEventsFile.has_value() || !iObj.assertions.empty()
-                || iObj.argCheckLoops || !iObj.jitterSpecs.empty() || !iObj.measurements.empty()))) {
+    if (iObj.argEventsOnly || sObj.eventsOnly_
+        || (!iObj.cli_output_file && iObj.output_files.empty()
+            && (iObj.argMargins || iObj.argSens
+                || (sObj.results.mcRuns <= 1
+                    && (iObj.verifyEventsFile.has_value() || !iObj.assertions.empty() || iObj.argCheckLoops
+                        || !iObj.jitterSpecs.empty() || !iObj.measurements.empty()))))) {
         sObj.results.xVector.clear();
         sObj.results.xVector.shrink_to_fit();
         sObj.results.mcTraceOut.clear();
@@ -1695,7 +1697,14 @@ void Output::write_events(const Input& iObj, Matrix& mObj, Simulation& sObj) {
 
     std::vector<RelevantTrace> fallbackTraces;
     const auto*                traceListPtr = &mObj.relevantTraces;
-    if (mObj.relevantTraces.empty()) {
+    bool                       hasPhaseTrace = false;
+    for (const auto& rt : mObj.relevantTraces) {
+        if (rt.storageType == StorageType::Phase) {
+            hasPhaseTrace = true;
+            break;
+        }
+    }
+    if (!hasPhaseTrace) {
         for (const auto& devVar : mObj.components.devices) {
             if (std::holds_alternative<JJ>(devVar)) {
                 const auto&   jjDev = std::get<JJ>(devVar);
@@ -2339,7 +2348,14 @@ void extract_trial_phase_events(const Input&                                    
 
     std::vector<RelevantTrace> fallbackTraces;
     const auto*                traceListPtr = &mObj.relevantTraces;
-    if (mObj.relevantTraces.empty()) {
+    bool                       hasPhaseTrace = false;
+    for (const auto& rt : mObj.relevantTraces) {
+        if (rt.storageType == StorageType::Phase) {
+            hasPhaseTrace = true;
+            break;
+        }
+    }
+    if (!hasPhaseTrace) {
         for (const auto& devVar : mObj.components.devices) {
             if (std::holds_alternative<JJ>(devVar)) {
                 const auto&   jjDev = std::get<JJ>(devVar);
@@ -2471,6 +2487,270 @@ void extract_trial_phase_events(const Input&                                    
         }
     }
 }
+bool trace_glob_match(const std::string& text, const std::string& pat) {
+    size_t ti = 0, pi = 0, starIdx = std::string::npos, matchIdx = 0;
+    while (ti < text.size()) {
+        if (pi < pat.size() && (pat[pi] == '?' || pat[pi] == text[ti])) {
+            ++ti;
+            ++pi;
+        } else if (pi < pat.size() && pat[pi] == '*') {
+            starIdx  = pi++;
+            matchIdx = ti;
+        } else if (starIdx != std::string::npos) {
+            pi = starIdx + 1;
+            ti = ++matchIdx;
+        } else {
+            return false;
+        }
+    }
+    while (pi < pat.size() && pat[pi] == '*') { ++pi; }
+    return pi == pat.size();
+}
+
+std::vector<int64_t> find_phase_trace_indices(const std::vector<PhaseTraceInfo>& phaseTraces, std::string rawName) {
+    std::vector<int64_t> out;
+    std::string          norm = normalize_event_trace_label(rawName);
+    std::replace(norm.begin(), norm.end(), '.', '|');
+    std::string inner = norm;
+    if (inner.size() > 3 && (inner.rfind("P(", 0) == 0 || inner.rfind("V(", 0) == 0) && inner.back() == ')') {
+        inner = inner.substr(2, inner.size() - 3);
+    }
+    const std::string withP   = "P(" + inner + ")";
+    const bool        hasGlob = (inner.find('*') != std::string::npos || inner.find('?') != std::string::npos);
+    for (size_t k = 0; k < phaseTraces.size(); ++k) {
+        std::string ptNorm = normalize_event_trace_label(phaseTraces[k].label);
+        std::replace(ptNorm.begin(), ptNorm.end(), '.', '|');
+        std::string ptInner = ptNorm;
+        if (ptInner.size() > 3 && ptInner.rfind("P(", 0) == 0 && ptInner.back() == ')') {
+            ptInner = ptInner.substr(2, ptInner.size() - 3);
+        }
+        if (!hasGlob) {
+            if (ptNorm == withP || ptNorm == inner) {
+                out.push_back(static_cast<int64_t>(k));
+                break;
+            }
+        } else {
+            if (trace_glob_match(ptInner, inner) || trace_glob_match(ptNorm, withP)) {
+                out.push_back(static_cast<int64_t>(k));
+            }
+        }
+    }
+    return out;
+}
+
+EventSeqDiagnosis evaluate_trial_assertions(const Input&                              iObj,
+                                            const std::vector<PhaseTraceInfo>&        phaseTraces,
+                                            const std::vector<std::vector<SfqEvent>>& curTrialEvs) {
+    EventSeqDiagnosis res;
+    for (const auto& evs : curTrialEvs) { res.totalPulses += static_cast<int64_t>(evs.size()); }
+    if (iObj.assertions.empty()) { return res; }
+
+    EventSeqDiagnosis bestFail;
+    bool              hasFail = false;
+    auto              record_fail = [&](const std::string& kind,
+                                        const std::string& label,
+                                        int32_t            pulseIdx,
+                                        double             failT,
+                                        double             refT,
+                                        double             actT,
+                                        double             dt) {
+        if (!hasFail || failT < bestFail.failTime) {
+            hasFail               = true;
+            bestFail.passed       = false;
+            bestFail.isStructural = (kind != "TIMING_LATE" && kind != "TIMING_EARLY");
+            bestFail.kind         = kind;
+            bestFail.traceLabel   = label;
+            bestFail.pulseIndex   = pulseIdx;
+            bestFail.failTime     = failT;
+            bestFail.refTime      = refT;
+            bestFail.actualTime   = actT;
+            bestFail.timeDelta    = dt;
+        }
+    };
+
+    for (size_t aIdx = 0; aIdx < iObj.assertions.size(); ++aIdx) {
+        const auto&                as       = iObj.assertions[aIdx];
+        const std::vector<int64_t> tIndices = find_phase_trace_indices(phaseTraces, as.trace);
+        if (tIndices.empty()) {
+            record_fail("MISSING_PULSE", as.trace, 1, 0.0, 0.0, 0.0, 0.0);
+            continue;
+        }
+        for (const int64_t tIdx : tIndices) {
+            const auto&       evs      = curTrialEvs[static_cast<size_t>(tIdx)];
+            const std::string traceLbl = phaseTraces[static_cast<size_t>(tIdx)].label;
+
+            if (as.kind == AssertKind::BITSTREAM) {
+                if (as.per <= 0.0 || as.bits.empty()) {
+                    record_fail("MISSING_PULSE", traceLbl, 1, 0.0, 0.0, 0.0, 0.0);
+                    continue;
+                }
+                const double      win       = (as.window > 0.0) ? as.window : as.per;
+                const double      tol       = (as.tol > 0.0) ? as.tol : 0.0;
+                const size_t      nBits     = as.bits.size();
+                const int64_t     expPerOne = (as.expCount > 0) ? as.expCount : 1;
+                std::vector<bool> claimed(evs.size(), false);
+
+                std::vector<std::vector<size_t>> winEvs(nBits);
+                for (size_t k = 0; k < nBits; ++k) {
+                    const double t0 = as.td + static_cast<double>(k) * as.per;
+                    const double t1 = t0 + win;
+                    for (size_t e = 0; e < evs.size(); ++e) {
+                        if (!claimed[e] && evs[e].time >= t0 && evs[e].time < t1) {
+                            claimed[e] = true;
+                            winEvs[k].push_back(e);
+                        }
+                    }
+                }
+                if (tol > 0.0) {
+                    for (size_t k = 0; k < nBits; ++k) {
+                        const char expC = as.bits[k];
+                        if ((expC == '1' || expC == '-') && static_cast<int64_t>(winEvs[k].size()) < expPerOne) {
+                            const double t0 = as.td + static_cast<double>(k) * as.per - tol;
+                            const double t1 = as.td + static_cast<double>(k) * as.per + win + tol;
+                            for (size_t e = 0; e < evs.size(); ++e) {
+                                if (!claimed[e] && evs[e].time >= t0 && evs[e].time < t1) {
+                                    claimed[e] = true;
+                                    winEvs[k].push_back(e);
+                                    if (static_cast<int64_t>(winEvs[k].size()) >= expPerOne) { break; }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (size_t k = 0; k < nBits; ++k) {
+                    const char expC = as.bits[k];
+                    if (expC == 'X' || expC == '?') { continue; }
+                    const double t0 = as.td + static_cast<double>(k) * as.per;
+                    const double t1 = t0 + win;
+                    const auto&  w  = winEvs[k];
+                    if (expC == '0') {
+                        if (!w.empty()) {
+                            const double tEv = evs[w.front()].time;
+                            record_fail("EXTRA_PULSE", traceLbl, static_cast<int32_t>(k + 1), tEv, t0, tEv, 0.0);
+                        }
+                    } else if (expC == '1' || expC == '-') {
+                        const int32_t expPol = (expC == '1') ? 1 : -1;
+                        for (size_t idx : w) {
+                            if ((evs[idx].polarity >= 0 ? 1 : -1) != expPol) {
+                                record_fail("POLARITY_ERR",
+                                            traceLbl,
+                                            static_cast<int32_t>(k + 1),
+                                            evs[idx].time,
+                                            t0,
+                                            evs[idx].time,
+                                            0.0);
+                            }
+                        }
+                        if (static_cast<int64_t>(w.size()) < expPerOne) {
+                            record_fail("MISSING_PULSE", traceLbl, static_cast<int32_t>(k + 1), t1, t1, 0.0, 0.0);
+                        } else if (static_cast<int64_t>(w.size()) > expPerOne) {
+                            const double tEv = evs[w.back()].time;
+                            record_fail("EXTRA_PULSE", traceLbl, static_cast<int32_t>(k + 1), tEv, t1, tEv, 0.0);
+                        }
+                    }
+                }
+                if (as.bits.find('X') == std::string::npos && as.bits.find('?') == std::string::npos
+                    && ((as.window > 0.0 && as.window < as.per) || as.expCount > 0)) {
+                    for (size_t e = 0; e < evs.size(); ++e) {
+                        if (!claimed[e]) {
+                            record_fail("EXTRA_PULSE",
+                                        traceLbl,
+                                        static_cast<int32_t>(e + 1),
+                                        evs[e].time,
+                                        0.0,
+                                        evs[e].time,
+                                        0.0);
+                        }
+                    }
+                }
+            } else if (as.kind == AssertKind::COUNT) {
+                int64_t cnt     = 0;
+                double  lastEvT = 0.0;
+                for (const auto& ev : evs) {
+                    if (as.tFrom >= 0.0 && ev.time < as.tFrom) { continue; }
+                    if (as.tTo >= 0.0 && ev.time >= as.tTo) { continue; }
+                    ++cnt;
+                    lastEvT = ev.time;
+                }
+                if (cnt < as.expCount) {
+                    const double tEnd = (as.tTo > 0.0) ? as.tTo : iObj.transSim.tstop();
+                    record_fail("MISSING_PULSE", traceLbl, static_cast<int32_t>(cnt + 1), tEnd, tEnd, 0.0, 0.0);
+                } else if (cnt > as.expCount) {
+                    record_fail("EXTRA_PULSE", traceLbl, static_cast<int32_t>(cnt), lastEvT, 0.0, lastEvT, 0.0);
+                }
+            } else if (as.kind == AssertKind::TIMES) {
+                const double tol = (as.tol >= 0.0) ? as.tol : iObj.argMarginTol;
+                if (evs.size() < as.expTimes.size()) {
+                    const double tExp = as.expTimes[evs.size()];
+                    record_fail("MISSING_PULSE", traceLbl, static_cast<int32_t>(evs.size() + 1), tExp, tExp, 0.0, 0.0);
+                } else if (evs.size() > as.expTimes.size()) {
+                    const double tEv = evs[as.expTimes.size()].time;
+                    record_fail("EXTRA_PULSE", traceLbl, static_cast<int32_t>(as.expTimes.size() + 1), tEv, 0.0, tEv, 0.0);
+                }
+                for (size_t p = 0; p < std::min(evs.size(), as.expTimes.size()); ++p) {
+                    const double dt    = evs[p].time - as.expTimes[p];
+                    const double absDt = std::abs(dt);
+                    if (absDt > res.maxTimingSkew) { res.maxTimingSkew = absDt; }
+                    if (absDt > tol) {
+                        record_fail((dt > 0.0) ? "TIMING_LATE" : "TIMING_EARLY",
+                                    traceLbl,
+                                    static_cast<int32_t>(p + 1),
+                                    as.expTimes[p],
+                                    as.expTimes[p],
+                                    evs[p].time,
+                                    dt);
+                    }
+                }
+            } else if (as.kind == AssertKind::AFTER) {
+                const auto rIndices = find_phase_trace_indices(phaseTraces, as.refTrace);
+                if (rIndices.empty()) {
+                    record_fail("MISSING_PULSE", as.refTrace, 1, 0.0, 0.0, 0.0, 0.0);
+                    continue;
+                }
+                const auto&  refEvs = curTrialEvs[static_cast<size_t>(rIndices.front())];
+                const double tol    = (as.tol >= 0.0) ? as.tol : iObj.argMarginTol;
+                if (evs.size() < refEvs.size()) {
+                    const double tExp = refEvs[evs.size()].time + as.delay;
+                    record_fail("MISSING_PULSE", traceLbl, static_cast<int32_t>(evs.size() + 1), tExp, tExp, 0.0, 0.0);
+                } else if (evs.size() > refEvs.size()) {
+                    const double tEv = evs[refEvs.size()].time;
+                    record_fail("EXTRA_PULSE", traceLbl, static_cast<int32_t>(refEvs.size() + 1), tEv, 0.0, tEv, 0.0);
+                }
+                for (size_t p = 0; p < std::min(evs.size(), refEvs.size()); ++p) {
+                    const double actualDelay = evs[p].time - refEvs[p].time;
+                    const double dt          = actualDelay - as.delay;
+                    const double absDt       = std::abs(dt);
+                    if (absDt > res.maxTimingSkew) { res.maxTimingSkew = absDt; }
+                    if (evs[p].polarity != refEvs[p].polarity) {
+                        record_fail("POLARITY_ERR",
+                                    traceLbl,
+                                    static_cast<int32_t>(p + 1),
+                                    evs[p].time,
+                                    refEvs[p].time + as.delay,
+                                    evs[p].time,
+                                    dt);
+                    } else if (absDt > tol) {
+                        record_fail((dt > 0.0) ? "TIMING_LATE" : "TIMING_EARLY",
+                                    traceLbl,
+                                    static_cast<int32_t>(p + 1),
+                                    refEvs[p].time + as.delay,
+                                    refEvs[p].time + as.delay,
+                                    evs[p].time,
+                                    dt);
+                    }
+                }
+            }
+        }
+    }
+
+    if (hasFail) {
+        bestFail.maxTimingSkew = res.maxTimingSkew;
+        bestFail.totalPulses   = res.totalPulses;
+        return bestFail;
+    }
+    return res;
+}
 } // namespace
 
 void Output::write_margins(const Input& iObj, Matrix& mObj, Simulation& sObj) {
@@ -2481,8 +2761,37 @@ void Output::write_margins(const Input& iObj, Matrix& mObj, Simulation& sObj) {
     extract_trial_phase_events(iObj, mObj, sObj, phaseTraces, trialEvents);
     if (phaseTraces.empty() || trialEvents.empty()) { return; }
 
-    const auto& nomEvents      = trialEvents[0];
-    int64_t     nomTotalPulses = 0;
+    if (!iObj.marginTraces.empty()) {
+        std::vector<bool> keep(phaseTraces.size(), false);
+        for (const auto& pat : iObj.marginTraces) {
+            for (int64_t idx : find_phase_trace_indices(phaseTraces, pat)) {
+                if (idx >= 0 && static_cast<size_t>(idx) < keep.size()) {
+                    keep[static_cast<size_t>(idx)] = true;
+                }
+            }
+        }
+        std::vector<PhaseTraceInfo> filtTraces;
+        std::vector<size_t>         keptIndices;
+        for (size_t k = 0; k < phaseTraces.size(); ++k) {
+            if (keep[k]) {
+                filtTraces.push_back(phaseTraces[k]);
+                keptIndices.push_back(k);
+            }
+        }
+        if (!keptIndices.empty()) {
+            phaseTraces = std::move(filtTraces);
+            for (auto& tEvs : trialEvents) {
+                std::vector<std::vector<SfqEvent>> filtEvs;
+                filtEvs.reserve(keptIndices.size());
+                for (size_t k : keptIndices) { filtEvs.push_back(std::move(tEvs[k])); }
+                tEvs = std::move(filtEvs);
+            }
+        }
+    }
+
+    const bool  useAssertCriterion = !iObj.assertions.empty();
+    const auto& nomEvents          = trialEvents[0];
+    int64_t     nomTotalPulses     = 0;
     for (const auto& evs : nomEvents) { nomTotalPulses += static_cast<int64_t>(evs.size()); }
 
     struct MarginRow {
@@ -2518,12 +2827,16 @@ void Output::write_margins(const Input& iObj, Matrix& mObj, Simulation& sObj) {
         std::vector<EventSeqDiagnosis> diags(P);
         for (size_t p = 0; p < P; ++p) {
             const int64_t b = mt.trialIndices[p];
-            if (b == 0) {
-                diags[p].passed      = true;
-                diags[p].totalPulses = nomTotalPulses;
-            } else if (b > 0 && static_cast<size_t>(b) < trialEvents.size()) {
-                diags[p] = compare_event_sequences(
-                        phaseTraces, nomEvents, trialEvents[b], iObj.argMarginTol, iObj.transSim.tstop());
+            if (b >= 0 && static_cast<size_t>(b) < trialEvents.size()) {
+                if (useAssertCriterion) {
+                    diags[p] = evaluate_trial_assertions(iObj, phaseTraces, trialEvents[static_cast<size_t>(b)]);
+                } else if (b == 0) {
+                    diags[p].passed      = true;
+                    diags[p].totalPulses = nomTotalPulses;
+                } else {
+                    diags[p] = compare_event_sequences(
+                            phaseTraces, nomEvents, trialEvents[static_cast<size_t>(b)], iObj.argMarginTol, iObj.transSim.tstop());
+                }
             } else {
                 diags[p].passed = false;
                 diags[p].kind   = "SIM_ERROR";
@@ -2589,8 +2902,12 @@ void Output::write_margins(const Input& iObj, Matrix& mObj, Simulation& sObj) {
         std::cout << "\n========================================================================================================\n";
         std::cout << "JoSIM Critical Operating Margin Report (" << rows.size() << " target(s), "
                   << sObj.results.mcRuns << " batched trials, " << phaseTraces.size() << " JJs, "
-                  << nomTotalPulses << " nominal SFQ events, tol = +/-" << std::fixed << std::setprecision(1)
-                  << (iObj.argMarginTol * 1e12) << " ps)\n";
+                  << nomTotalPulses << " nominal SFQ events, ";
+        if (useAssertCriterion) {
+            std::cout << "criterion = .assert (" << iObj.assertions.size() << " specs))\n";
+        } else {
+            std::cout << "tol = +/-" << std::fixed << std::setprecision(1) << (iObj.argMarginTol * 1e12) << " ps)\n";
+        }
         std::cout << "========================================================================================================\n";
         std::cout << std::left << std::setw(5) << "Rank" << std::setw(18) << "Target" << std::setw(8) << "Cat"
                   << std::right << std::setw(10) << "Lower" << std::setw(10) << "Upper" << std::setw(17)
@@ -2895,9 +3212,10 @@ void Output::verify_assertions(const Input& iObj, Matrix& mObj, Simulation& sObj
                     failures.push_back(oss.str());
                     continue;
                 }
-                const double      win     = (as.window > 0.0) ? as.window : as.per;
-                const double      tol     = (as.tol > 0.0) ? as.tol : 0.0;
-                const size_t      nBits   = as.bits.size();
+                const double      win       = (as.window > 0.0) ? as.window : as.per;
+                const double      tol       = (as.tol > 0.0) ? as.tol : 0.0;
+                const size_t      nBits     = as.bits.size();
+                const int64_t     expPerOne = (as.expCount > 0) ? as.expCount : 1;
                 std::vector<bool> claimed(evs.size(), false);
                 std::string       actualBits(nBits, '0');
 
@@ -2913,19 +3231,19 @@ void Output::verify_assertions(const Input& iObj, Matrix& mObj, Simulation& sObj
                         }
                     }
                 }
-                // Pass 2: if tol > 0, allow windows expecting a pulse ('1' or '-') with 0 claimed events
+                // Pass 2: if tol > 0, allow windows expecting a pulse ('1' or '-') with < expPerOne claimed events
                 // to claim an unclaimed event within [t0 - tol, t0 + win + tol)
                 if (tol > 0.0) {
                     for (size_t k = 0; k < nBits; ++k) {
                         const char expC = as.bits[k];
-                        if ((expC == '1' || expC == '-') && winEvs[k].empty()) {
+                        if ((expC == '1' || expC == '-') && static_cast<int64_t>(winEvs[k].size()) < expPerOne) {
                             const double t0 = as.td + static_cast<double>(k) * as.per - tol;
                             const double t1 = as.td + static_cast<double>(k) * as.per + win + tol;
                             for (size_t e = 0; e < evs.size(); ++e) {
                                 if (!claimed[e] && evs[e].time >= t0 && evs[e].time < t1) {
                                     claimed[e] = true;
                                     winEvs[k].push_back(e);
-                                    break;
+                                    if (static_cast<int64_t>(winEvs[k].size()) >= expPerOne) { break; }
                                 }
                             }
                         }
@@ -2937,7 +3255,7 @@ void Output::verify_assertions(const Input& iObj, Matrix& mObj, Simulation& sObj
                     const auto& w = winEvs[k];
                     if (w.empty()) {
                         actualBits[k] = '0';
-                    } else if (w.size() == 1) {
+                    } else if (static_cast<int64_t>(w.size()) == expPerOne) {
                         actualBits[k] = (evs[w[0]].polarity >= 0) ? '1' : '-';
                     } else {
                         actualBits[k] = 'M';
@@ -2947,8 +3265,26 @@ void Output::verify_assertions(const Input& iObj, Matrix& mObj, Simulation& sObj
                     if (actualBits[k] != expC && firstFailBit < 0) { firstFailBit = static_cast<int64_t>(k); }
                 }
 
-                if (firstFailBit < 0) {
+                bool hasStray = false;
+                if (firstFailBit < 0 && as.bits.find('X') == std::string::npos
+                    && as.bits.find('?') == std::string::npos
+                    && ((as.window > 0.0 && as.window < as.per) || as.expCount > 0)) {
+                    for (size_t e = 0; e < evs.size(); ++e) {
+                        if (!claimed[e]) {
+                            hasStray = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (firstFailBit < 0 && !hasStray) {
                     ++totalPassed;
+                } else if (hasStray) {
+                    std::ostringstream oss;
+                    oss << "Assertion #" << (aIdx + 1) << " [" << traceLbl << " BITSTREAM";
+                    if (nTrialsToCheck > 1) { oss << " trial #" << b; }
+                    oss << "] FAILED: stray pulse(s) detected outside asserted windows";
+                    failures.push_back(oss.str());
                 } else {
                     const double       fT0 = (as.td + static_cast<double>(firstFailBit) * as.per) * 1e12;
                     const double       fT1 = (as.td + static_cast<double>(firstFailBit) * as.per + win) * 1e12;
@@ -4036,14 +4372,14 @@ void Output::write_loop_audit(const Input& iObj, Matrix& mObj, Simulation& sObj)
         al.fluxPhi0     = std::abs(phiSum) / (2.0 * Constants::PI);
         if (al.Ltot <= 1e-18) {
             al.classification = "DEGENERATE_0L";
-        } else if (al.betaL < 0.1 * Constants::PI) {
-            al.classification = "SUB_CRITICAL";
-        } else if (al.betaL < Constants::PI) {
-            al.classification = "NON_STORAGE";
+        } else if (al.betaL < 0.5 * Constants::PI) {
+            al.classification = "SUB_QUANTUM (<0.5pi)";
+        } else if (al.betaL < 1.5 * Constants::PI) {
+            al.classification = (al.jjLabels.size() == 2) ? "JTL_STAGE (0.5pi..1.5pi)" : "NON_STORAGE (0.5pi..1.5pi)";
         } else if (al.betaL < 3.0 * Constants::PI) {
-            al.classification = "STORAGE_QUANT";
+            al.classification = "STORAGE_QUANT (1.5pi..3pi)";
         } else {
-            al.classification = "MULTI_FLUX_TRAP";
+            al.classification = "MULTI_FLUX_TRAP (>=3pi)";
         }
         loops.push_back(std::move(al));
     }
@@ -4062,7 +4398,7 @@ void Output::write_loop_audit(const Input& iObj, Matrix& mObj, Simulation& sObj)
     for (size_t i = 0; i < loops.size(); ++i) {
         const auto& lp = loops[i];
         if (lp.classification == "DEGENERATE_0L") { ++degCount; }
-        if (lp.betaL >= Constants::PI) { ++storCount; }
+        if (lp.betaL >= 1.5 * Constants::PI) { ++storCount; }
         const std::string idxStr = std::to_string(i + 1);
         set_param("BETA_L_LOOP_" + idxStr, lp.betaL);
         set_param("L_LOOP_" + idxStr, lp.Ltot);

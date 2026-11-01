@@ -56,6 +56,8 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
                 swChar = 'F';
             } else if (swLower.rfind("margintol", 0) == 0 || swLower.rfind("marginstol", 0) == 0) {
                 swChar = 'T';
+            } else if (swLower.rfind("margintrace", 0) == 0 || swLower.rfind("marginstrace", 0) == 0) {
+                swChar = 'G';
             } else if (swLower.rfind("margin", 0) == 0) {
                 swChar = 'M';
             } else if (swLower.rfind("verifyevent", 0) == 0) {
@@ -261,6 +263,19 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                         std::transform(s.begin(), s.end(), s.begin(), ::toupper);
                         const double v = Misc::modifier(s);
                         if (std::isfinite(v) && v >= 0.0) { out.margin_tol = v; }
+                    }
+                    break;
+                    // Margin trace filter list/glob (--margin-traces)
+                case 'G':
+                    if (i.second && !i.second.value().empty()) {
+                        const std::string& raw = i.second.value();
+                        size_t             pos = 0;
+                        while (pos < raw.size()) {
+                            size_t next = raw.find_first_of(",; ", pos);
+                            if (next == std::string::npos) { next = raw.size(); }
+                            if (next > pos) { out.margin_traces.push_back(raw.substr(pos, next - pos)); }
+                            pos = next + 1;
+                        }
                     }
                     break;
                     // Verify simulation SFQ events against a golden .events.csv / .events.npy file

@@ -46,6 +46,7 @@ from pyjosim import (
 from josim_cosim import (
     CosimServerProcess,
     PortSpec,
+    _default_win_visible_tmp_dir,
     format_spice_pwl_file,
     run_ltspice_batch,
     run_ngspice_deck,
@@ -548,7 +549,7 @@ N1 p1 0 n_g_in 0 nmod
 """
 
     def run_transceiver(use_ipc_server: bool) -> Tuple[np.ndarray, Dict[str, np.ndarray], int]:
-        with tempfile.TemporaryDirectory(prefix=".lt1_branin_", dir="/mnt/c/dev/JoSIM") as tmpd:
+        with tempfile.TemporaryDirectory(prefix=".lt1_branin_", dir=str(_default_win_visible_tmp_dir())) as tmpd:
             tmp = Path(tmpd)
             # History of outgoing waves from JoSIM (b_j[t]) and from LTspice (b_lt[t])
             t_hist_j = np.array([0.0], dtype=np.float64)
@@ -733,7 +734,7 @@ RSH_CH nch 0 120
 """
 
     def run_ltspice_relaxation(use_ipc_server: bool) -> Tuple[np.ndarray, Dict[str, np.ndarray], float]:
-        with tempfile.TemporaryDirectory(prefix=".lt2_pwl_", dir="/mnt/c/dev/JoSIM") as tmpd:
+        with tempfile.TemporaryDirectory(prefix=".lt2_pwl_", dir=str(_default_win_visible_tmp_dir())) as tmpd:
             tmp = Path(tmpd)
             dt = 0.2e-12
             n_steps = int(round(60.0e-12 / dt))

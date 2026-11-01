@@ -69,6 +69,10 @@ JOSIM_DPI_API double josim_dpi_get_output(int handle, int port_idx);
 JOSIM_DPI_API double josim_dpi_get_jacobian(int handle, int port_idx);
 JOSIM_DPI_API double josim_dpi_get_hist(int handle, int port_idx);
 
+// Configure optional JoSIM output CSV (for .print traces) and switching-events CSV (-e format)
+// to be written automatically when the session closes / finalizes.
+JOSIM_DPI_API int josim_dpi_set_output(int handle, const char* out_csv, const char* events_csv);
+
 // Close a specific session handle or all active handles.
 JOSIM_DPI_API int  josim_dpi_close(int handle);
 JOSIM_DPI_API void josim_dpi_close_all(void);

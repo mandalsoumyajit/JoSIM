@@ -42,6 +42,7 @@ struct CliOptions {
     std::vector<std::string>        margin_specs;
     std::optional<double>           margin_tol;
     std::optional<std::string>      margin_file;
+    std::vector<std::string>        margin_traces;
     std::optional<std::string>      verify_events_file;
     std::vector<std::string>        assertions;
     std::vector<std::string>        measurements;

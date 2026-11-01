@@ -8,7 +8,8 @@
 //   ahdl_include "josim_cosim_port.va"
 //
 //   Xsfq (v_boundary 0) josim_cosim_port_norton \
-//       netlist="sfq_subcircuit.cir" port_nodes="b4" port_modes="0" endpoint="unix:/tmp/josim.sock"
+//       netlist="sfq_subcircuit.cir" port_nodes="b4" port_modes="0" \
+//       endpoint="unix:/tmp/josim.sock" out_csv="josim_traces.csv" events="josim_events.csv"
 //
 // Why `i_hist` and `g_eq` are returned separately from C:
 //   In Verilog-A automatic differentiation (AD), any external C function has zero symbolic
@@ -37,6 +38,8 @@ module josim_cosim_port_norton(p, n);
   parameter string port_nodes   = "1";
   parameter string port_modes   = "0";   // "0" for Norton, "2:50.0" for Branin Wave with Z0=50 ohm
   parameter string endpoint     = "";    // "" = inproc or $JOSIM_COSIM_ENDPOINT; "unix:/path" or "tcp:host:port"
+  parameter string out_csv      = "";    // Optional output CSV for JoSIM .print traces
+  parameter string events       = "";    // Optional output CSV for JoSIM 2*pi switching events
   parameter real   maxstep_mult = 0.0;   // If > 0, bounds Spectre step to maxstep_mult * josim_tstep
   parameter real   gmin_dc      = 1e-12; // Minimum DC shunt conductance for initial OP conditioning
 
@@ -46,31 +49,46 @@ module josim_cosim_port_norton(p, n);
     input string port_modes_csv,
     input string ep
   );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_output(
+    input integer h,
+    input string  out_csv_path,
+    input string  events_csv_path
+  );
   import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
     input integer h
   );
-  import `JOSIM_DPI_IMPORT function real josim_dpi_eval_ihist(
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_input(
     input integer h,
-    input real    t_s,
-    input real    v_pn
+    input integer port_idx,
+    input real    val
   );
-  import `JOSIM_DPI_IMPORT function real josim_dpi_eval_g(
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_eval(
     input integer h,
-    input real    t_s,
-    input real    v_pn
+    input real    t_s
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_hist(
+    input integer h,
+    input integer port_idx
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_jacobian(
+    input integer h,
+    input integer port_idx
   );
 
-  integer h;
+  integer h, rc;
   real    dt_j, i_hist, g_eq;
 
   analog begin
     @(initial_step) begin
       h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      rc   = josim_dpi_set_output(h, out_csv, events);
       dt_j = josim_dpi_tstep(h);
     end
 
-    i_hist = josim_dpi_eval_ihist(h, $abstime, V(p, n));
-    g_eq   = josim_dpi_eval_g(h, $abstime, V(p, n));
+    rc     = josim_dpi_set_input(h, 0, V(p, n));
+    rc     = josim_dpi_eval(h, $abstime);
+    i_hist = josim_dpi_get_hist(h, 0);
+    g_eq   = josim_dpi_get_jacobian(h, 0);
 
     if (analysis("dc") || $abstime <= 0.0) begin
       I(p, n) <+ i_hist + (g_eq + gmin_dc) * V(p, n);
@@ -96,6 +114,8 @@ module josim_cosim_port_thevenin(p, n);
   parameter string port_nodes   = "1";
   parameter string port_modes   = "1";
   parameter string endpoint     = "";
+  parameter string out_csv      = "";
+  parameter string events       = "";
   parameter real   maxstep_mult = 0.0;
 
   import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
@@ -104,31 +124,46 @@ module josim_cosim_port_thevenin(p, n);
     input string port_modes_csv,
     input string ep
   );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_output(
+    input integer h,
+    input string  out_csv_path,
+    input string  events_csv_path
+  );
   import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
     input integer h
   );
-  import `JOSIM_DPI_IMPORT function real josim_dpi_eval_vhist(
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_input(
     input integer h,
-    input real    t_s,
-    input real    i_pn
+    input integer port_idx,
+    input real    val
   );
-  import `JOSIM_DPI_IMPORT function real josim_dpi_eval_r(
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_eval(
     input integer h,
-    input real    t_s,
-    input real    i_pn
+    input real    t_s
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_hist(
+    input integer h,
+    input integer port_idx
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_jacobian(
+    input integer h,
+    input integer port_idx
   );
 
-  integer h;
+  integer h, rc;
   real    dt_j, v_hist, r_eq;
 
   analog begin
     @(initial_step) begin
       h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      rc   = josim_dpi_set_output(h, out_csv, events);
       dt_j = josim_dpi_tstep(h);
     end
 
-    v_hist = josim_dpi_eval_vhist(h, $abstime, I(p, n));
-    r_eq   = josim_dpi_eval_r(h, $abstime, I(p, n));
+    rc     = josim_dpi_set_input(h, 0, I(p, n));
+    rc     = josim_dpi_eval(h, $abstime);
+    v_hist = josim_dpi_get_hist(h, 0);
+    r_eq   = josim_dpi_get_jacobian(h, 0);
     V(p, n) <+ v_hist + r_eq * I(p, n);
 
     if (maxstep_mult > 0.0 && dt_j > 0.0) begin
@@ -149,6 +184,8 @@ module josim_cosim_port_2p(p0, n0, p1, n1);
   parameter string port_nodes   = "1,2";
   parameter string port_modes   = "0,0";
   parameter string endpoint     = "";
+  parameter string out_csv      = "";
+  parameter string events       = "";
   parameter real   maxstep_mult = 0.0;
   parameter real   gmin_dc      = 1e-12;
 
@@ -157,6 +194,11 @@ module josim_cosim_port_2p(p0, n0, p1, n1);
     input string port_nodes_csv,
     input string port_modes_csv,
     input string ep
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_output(
+    input integer h,
+    input string  out_csv_path,
+    input string  events_csv_path
   );
   import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
     input integer h
@@ -186,6 +228,7 @@ module josim_cosim_port_2p(p0, n0, p1, n1);
   analog begin
     @(initial_step) begin
       h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      rc   = josim_dpi_set_output(h, out_csv, events);
       dt_j = josim_dpi_tstep(h);
     end
 
@@ -204,6 +247,475 @@ module josim_cosim_port_2p(p0, n0, p1, n1);
     end else begin
       I(p0, n0) <+ ihist0 + g0 * V(p0, n0);
       I(p1, n1) <+ ihist1 + g1 * V(p1, n1);
+    end
+
+    if (maxstep_mult > 0.0 && dt_j > 0.0) begin
+      $bound_step(maxstep_mult * dt_j);
+    end
+  end
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// 4. Three-Port Norton / Branin Wave Boundary (e.g., Splitter / 1-in 1-out + Bias)
+// -----------------------------------------------------------------------------
+module josim_cosim_port_3p(p0, n0, p1, n1, p2, n2);
+  inout p0, n0, p1, n1, p2, n2;
+  electrical p0, n0, p1, n1, p2, n2;
+
+  parameter string netlist      = "";
+  parameter string port_nodes   = "1,2,3";
+  parameter string port_modes   = "0,0,0";
+  parameter string endpoint     = "";
+  parameter string out_csv      = "";
+  parameter string events       = "";
+  parameter real   maxstep_mult = 0.0;
+  parameter real   gmin_dc      = 1e-12;
+
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
+    input string netlist_path,
+    input string port_nodes_csv,
+    input string port_modes_csv,
+    input string ep
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_output(
+    input integer h,
+    input string  out_csv_path,
+    input string  events_csv_path
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
+    input integer h
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_input(
+    input integer h,
+    input integer port_idx,
+    input real    val
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_eval(
+    input integer h,
+    input real    t_s
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_hist(
+    input integer h,
+    input integer port_idx
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_jacobian(
+    input integer h,
+    input integer port_idx
+  );
+
+  integer h, rc;
+  real    dt_j;
+  real    ih0, g0, ih1, g1, ih2, g2;
+
+  analog begin
+    @(initial_step) begin
+      h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      rc   = josim_dpi_set_output(h, out_csv, events);
+      dt_j = josim_dpi_tstep(h);
+    end
+
+    rc = josim_dpi_set_input(h, 0, V(p0, n0));
+    rc = josim_dpi_set_input(h, 1, V(p1, n1));
+    rc = josim_dpi_set_input(h, 2, V(p2, n2));
+    rc = josim_dpi_eval(h, $abstime);
+
+    ih0 = josim_dpi_get_hist(h, 0); g0 = josim_dpi_get_jacobian(h, 0);
+    ih1 = josim_dpi_get_hist(h, 1); g1 = josim_dpi_get_jacobian(h, 1);
+    ih2 = josim_dpi_get_hist(h, 2); g2 = josim_dpi_get_jacobian(h, 2);
+
+    if (analysis("dc") || $abstime <= 0.0) begin
+      I(p0, n0) <+ ih0 + (g0 + gmin_dc) * V(p0, n0);
+      I(p1, n1) <+ ih1 + (g1 + gmin_dc) * V(p1, n1);
+      I(p2, n2) <+ ih2 + (g2 + gmin_dc) * V(p2, n2);
+    end else begin
+      I(p0, n0) <+ ih0 + g0 * V(p0, n0);
+      I(p1, n1) <+ ih1 + g1 * V(p1, n1);
+      I(p2, n2) <+ ih2 + g2 * V(p2, n2);
+    end
+
+    if (maxstep_mult > 0.0 && dt_j > 0.0) begin
+      $bound_step(maxstep_mult * dt_j);
+    end
+  end
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// 5. Four-Port Norton / Branin Wave Boundary (e.g., Splitter with Bias, 2-in 1-out + Bias)
+// -----------------------------------------------------------------------------
+module josim_cosim_port_4p(p0, n0, p1, n1, p2, n2, p3, n3);
+  inout p0, n0, p1, n1, p2, n2, p3, n3;
+  electrical p0, n0, p1, n1, p2, n2, p3, n3;
+
+  parameter string netlist      = "";
+  parameter string port_nodes   = "1,2,3,4";
+  parameter string port_modes   = "0,0,0,0";
+  parameter string endpoint     = "";
+  parameter string out_csv      = "";
+  parameter string events       = "";
+  parameter real   maxstep_mult = 0.0;
+  parameter real   gmin_dc      = 1e-12;
+
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
+    input string netlist_path,
+    input string port_nodes_csv,
+    input string port_modes_csv,
+    input string ep
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_output(
+    input integer h,
+    input string  out_csv_path,
+    input string  events_csv_path
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
+    input integer h
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_input(
+    input integer h,
+    input integer port_idx,
+    input real    val
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_eval(
+    input integer h,
+    input real    t_s
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_hist(
+    input integer h,
+    input integer port_idx
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_jacobian(
+    input integer h,
+    input integer port_idx
+  );
+
+  integer h, rc;
+  real    dt_j;
+  real    ih0, g0, ih1, g1, ih2, g2, ih3, g3;
+
+  analog begin
+    @(initial_step) begin
+      h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      rc   = josim_dpi_set_output(h, out_csv, events);
+      dt_j = josim_dpi_tstep(h);
+    end
+
+    rc = josim_dpi_set_input(h, 0, V(p0, n0));
+    rc = josim_dpi_set_input(h, 1, V(p1, n1));
+    rc = josim_dpi_set_input(h, 2, V(p2, n2));
+    rc = josim_dpi_set_input(h, 3, V(p3, n3));
+    rc = josim_dpi_eval(h, $abstime);
+
+    ih0 = josim_dpi_get_hist(h, 0); g0 = josim_dpi_get_jacobian(h, 0);
+    ih1 = josim_dpi_get_hist(h, 1); g1 = josim_dpi_get_jacobian(h, 1);
+    ih2 = josim_dpi_get_hist(h, 2); g2 = josim_dpi_get_jacobian(h, 2);
+    ih3 = josim_dpi_get_hist(h, 3); g3 = josim_dpi_get_jacobian(h, 3);
+
+    if (analysis("dc") || $abstime <= 0.0) begin
+      I(p0, n0) <+ ih0 + (g0 + gmin_dc) * V(p0, n0);
+      I(p1, n1) <+ ih1 + (g1 + gmin_dc) * V(p1, n1);
+      I(p2, n2) <+ ih2 + (g2 + gmin_dc) * V(p2, n2);
+      I(p3, n3) <+ ih3 + (g3 + gmin_dc) * V(p3, n3);
+    end else begin
+      I(p0, n0) <+ ih0 + g0 * V(p0, n0);
+      I(p1, n1) <+ ih1 + g1 * V(p1, n1);
+      I(p2, n2) <+ ih2 + g2 * V(p2, n2);
+      I(p3, n3) <+ ih3 + g3 * V(p3, n3);
+    end
+
+    if (maxstep_mult > 0.0 && dt_j > 0.0) begin
+      $bound_step(maxstep_mult * dt_j);
+    end
+  end
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// 6. Five-Port Norton / Branin Wave Boundary (e.g., clocked 2-in 1-out gate + Bias)
+// -----------------------------------------------------------------------------
+module josim_cosim_port_5p(p0, n0, p1, n1, p2, n2, p3, n3, p4, n4);
+  inout p0, n0, p1, n1, p2, n2, p3, n3, p4, n4;
+  electrical p0, n0, p1, n1, p2, n2, p3, n3, p4, n4;
+
+  parameter string netlist      = "";
+  parameter string port_nodes   = "1,2,3,4,5";
+  parameter string port_modes   = "0,0,0,0,0";
+  parameter string endpoint     = "";
+  parameter string out_csv      = "";
+  parameter string events       = "";
+  parameter real   maxstep_mult = 0.0;
+  parameter real   gmin_dc      = 1e-12;
+
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
+    input string netlist_path,
+    input string port_nodes_csv,
+    input string port_modes_csv,
+    input string ep
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_output(
+    input integer h,
+    input string  out_csv_path,
+    input string  events_csv_path
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
+    input integer h
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_input(
+    input integer h,
+    input integer port_idx,
+    input real    val
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_eval(
+    input integer h,
+    input real    t_s
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_hist(
+    input integer h,
+    input integer port_idx
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_jacobian(
+    input integer h,
+    input integer port_idx
+  );
+
+  integer h, rc;
+  real    dt_j;
+  real    ih0, g0, ih1, g1, ih2, g2, ih3, g3, ih4, g4;
+
+  analog begin
+    @(initial_step) begin
+      h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      rc   = josim_dpi_set_output(h, out_csv, events);
+      dt_j = josim_dpi_tstep(h);
+    end
+
+    rc = josim_dpi_set_input(h, 0, V(p0, n0));
+    rc = josim_dpi_set_input(h, 1, V(p1, n1));
+    rc = josim_dpi_set_input(h, 2, V(p2, n2));
+    rc = josim_dpi_set_input(h, 3, V(p3, n3));
+    rc = josim_dpi_set_input(h, 4, V(p4, n4));
+    rc = josim_dpi_eval(h, $abstime);
+
+    ih0 = josim_dpi_get_hist(h, 0); g0 = josim_dpi_get_jacobian(h, 0);
+    ih1 = josim_dpi_get_hist(h, 1); g1 = josim_dpi_get_jacobian(h, 1);
+    ih2 = josim_dpi_get_hist(h, 2); g2 = josim_dpi_get_jacobian(h, 2);
+    ih3 = josim_dpi_get_hist(h, 3); g3 = josim_dpi_get_jacobian(h, 3);
+    ih4 = josim_dpi_get_hist(h, 4); g4 = josim_dpi_get_jacobian(h, 4);
+
+    if (analysis("dc") || $abstime <= 0.0) begin
+      I(p0, n0) <+ ih0 + (g0 + gmin_dc) * V(p0, n0);
+      I(p1, n1) <+ ih1 + (g1 + gmin_dc) * V(p1, n1);
+      I(p2, n2) <+ ih2 + (g2 + gmin_dc) * V(p2, n2);
+      I(p3, n3) <+ ih3 + (g3 + gmin_dc) * V(p3, n3);
+      I(p4, n4) <+ ih4 + (g4 + gmin_dc) * V(p4, n4);
+    end else begin
+      I(p0, n0) <+ ih0 + g0 * V(p0, n0);
+      I(p1, n1) <+ ih1 + g1 * V(p1, n1);
+      I(p2, n2) <+ ih2 + g2 * V(p2, n2);
+      I(p3, n3) <+ ih3 + g3 * V(p3, n3);
+      I(p4, n4) <+ ih4 + g4 * V(p4, n4);
+    end
+
+    if (maxstep_mult > 0.0 && dt_j > 0.0) begin
+      $bound_step(maxstep_mult * dt_j);
+    end
+  end
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// 7. Six-Port Norton / Branin Wave Boundary
+// -----------------------------------------------------------------------------
+module josim_cosim_port_6p(p0, n0, p1, n1, p2, n2, p3, n3, p4, n4, p5, n5);
+  inout p0, n0, p1, n1, p2, n2, p3, n3, p4, n4, p5, n5;
+  electrical p0, n0, p1, n1, p2, n2, p3, n3, p4, n4, p5, n5;
+
+  parameter string netlist      = "";
+  parameter string port_nodes   = "1,2,3,4,5,6";
+  parameter string port_modes   = "0,0,0,0,0,0";
+  parameter string endpoint     = "";
+  parameter string out_csv      = "";
+  parameter string events       = "";
+  parameter real   maxstep_mult = 0.0;
+  parameter real   gmin_dc      = 1e-12;
+
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
+    input string netlist_path,
+    input string port_nodes_csv,
+    input string port_modes_csv,
+    input string ep
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_output(
+    input integer h,
+    input string  out_csv_path,
+    input string  events_csv_path
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
+    input integer h
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_input(
+    input integer h,
+    input integer port_idx,
+    input real    val
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_eval(
+    input integer h,
+    input real    t_s
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_hist(
+    input integer h,
+    input integer port_idx
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_jacobian(
+    input integer h,
+    input integer port_idx
+  );
+
+  integer h, rc;
+  real    dt_j;
+  real    ih0, g0, ih1, g1, ih2, g2, ih3, g3, ih4, g4, ih5, g5;
+
+  analog begin
+    @(initial_step) begin
+      h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      rc   = josim_dpi_set_output(h, out_csv, events);
+      dt_j = josim_dpi_tstep(h);
+    end
+
+    rc = josim_dpi_set_input(h, 0, V(p0, n0));
+    rc = josim_dpi_set_input(h, 1, V(p1, n1));
+    rc = josim_dpi_set_input(h, 2, V(p2, n2));
+    rc = josim_dpi_set_input(h, 3, V(p3, n3));
+    rc = josim_dpi_set_input(h, 4, V(p4, n4));
+    rc = josim_dpi_set_input(h, 5, V(p5, n5));
+    rc = josim_dpi_eval(h, $abstime);
+
+    ih0 = josim_dpi_get_hist(h, 0); g0 = josim_dpi_get_jacobian(h, 0);
+    ih1 = josim_dpi_get_hist(h, 1); g1 = josim_dpi_get_jacobian(h, 1);
+    ih2 = josim_dpi_get_hist(h, 2); g2 = josim_dpi_get_jacobian(h, 2);
+    ih3 = josim_dpi_get_hist(h, 3); g3 = josim_dpi_get_jacobian(h, 3);
+    ih4 = josim_dpi_get_hist(h, 4); g4 = josim_dpi_get_jacobian(h, 4);
+    ih5 = josim_dpi_get_hist(h, 5); g5 = josim_dpi_get_jacobian(h, 5);
+
+    if (analysis("dc") || $abstime <= 0.0) begin
+      I(p0, n0) <+ ih0 + (g0 + gmin_dc) * V(p0, n0);
+      I(p1, n1) <+ ih1 + (g1 + gmin_dc) * V(p1, n1);
+      I(p2, n2) <+ ih2 + (g2 + gmin_dc) * V(p2, n2);
+      I(p3, n3) <+ ih3 + (g3 + gmin_dc) * V(p3, n3);
+      I(p4, n4) <+ ih4 + (g4 + gmin_dc) * V(p4, n4);
+      I(p5, n5) <+ ih5 + (g5 + gmin_dc) * V(p5, n5);
+    end else begin
+      I(p0, n0) <+ ih0 + g0 * V(p0, n0);
+      I(p1, n1) <+ ih1 + g1 * V(p1, n1);
+      I(p2, n2) <+ ih2 + g2 * V(p2, n2);
+      I(p3, n3) <+ ih3 + g3 * V(p3, n3);
+      I(p4, n4) <+ ih4 + g4 * V(p4, n4);
+      I(p5, n5) <+ ih5 + g5 * V(p5, n5);
+    end
+
+    if (maxstep_mult > 0.0 && dt_j > 0.0) begin
+      $bound_step(maxstep_mult * dt_j);
+    end
+  end
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// 8. Eight-Port Norton / Branin Wave Boundary
+// -----------------------------------------------------------------------------
+module josim_cosim_port_8p(p0, n0, p1, n1, p2, n2, p3, n3, p4, n4, p5, n5, p6, n6, p7, n7);
+  inout p0, n0, p1, n1, p2, n2, p3, n3, p4, n4, p5, n5, p6, n6, p7, n7;
+  electrical p0, n0, p1, n1, p2, n2, p3, n3, p4, n4, p5, n5, p6, n6, p7, n7;
+
+  parameter string netlist      = "";
+  parameter string port_nodes   = "1,2,3,4,5,6,7,8";
+  parameter string port_modes   = "0,0,0,0,0,0,0,0";
+  parameter string endpoint     = "";
+  parameter string out_csv      = "";
+  parameter string events       = "";
+  parameter real   maxstep_mult = 0.0;
+  parameter real   gmin_dc      = 1e-12;
+
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
+    input string netlist_path,
+    input string port_nodes_csv,
+    input string port_modes_csv,
+    input string ep
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_output(
+    input integer h,
+    input string  out_csv_path,
+    input string  events_csv_path
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
+    input integer h
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_input(
+    input integer h,
+    input integer port_idx,
+    input real    val
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_eval(
+    input integer h,
+    input real    t_s
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_hist(
+    input integer h,
+    input integer port_idx
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_jacobian(
+    input integer h,
+    input integer port_idx
+  );
+
+  integer h, rc;
+  real    dt_j;
+  real    ih0, g0, ih1, g1, ih2, g2, ih3, g3, ih4, g4, ih5, g5, ih6, g6, ih7, g7;
+
+  analog begin
+    @(initial_step) begin
+      h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      rc   = josim_dpi_set_output(h, out_csv, events);
+      dt_j = josim_dpi_tstep(h);
+    end
+
+    rc = josim_dpi_set_input(h, 0, V(p0, n0));
+    rc = josim_dpi_set_input(h, 1, V(p1, n1));
+    rc = josim_dpi_set_input(h, 2, V(p2, n2));
+    rc = josim_dpi_set_input(h, 3, V(p3, n3));
+    rc = josim_dpi_set_input(h, 4, V(p4, n4));
+    rc = josim_dpi_set_input(h, 5, V(p5, n5));
+    rc = josim_dpi_set_input(h, 6, V(p6, n6));
+    rc = josim_dpi_set_input(h, 7, V(p7, n7));
+    rc = josim_dpi_eval(h, $abstime);
+
+    ih0 = josim_dpi_get_hist(h, 0); g0 = josim_dpi_get_jacobian(h, 0);
+    ih1 = josim_dpi_get_hist(h, 1); g1 = josim_dpi_get_jacobian(h, 1);
+    ih2 = josim_dpi_get_hist(h, 2); g2 = josim_dpi_get_jacobian(h, 2);
+    ih3 = josim_dpi_get_hist(h, 3); g3 = josim_dpi_get_jacobian(h, 3);
+    ih4 = josim_dpi_get_hist(h, 4); g4 = josim_dpi_get_jacobian(h, 4);
+    ih5 = josim_dpi_get_hist(h, 5); g5 = josim_dpi_get_jacobian(h, 5);
+    ih6 = josim_dpi_get_hist(h, 6); g6 = josim_dpi_get_jacobian(h, 6);
+    ih7 = josim_dpi_get_hist(h, 7); g7 = josim_dpi_get_jacobian(h, 7);
+
+    if (analysis("dc") || $abstime <= 0.0) begin
+      I(p0, n0) <+ ih0 + (g0 + gmin_dc) * V(p0, n0);
+      I(p1, n1) <+ ih1 + (g1 + gmin_dc) * V(p1, n1);
+      I(p2, n2) <+ ih2 + (g2 + gmin_dc) * V(p2, n2);
+      I(p3, n3) <+ ih3 + (g3 + gmin_dc) * V(p3, n3);
+      I(p4, n4) <+ ih4 + (g4 + gmin_dc) * V(p4, n4);
+      I(p5, n5) <+ ih5 + (g5 + gmin_dc) * V(p5, n5);
+      I(p6, n6) <+ ih6 + (g6 + gmin_dc) * V(p6, n6);
+      I(p7, n7) <+ ih7 + (g7 + gmin_dc) * V(p7, n7);
+    end else begin
+      I(p0, n0) <+ ih0 + g0 * V(p0, n0);
+      I(p1, n1) <+ ih1 + g1 * V(p1, n1);
+      I(p2, n2) <+ ih2 + g2 * V(p2, n2);
+      I(p3, n3) <+ ih3 + g3 * V(p3, n3);
+      I(p4, n4) <+ ih4 + g4 * V(p4, n4);
+      I(p5, n5) <+ ih5 + g5 * V(p5, n5);
+      I(p6, n6) <+ ih6 + g6 * V(p6, n6);
+      I(p7, n7) <+ ih7 + g7 * V(p7, n7);
     end
 
     if (maxstep_mult > 0.0 && dt_j > 0.0) begin

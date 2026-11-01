@@ -103,15 +103,10 @@ void Simulation::cosim_initialize(Input& iObj, Matrix& mObj) {
                 results.xVector[idx]->reserve(static_cast<size_t>(std::max<int64_t>(64, numKeptSteps_)));
             }
         }
-    } else {
-        for (auto& v : results.xVector) {
-            if (v) {
-                v->clear();
-                v->reserve(static_cast<size_t>(std::max<int64_t>(64, numKeptSteps_)));
-            }
-        }
     }
 
+    save_mna_checkpoint(ckpt_[0], 0);
+    cosimLuChanged_ = true;
     cosim_step_one(mObj, 0, 0.0);
     cosim_record_step(mObj, 0, 0.0);
 }
@@ -137,32 +132,15 @@ void Simulation::cosim_record_step(const Matrix& mObj, int64_t stepIdx, double s
                 results.xVector[j]->emplace_back(x_[j]);
             }
         }
-    } else {
-        for (size_t j = 0; j < results.xVector.size(); ++j) {
-            if (results.xVector[j]) { results.xVector[j]->emplace_back(x_[j]); }
-        }
     }
 }
 
 void Simulation::cosim_restore_ckpt(Matrix& mObj, const RollingCheckpoint& ckpt) {
     restore_mna_checkpoint(mObj, ckpt);
-    const double rbTimeCut  = (static_cast<double>(ckpt.stepIdx) + 0.5) * baseStepSize_;
-    const size_t newKeptLen = static_cast<size_t>(
-            std::lower_bound(results.timeAxis.begin(), results.timeAxis.end(), rbTimeCut) - results.timeAxis.begin());
-    if (results.timeAxis.size() > newKeptLen) { results.timeAxis.resize(newKeptLen); }
-    if (!mObj.relevantTraces.empty()) {
-        for (const auto& j : mObj.relevantIndices) {
-            if (results.xVector[j] && results.xVector[j]->size() > newKeptLen) {
-                results.xVector[j]->resize(newKeptLen);
-            }
-        }
-    } else {
-        for (auto& vecOpt : results.xVector) {
-            if (vecOpt && vecOpt->size() > newKeptLen) { vecOpt->resize(newKeptLen); }
-        }
+    if (needsLU_) {
+        refactor_lu(mObj);
+        needsLU_ = false;
     }
-    refactor_lu(mObj);
-    needsLU_ = false;
 }
 
 double Simulation::cosim_solve_unit_rhs(Matrix& mObj,
@@ -337,6 +315,14 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
         vccss_.push_back(std::get<VCCS>(mObj.components.devices[idx]));
     }
 
+    const size_t nCS = mObj.components.currentsources.size();
+    csSameAsPrev_.assign(nCS, 0);
+    for (size_t k = 1; k < nCS; ++k) {
+        const auto& fPrev = mObj.sourcegen[mObj.components.currentsources[k - 1].sourceIndex_];
+        const auto& fCurr = mObj.sourcegen[mObj.components.currentsources[k].sourceIndex_];
+        if (fCurr.same_waveform_as(fPrev)) { csSameAsPrev_[k] = 1; }
+    }
+
     nanowires_.clear();
     nanowires_.reserve(mObj.components.nanowireIndices.size());
     for (const auto& idx : mObj.components.nanowireIndices) {
@@ -438,7 +424,10 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
 
     // Determine whether in-loop print windowing / decimation can be used
     mcEventTrackers_.clear();
-    eventsOnly_ = iObj.argEventsOnly && !mObj.relevantTraces.empty()
+    const bool autoMcEventsOnly = (mcRuns_ > 1) && (iObj.argMargins || iObj.argSens)
+                                  && !iObj.cli_output_file.has_value() && iObj.output_files.empty()
+                                  && iObj.measurements.empty() && !iObj.argSweep;
+    eventsOnly_ = (iObj.argEventsOnly || autoMcEventsOnly) && !mObj.relevantTraces.empty()
                   && (iObj.transSim.prfirwindow() <= 0.0) && (atyp_ == AnalysisType::Phase) && !gpu_
                   && (mcRuns_ <= 1 || nodal_);
     eventMetrics_  = iObj.argEventMetrics;
@@ -522,6 +511,8 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
         for (const auto& i : mObj.relevantIndices) {
             results.xVector.at(i).emplace();
         }
+    } else if (cosimMode_) {
+        results.xVector.resize(mObj.branchIndex);
     } else {
         results.xVector.resize(mObj.branchIndex, std::vector<double>(0));
     }
@@ -3606,7 +3597,7 @@ void Simulation::save_mna_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx) {
     ckpt.stepSize  = stepSize_;
     ckpt.keptCount = results.timeAxis.size();
     ckpt.x         = x_;
-    ckpt.b         = b_;
+    if (!cosimMode_) { ckpt.b = b_; }
     ckpt.mnaJJs.resize(jjs_.size());
     for (size_t i = 0; i < jjs_.size(); ++i) {
         const auto& jj = jjs_[i];
@@ -3626,15 +3617,19 @@ void Simulation::save_mna_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx) {
                                     jj.cTerm_,
                                     jj.matrixInfo.nonZeros_.back()};
     }
-    ckpt.mnaRess.resize(resistors_.size());
-    for (size_t i = 0; i < resistors_.size(); ++i) {
-        const auto& r   = resistors_[i];
-        ckpt.mnaRess[i] = MnaP4State{r.pn1_, r.pn2_, r.pn3_, r.pn4_};
+    if (atyp_ == AnalysisType::Phase) {
+        ckpt.mnaRess.resize(resistors_.size());
+        for (size_t i = 0; i < resistors_.size(); ++i) {
+            const auto& r   = resistors_[i];
+            ckpt.mnaRess[i] = MnaP4State{r.pn1_, r.pn2_, r.pn3_, r.pn4_};
+        }
     }
-    ckpt.mnaInds.resize(inductors_.size());
-    for (size_t i = 0; i < inductors_.size(); ++i) {
-        const auto& ind = inductors_[i];
-        ckpt.mnaInds[i] = MnaIndState{ind.In2_, ind.In3_, ind.In4_};
+    if (atyp_ == AnalysisType::Voltage) {
+        ckpt.mnaInds.resize(inductors_.size());
+        for (size_t i = 0; i < inductors_.size(); ++i) {
+            const auto& ind = inductors_[i];
+            ckpt.mnaInds[i] = MnaIndState{ind.In2_, ind.In3_, ind.In4_};
+        }
     }
     ckpt.mnaCaps.resize(capacitors_.size());
     for (size_t i = 0; i < capacitors_.size(); ++i) {
@@ -3691,8 +3686,9 @@ void Simulation::save_mna_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx) {
 
 void Simulation::restore_mna_checkpoint(Matrix& mObj, const RollingCheckpoint& ckpt) {
     if (!ckpt.valid) { return; }
-    x_ = ckpt.x;
-    b_ = ckpt.b;
+    needsLU_ = false;
+    x_       = ckpt.x;
+    if (!cosimMode_ && !ckpt.b.empty()) { b_ = ckpt.b; }
     for (size_t i = 0; i < jjs_.size(); ++i) {
         auto&       jj                      = jjs_[i];
         const auto& s                       = ckpt.mnaJJs[i];
@@ -3711,26 +3707,33 @@ void Simulation::restore_mna_checkpoint(Matrix& mObj, const RollingCheckpoint& c
         jj.it_                              = s.it;
         jj.cTerm_                           = s.cTerm;
         jj.matrixInfo.nonZeros_.back()      = s.curNzBack;
-        mObj.nz[jj.nzBackIndex_]            = s.curNzBack;
+        if (mObj.nz[jj.nzBackIndex_] != s.curNzBack) {
+            mObj.nz[jj.nzBackIndex_] = s.curNzBack;
+            needsLU_                 = true;
 #ifndef SLU
-        if (usePartitions_ && i < jjPartIdx_.size() && i < jjPartNzIdx_.size()) {
-            const int64_t p = jjPartIdx_[i];
-            if (p >= 0 && p < static_cast<int64_t>(partitions_.size()) && jjPartNzIdx_[i] >= 0) {
-                partitions_[p].nz[jjPartNzIdx_[i]] = s.curNzBack;
-                partitions_[p].needsLU             = true;
+            if (usePartitions_ && i < jjPartIdx_.size() && i < jjPartNzIdx_.size()) {
+                const int64_t p = jjPartIdx_[i];
+                if (p >= 0 && p < static_cast<int64_t>(partitions_.size()) && jjPartNzIdx_[i] >= 0) {
+                    partitions_[p].nz[jjPartNzIdx_[i]] = s.curNzBack;
+                    partitions_[p].needsLU             = true;
+                }
             }
-        }
 #endif
+        }
     }
-    for (size_t i = 0; i < resistors_.size(); ++i) {
-        auto&       r  = resistors_[i];
-        const auto& s  = ckpt.mnaRess[i];
-        r.pn1_ = s.pn1; r.pn2_ = s.pn2; r.pn3_ = s.pn3; r.pn4_ = s.pn4;
+    if (atyp_ == AnalysisType::Phase && ckpt.mnaRess.size() == resistors_.size()) {
+        for (size_t i = 0; i < resistors_.size(); ++i) {
+            auto&       r = resistors_[i];
+            const auto& s = ckpt.mnaRess[i];
+            r.pn1_ = s.pn1; r.pn2_ = s.pn2; r.pn3_ = s.pn3; r.pn4_ = s.pn4;
+        }
     }
-    for (size_t i = 0; i < inductors_.size(); ++i) {
-        auto&       ind = inductors_[i];
-        const auto& s   = ckpt.mnaInds[i];
-        ind.In2_ = s.In2; ind.In3_ = s.In3; ind.In4_ = s.In4;
+    if (atyp_ == AnalysisType::Voltage && ckpt.mnaInds.size() == inductors_.size()) {
+        for (size_t i = 0; i < inductors_.size(); ++i) {
+            auto&       ind = inductors_[i];
+            const auto& s   = ckpt.mnaInds[i];
+            ind.In2_ = s.In2; ind.In3_ = s.In3; ind.In4_ = s.In4;
+        }
     }
     for (size_t i = 0; i < capacitors_.size(); ++i) {
         auto&       c  = capacitors_[i];
@@ -3766,7 +3769,10 @@ void Simulation::restore_mna_checkpoint(Matrix& mObj, const RollingCheckpoint& c
         nw.In3_                        = s.In3;
         nw.In4_                        = s.In4;
         nw.matrixInfo.nonZeros_.back() = s.curNzBack;
-        mObj.nz[nw.nzBackIndex_]       = s.curNzBack;
+        if (mObj.nz[nw.nzBackIndex_] != s.curNzBack) {
+            mObj.nz[nw.nzBackIndex_] = s.curNzBack;
+            needsLU_                 = true;
+        }
     }
     size_t off = 0;
     for (size_t i = 0; i < txlines_.size(); ++i) {
@@ -3784,8 +3790,16 @@ void Simulation::restore_mna_checkpoint(Matrix& mObj, const RollingCheckpoint& c
     }
     if (results.timeAxis.size() > ckpt.keptCount) {
         results.timeAxis.resize(ckpt.keptCount);
-        for (auto& vecOpt : results.xVector) {
-            if (vecOpt && vecOpt->size() > ckpt.keptCount) { vecOpt->resize(ckpt.keptCount); }
+        if (!mObj.relevantTraces.empty()) {
+            for (const auto& j : mObj.relevantIndices) {
+                if (results.xVector[j] && results.xVector[j]->size() > ckpt.keptCount) {
+                    results.xVector[j]->resize(ckpt.keptCount);
+                }
+            }
+        } else {
+            for (auto& vecOpt : results.xVector) {
+                if (vecOpt && vecOpt->size() > ckpt.keptCount) { vecOpt->resize(ckpt.keptCount); }
+            }
         }
     }
     if (!eventTrackers_.empty()) { eventTrackers_ = ckpt.eventTrackers; }
@@ -4799,6 +4813,7 @@ void Simulation::factorize_lu(Matrix& mObj) {
 }
 
 void Simulation::refactor_lu(Matrix& mObj) {
+    cosimLuChanged_ = true;
 #ifdef SLU
     lu.factorize(true);
 #else
@@ -5196,8 +5211,9 @@ void Simulation::expand_margin_targets(Input& iObj, const Matrix& mObj) {
                 return false;
             };
 
-            if (baseTgt == "@DEFAULT" || baseTgt == "@CATS") {
-                bool hasBiasInSub = false;
+            if (baseTgt == "@DEFAULT" || baseTgt == "@CATS" || baseTgt == "@DEFAULT_IC" || baseTgt == "@CATS_IC") {
+                const bool useIcOnly = (baseTgt == "@DEFAULT_IC" || baseTgt == "@CATS_IC");
+                bool       hasBiasInSub = false;
                 for (size_t i = 0; i < mObj.components.currentsources.size(); ++i) {
                     if (csIsBias[i] && in_subckt(mObj.components.currentsources[i].netlistInfo.label_)) {
                         hasBiasInSub = true;
@@ -5212,7 +5228,8 @@ void Simulation::expand_margin_targets(Input& iObj, const Matrix& mObj) {
                 }
                 if (hasBiasInSub) { add_target("@BIAS" + sfx, "GLOBAL", "@BIAS" + sfx, 1.0, sp); }
                 if (has_any_in_subckt(jjs_, [](const JJ& d) { return d.netlistInfo.label_; })) {
-                    add_target("@JJ" + sfx, "GLOBAL", "@JJ" + sfx, 1.0, sp);
+                    const std::string jjCat = useIcOnly ? ("@JJ_IC" + sfx) : ("@JJ" + sfx);
+                    add_target(jjCat, "GLOBAL", jjCat, 1.0, sp);
                 }
                 if (has_any_in_subckt(inductors_, [](const Inductor& d) { return d.netlistInfo.label_; })) {
                     add_target("@IND" + sfx, "GLOBAL", "@IND" + sfx, 1.0, sp);
@@ -5226,10 +5243,30 @@ void Simulation::expand_margin_targets(Input& iObj, const Matrix& mObj) {
                 if (has_any_in_subckt(nanowires_, [](const Nanowire& d) { return d.netlistInfo.label_; })) {
                     add_target("@NW" + sfx, "GLOBAL", "@NW" + sfx, 1.0, sp);
                 }
-            } else if (baseTgt == "@DEVICES" || baseTgt == "@ALL_DEVS" || baseTgt == "@CELL" || baseTgt == "@BIASES"
-                       || baseTgt == "@JJS" || baseTgt == "@INDS" || baseTgt == "@RESS" || baseTgt == "@CAPS"
+            } else if (baseTgt == "@DEVICES" || baseTgt == "@ALL_DEVS" || baseTgt == "@CELL"
+                       || baseTgt == "@DEVICES_IC" || baseTgt == "@ALL_DEVS_IC" || baseTgt == "@CELL_IC"
+                       || baseTgt == "@BIASES" || baseTgt == "@JJS" || baseTgt == "@JJS_IC" || baseTgt == "@JJ_IC"
+                       || baseTgt == "@INDS" || baseTgt == "@RESS" || baseTgt == "@CAPS"
                        || baseTgt == "@NWS" || baseTgt == "@NANOWIRES" || baseTgt == "@NTRONS") {
-                const bool incAll = (baseTgt == "@DEVICES" || baseTgt == "@ALL_DEVS" || baseTgt == "@CELL");
+                const bool incAll
+                        = (baseTgt == "@DEVICES" || baseTgt == "@ALL_DEVS" || baseTgt == "@CELL"
+                           || baseTgt == "@DEVICES_IC" || baseTgt == "@ALL_DEVS_IC" || baseTgt == "@CELL_IC");
+                const bool useIcOnly
+                        = (baseTgt == "@DEVICES_IC" || baseTgt == "@ALL_DEVS_IC" || baseTgt == "@CELL_IC"
+                           || baseTgt == "@JJS_IC" || baseTgt == "@JJ_IC");
+                if (baseTgt == "@JJ_IC") {
+                    add_target("@JJ_IC" + sfx, "GLOBAL", "@JJ_IC" + sfx, 1.0, sp);
+                    if (iObj.argSens) {
+                        for (const auto& jj : jjs_) {
+                            const auto& lbl = jj.netlistInfo.label_;
+                            if (in_subckt(lbl)) {
+                                const std::string disp = (seenTargets.count(lbl) > 0) ? (lbl + "(IC)") : lbl;
+                                add_target("IC:" + lbl, "JJ_IC", disp, jj.model_.ic(), sp);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if (incAll || baseTgt == "@BIASES") {
                     for (size_t i = 0; i < mObj.components.currentsources.size(); ++i) {
                         const auto& lbl = mObj.components.currentsources[i].netlistInfo.label_;
@@ -5244,10 +5281,17 @@ void Simulation::expand_margin_targets(Input& iObj, const Matrix& mObj) {
                         }
                     }
                 }
-                if (incAll || baseTgt == "@JJS") {
+                if (incAll || baseTgt == "@JJS" || baseTgt == "@JJS_IC") {
                     for (const auto& jj : jjs_) {
                         const auto& lbl = jj.netlistInfo.label_;
-                        if (in_subckt(lbl)) { add_target(lbl, "JJ", lbl, jj.area_, sp); }
+                        if (in_subckt(lbl)) {
+                            if (useIcOnly) {
+                                const std::string disp = (seenTargets.count(lbl) > 0) ? (lbl + "(IC)") : lbl;
+                                add_target("IC:" + lbl, "JJ_IC", disp, jj.model_.ic(), sp);
+                            } else {
+                                add_target(lbl, "JJ", lbl, jj.area_, sp);
+                            }
+                        }
                     }
                 }
                 if (incAll || baseTgt == "@INDS") {
@@ -5298,6 +5342,18 @@ void Simulation::expand_margin_targets(Input& iObj, const Matrix& mObj) {
                 std::string cat    = "GROUP";
                 double      nomVal = 1.0;
                 bool        found  = false;
+                if (item.rfind("IC:", 0) == 0) {
+                    const std::string jjPat = item.substr(3);
+                    for (size_t i = 0; !found && i < jjs_.size(); ++i) {
+                        if (match_single_label(jjs_[i].netlistInfo.label_, jjPat)) {
+                            cat    = "JJ_IC";
+                            nomVal = jjs_[i].model_.ic();
+                            found  = true;
+                        }
+                    }
+                    add_target(item, cat, jjPat, nomVal, sp);
+                    continue;
+                }
                 if (item.rfind("PARAM:", 0) != 0) {
                     for (const auto& cs : mObj.components.currentsources) {
                         if (match_single_label(cs.netlistInfo.label_, item)) {
@@ -5397,6 +5453,7 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
         ts.resScale.assign(resistors_.size(), 1.0);
         ts.capScale.assign(capacitors_.size(), 1.0);
         ts.jjScale.assign(jjs_.size(), 1.0);
+        ts.jjIcScale.assign(jjs_.size(), 1.0);
         ts.nwScale.assign(nanowires_.size(), 1.0);
         ts.vsScale.assign(vsources_.size(), 1.0);
         ts.psScale.assign(psources_.size(), 1.0);
@@ -5745,6 +5802,10 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
                     for (size_t i = 0; i < ts.jjScale.size(); ++i) {
                         if (in_subckt(jjs_[i].netlistInfo.label_)) { ts.jjScale[i] *= val; }
                     }
+                } else if (baseCat == "@JJ_IC" || baseCat == "@B_IC" || baseCat == "@JJS_IC") {
+                    for (size_t i = 0; i < ts.jjIcScale.size(); ++i) {
+                        if (in_subckt(jjs_[i].netlistInfo.label_)) { ts.jjIcScale[i] *= val; }
+                    }
                 } else if (baseCat == "@IND" || baseCat == "@L") {
                     for (size_t i = 0; i < ts.indScale.size(); ++i) {
                         if (in_subckt(inductors_[i].netlistInfo.label_)) { ts.indScale[i] *= val; }
@@ -5762,6 +5823,20 @@ void Simulation::compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScale
                         if (in_subckt(nanowires_[i].netlistInfo.label_)) { ts.nwScale[i] *= val; }
                     }
                 }
+            } else if (tgt.rfind("IC:", 0) == 0) {
+                const std::string jjPat = tgt.substr(3);
+                const bool        hasWildcard
+                        = (jjPat.find('*') != std::string::npos || jjPat.find('?') != std::string::npos
+                           || jjPat.find(',') != std::string::npos);
+                const bool useRel  = perturbs[dIdx].isRelative || hasWildcard;
+                bool       matched = false;
+                for (size_t idx = 0; idx < jjs_.size(); ++idx) {
+                    if (match_label(jjs_[idx].netlistInfo.label_, jjPat)) {
+                        ts.jjIcScale[idx] *= resolve_scale(val, jjs_[idx].model_.ic(), useRel);
+                        matched = true;
+                    }
+                }
+                dimHandledDevice[dIdx] = matched;
             } else if (tgt.rfind("PARAM:", 0) != 0) {
                 const bool hasWildcard
                         = (tgt.find('*') != std::string::npos || tgt.find('?') != std::string::npos
@@ -6657,15 +6732,16 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
             }
 
             for (size_t jIdx = 0; jIdx < jjs_.size(); ++jIdx) {
-                const auto&   jj    = jjs_[jIdx];
-                const double  area  = jj.area_ * ts.jjScale[jIdx];
-                const int32_t gJJ   = globalJJToGpuJJ[jIdx];
-                const int64_t p     = jjPartIdx_[jIdx];
-                const int64_t nzLoc = jjPartNzIdx_[jIdx];
+                const auto&   jj      = jjs_[jIdx];
+                const double  area    = jj.area_ * ts.jjScale[jIdx];
+                const double  icScale = ts.jjIcScale[jIdx];
+                const int32_t gJJ     = globalJJToGpuJJ[jIdx];
+                const int64_t p       = jjPartIdx_[jIdx];
+                const int64_t nzLoc   = jjPartNzIdx_[jIdx];
                 if (gJJ >= 0 && std::abs(area) > 1e-30) {
                     GpuJJ&       gjj     = allJJs[jjOffB + gJJ];
                     const double baseNz  = gjj.curNzVal;
-                    gjj.ic               = jj.baseModel_.ic() * area;
+                    gjj.ic               = jj.baseModel_.ic() * area * icScale;
                     gjj.rn               = jj.baseModel_.rn() / area;
                     gjj.r0               = (jj.baseModel_.rtype() == 0) ? gjj.rn : (jj.baseModel_.r0() / area);
                     gjj.c                = jj.baseModel_.c() * area;
@@ -6865,8 +6941,9 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
     bool anySingErr = false;
 
 #ifdef _OPENMP
-    const int nThreads = parallel_ ? std::min<int>(omp_get_max_threads(), static_cast<int>(B)) : 1;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) if (parallel_) reduction(|| : anyNeedsTR, anySingErr)
+    const int  nThreads = std::min<int>(omp_get_max_threads(), static_cast<int>(B));
+    const bool useOmp   = (nThreads > 1);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) if (useOmp) reduction(|| : anyNeedsTR, anySingErr)
 #endif
     for (int64_t b = 0; b < B; ++b) {
         if (anyNeedsTR || anySingErr) { continue; }
@@ -7416,8 +7493,9 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
     std::vector<double>       trial0FinalNodalX;
 
 #ifdef _OPENMP
-    const int nThreads = parallel_ ? std::min<int>(omp_get_max_threads(), static_cast<int>(B)) : 1;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) if (parallel_) reduction(|| : anyNeedsTR, anySingErr)
+    const int  nThreads = std::min<int>(omp_get_max_threads(), static_cast<int>(B));
+    const bool useOmp   = (nThreads > 1);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nThreads) if (useOmp) reduction(|| : anyNeedsTR, anySingErr)
 #endif
     for (int64_t b = 0; b < B; ++b) {
         if (anyNeedsTR || anySingErr) { continue; }
@@ -7458,18 +7536,19 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
         };
 
         for (size_t jIdx = 0; jIdx < trialJJs.size(); ++jIdx) {
-            const auto&  jj   = jjs_[jIdx];
-            GpuJJ&       gj   = trialJJs[jIdx];
-            const double area = std::max(1e-30, jj.area_ * ts.jjScale[jIdx]);
-            gj.ic             = jj.baseModel_.ic() * area;
-            gj.rn             = jj.baseModel_.rn() / area;
-            gj.r0             = (jj.baseModel_.rtype() == 0) ? gj.rn : (jj.baseModel_.r0() / area);
-            gj.c              = jj.baseModel_.c() * area;
-            gj.gLarge         = gj.ic / (jj.baseModel_.icFct() * jj.baseModel_.deltaV());
-            gj.negInvSubgap   = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + (1.0 / gj.r0)));
-            gj.negInvNormal   = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + (1.0 / gj.rn)));
-            gj.negInvTrans    = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + gj.gLarge));
-            gj.curNzVal       = (gj.rtype == 1) ? gj.negInvSubgap : gj.negInvNormal;
+            const auto&  jj      = jjs_[jIdx];
+            GpuJJ&       gj      = trialJJs[jIdx];
+            const double area    = std::max(1e-30, jj.area_ * ts.jjScale[jIdx]);
+            const double icScale = std::max(1e-30, ts.jjIcScale[jIdx]);
+            gj.ic                = jj.baseModel_.ic() * area * icScale;
+            gj.rn                = jj.baseModel_.rn() / area;
+            gj.r0                = (jj.baseModel_.rtype() == 0) ? gj.rn : (jj.baseModel_.r0() / area);
+            gj.c                 = jj.baseModel_.c() * area;
+            gj.gLarge            = gj.ic / (jj.baseModel_.icFct() * jj.baseModel_.deltaV());
+            gj.negInvSubgap      = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + (1.0 / gj.r0)));
+            gj.negInvNormal      = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + (1.0 / gj.rn)));
+            gj.negInvTrans       = -(1.0 / (((3.0 * gj.c) / (2.0 * stepSize_)) + gj.gLarge));
+            gj.curNzVal          = (gj.rtype == 1) ? gj.negInvSubgap : gj.negInvNormal;
             add_stamp(gj.nzIdxPP, gj.nzIdxQQ, gj.nzIdxPQ, gj.nzIdxQP, gj.gScale * (-1.0 / gj.curNzVal));
         }
 
@@ -7556,9 +7635,19 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
             continue;
         }
 
-        const size_t        stateSize = std::max<size_t>(mObj.rp.size(), x_.size());
+        bool needTrialB = (nTH > 0) || (atyp_ == AnalysisType::Voltage && nInd > 0);
+        if (!eventsOnly_) {
+            for (const auto& tr : trialRelTraces) {
+                if (tr.traceType == 1 || tr.traceType == 2 || tr.traceType == 3) {
+                    needTrialB = true;
+                    break;
+                }
+            }
+        }
+        const size_t        stateSize = needTrialB ? std::max<size_t>(mObj.rp.size(), x_.size()) : 0;
         std::vector<double> trialB(stateSize, 0.0);
-        std::vector<double> trialX      = x_;
+        std::vector<double> trialX      = (atyp_ == AnalysisType::Voltage && nInd > 0) ? x_ : std::vector<double>();
+        std::vector<double> jjBVar(static_cast<size_t>(nJJ), 0.0);
         std::vector<double> trialNodalX = nodalXInit;
         std::vector<double> trialNodalB(static_cast<size_t>(nRed), 0.0);
 
@@ -7599,9 +7688,9 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
                 if (i > 0) {
                     if (atyp_ == AnalysisType::Voltage) {
                         vn1 = pn1;
-                        pn1 = gj.gVar * (pn1 - trialB[gj.varIdx]);
+                        pn1 = gj.gVar * (pn1 - jjBVar[jIdx]);
                     } else {
-                        vn1 = gj.gVar * (pn1 - trialB[gj.varIdx]);
+                        vn1 = gj.gVar * (pn1 - jjBVar[jIdx]);
                     }
                 }
                 gj.pn1            = pn1;
@@ -7620,7 +7709,8 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
                 } else {
                     bVar = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gj.pn2;
                 }
-                trialB[gj.varIdx] = bVar;
+                jjBVar[jIdx] = bVar;
+                if (needTrialB) { trialB[gj.varIdx] = bVar; }
                 gj.pn4            = gj.pn3;
                 gj.pn3            = gj.pn2;
                 gj.pn2            = pn1;
@@ -7693,7 +7783,7 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
                                * std::tanh(gj.del / (2.0 * Constants::BOLTZMANN * gj.t) * sqrt_part))
                               - (((2.0 * gj.c) / stepSize_) * vn1) + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
                 }
-                trialB[gj.curIdx] = bCur;
+                if (needTrialB) { trialB[gj.curIdx] = bCur; }
                 gj.vn2            = vn1;
                 const double gCur = -1.0 / gj.curNzVal;
                 const double gJ   = gj.gScale * gCur;
@@ -7727,7 +7817,7 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
                     const double vDiff = read_nx(gr.posIdx) - read_nx(gr.negIdx);
                     const double pn1   = gr.alpha * vDiff + (1.0 - gr.alpha) * gr.pn1;
                     const double bRes  = (4.0 / 3.0) * pn1 - (1.0 / 3.0) * gr.pn2;
-                    trialB[gr.curIdx]  = bRes;
+                    if (needTrialB) { trialB[gr.curIdx] = bRes; }
                     gr.pn2             = pn1;
                     gr.pn1             = bRes;
                     const double jRes  = gr.g * bRes;
@@ -7780,7 +7870,7 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
                 }
                 gc.pn2            = pn1;
                 gc.pn1            = pn1;
-                trialB[gc.curIdx] = bCap;
+                if (needTrialB) { trialB[gc.curIdx] = bCap; }
                 const double jCap = gc.g * bCap;
                 if (gc.posIdx >= 0) { trialNodalB[gc.posIdx] += jCap; }
                 if (gc.negIdx >= 0) { trialNodalB[gc.negIdx] -= jCap; }
@@ -10939,9 +11029,9 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
                         temp.vn1_ = x_[temp.variableIndex_];
                     }
                 }
-                double v0  = (5.0 / 2.0) * temp.vn1_ - 2.0 * temp.vn2_ + (1.0 / 2.0) * temp.vn3_;
-                temp.phi0_ = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_
-                             + ((1.0 / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0)) * v0;
+                double v0        = temp.vn1_ + 1.5 * (temp.vn1_ - temp.vn2_) - 0.5 * (temp.vn2_ - temp.vn3_);
+                const double pH  = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
+                temp.phi0_       = pH + ((1.0 / Constants::SIGMA) * ((2.0 * stepSize_) / 3.0)) * v0;
                 if (checkPhase && std::abs(temp.phi0_ - temp.pn1_) > (0.20 * 2 * Constants::PI)) {
                     localNeedsTR = true;
                     continue;
@@ -10950,7 +11040,7 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
                     b_[temp.variableIndex_] = Constants::SIGMA
                                               * (-(2.0 / stepSize_) * temp.pn1_ + (1.0 / (2.0 * stepSize_)) * temp.pn2_);
                 } else if (atyp_ == AnalysisType::Phase) {
-                    b_[temp.variableIndex_] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+                    b_[temp.variableIndex_] = pH;
                 }
                 temp.pn4_ = temp.pn3_;
                 temp.pn3_ = temp.pn2_;
@@ -11025,7 +11115,7 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
                     } else {
                         temp.pn1_ = 0.0;
                     }
-                    b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+                    b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
                     temp.pn4_                                = temp.pn3_;
                     temp.pn3_                                = temp.pn2_;
                     temp.pn2_                                = temp.pn1_;
@@ -11046,10 +11136,12 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
                         temp.pn1_ = 0.0;
                     }
                     if (atyp_ == AnalysisType::Voltage) {
-                        b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+                        b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
                     } else if (atyp_ == AnalysisType::Phase) {
-                        b_[temp.indexInfo.currentIndex_.value()] = (8.0 / 3.0) * temp.pn1_ - (22.0 / 9.0) * temp.pn2_
-                                                                   + (8.0 / 9.0) * temp.pn3_ - (1.0 / 9.0) * temp.pn4_;
+                        b_[temp.indexInfo.currentIndex_.value()]
+                                = temp.pn1_
+                                  + ((5.0 / 3.0) * (temp.pn1_ - temp.pn2_) - (7.0 / 9.0) * (temp.pn2_ - temp.pn3_)
+                                     + (1.0 / 9.0) * (temp.pn3_ - temp.pn4_));
                         temp.pn7_ = temp.pn6_;
                         temp.pn6_ = temp.pn5_;
                         temp.pn5_ = temp.pn4_;
@@ -11136,8 +11228,16 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
 }
 
 void Simulation::handle_cs(Matrix& mObj, double& step, const int64_t& i) {
-    for (const auto& j : mObj.components.currentsources) {
-        double srcVal = mObj.sourcegen[j.sourceIndex_].value(step);
+    (void) i;
+    const auto&  csList = mObj.components.currentsources;
+    const size_t nCS    = csList.size();
+    const bool   dedup  = (mcRuns_ <= 1 && csSameAsPrev_.size() == nCS);
+    double       srcVal = 0.0;
+    for (size_t k = 0; k < nCS; ++k) {
+        const auto& j = csList[k];
+        if (!dedup || !csSameAsPrev_[k]) {
+            srcVal = mObj.sourcegen[j.sourceIndex_].value(step);
+        }
         if (j.indexInfo.nodeConfig_ == NodeConfig::POSGND) {
             b_[j.indexInfo.posIndex_.value()] -= srcVal;
         } else if (j.indexInfo.nodeConfig_ == NodeConfig::GNDNEG) {
@@ -11170,7 +11270,7 @@ void Simulation::handle_resistors(Matrix& mObj, double& step) {
                 } else {
                     temp.pn1_ = 0.0;
                 }
-                b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+                b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
                 temp.pn4_                                = temp.pn3_;
                 temp.pn3_                                = temp.pn2_;
                 temp.pn2_                                = temp.pn1_;
@@ -11191,7 +11291,7 @@ void Simulation::handle_resistors(Matrix& mObj, double& step) {
                 temp.pn1_ = 0.0;
             }
             // 4/3 φp1 - 1/3 φp2
-            b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+            b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
             temp.pn4_                                = temp.pn3_;
             temp.pn3_                                = temp.pn2_;
             temp.pn2_                                = temp.pn1_;
@@ -11218,7 +11318,7 @@ void Simulation::handle_resistors(Matrix& mObj, double& step) {
         }
         if (atyp_ == AnalysisType::Phase) {
             // 4/3 φp1 - 1/3 φp2
-            b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+            b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
             temp.pn4_                                = temp.pn3_;
             temp.pn3_                                = temp.pn2_;
             temp.pn2_                                = temp.pn1_;
@@ -11274,10 +11374,12 @@ void Simulation::handle_capacitors(Matrix& mObj) {
                 temp.pn1_ = 0.0;
             }
             if (atyp_ == AnalysisType::Voltage) {
-                b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+                b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
             } else if (atyp_ == AnalysisType::Phase) {
-                b_[temp.indexInfo.currentIndex_.value()] = (8.0 / 3.0) * temp.pn1_ - (22.0 / 9.0) * temp.pn2_
-                                                           + (8.0 / 9.0) * temp.pn3_ - (1.0 / 9.0) * temp.pn4_;
+                b_[temp.indexInfo.currentIndex_.value()]
+                        = temp.pn1_
+                          + ((5.0 / 3.0) * (temp.pn1_ - temp.pn2_) - (7.0 / 9.0) * (temp.pn2_ - temp.pn3_)
+                             + (1.0 / 9.0) * (temp.pn3_ - temp.pn4_));
                 temp.pn7_ = temp.pn6_;
                 temp.pn6_ = temp.pn5_;
                 temp.pn5_ = temp.pn4_;
@@ -11302,11 +11404,13 @@ void Simulation::handle_capacitors(Matrix& mObj) {
         }
         if (atyp_ == AnalysisType::Voltage) {
             // 4/3 Vp1 - 1/3 Vp2
-            b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+            b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
         } else if (atyp_ == AnalysisType::Phase) {
             // (8/3)φn-1 - (22/9)φn-2 + (8/9)φn-3 - (1/9)φn-4
-            b_[temp.indexInfo.currentIndex_.value()] = (8.0 / 3.0) * temp.pn1_ - (22.0 / 9.0) * temp.pn2_
-                                                       + (8.0 / 9.0) * temp.pn3_ - (1.0 / 9.0) * temp.pn4_;
+            b_[temp.indexInfo.currentIndex_.value()]
+                    = temp.pn1_
+                      + ((5.0 / 3.0) * (temp.pn1_ - temp.pn2_) - (7.0 / 9.0) * (temp.pn2_ - temp.pn3_)
+                         + (1.0 / 9.0) * (temp.pn3_ - temp.pn4_));
             temp.pn7_ = temp.pn6_;
             temp.pn6_ = temp.pn5_;
             temp.pn5_ = temp.pn4_;
@@ -11349,9 +11453,9 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
                     temp.vn1_ = x_[temp.variableIndex_];
                 }
             }
-            double v0  = (5.0 / 2.0) * temp.vn1_ - 2.0 * temp.vn2_ + (1.0 / 2.0) * temp.vn3_;
-            temp.phi0_ = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_
-                         + ((1.0 / Constants::SIGMA) * ((2.0 * (stepSize_)) / 3.0)) * v0;
+            double v0  = temp.vn1_ + 1.5 * (temp.vn1_ - temp.vn2_) - 0.5 * (temp.vn2_ - temp.vn3_);
+            temp.phi0_ = temp.pn1_ + ((1.0 / 3.0) * (temp.pn1_ - temp.pn2_)
+                                      + ((1.0 / Constants::SIGMA) * ((2.0 * (stepSize_)) / 3.0)) * v0);
             if (checkPhase) {
                 if (abs(temp.phi0_ - temp.pn1_) > (0.20 * 2 * Constants::PI)) {
                     localNeedsTR = true;
@@ -11362,7 +11466,7 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
                 b_[temp.variableIndex_] = (Constants::SIGMA)
                                           * (-(2.0 / (stepSize_)) * temp.pn1_ + (1.0 / (2.0 * (stepSize_))) * temp.pn2_);
             } else if (atyp_ == AnalysisType::Phase) {
-                b_[temp.variableIndex_] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+                b_[temp.variableIndex_] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
             }
             temp.pn4_ = temp.pn3_;
             temp.pn3_ = temp.pn2_;
@@ -11463,10 +11567,10 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
             }
         }
         // Guess voltage (V0)
-        double v0  = (5.0 / 2.0) * temp.vn1_ - 2.0 * temp.vn2_ + (1.0 / 2.0) * temp.vn3_;
+        double v0  = temp.vn1_ + 1.5 * (temp.vn1_ - temp.vn2_) - 0.5 * (temp.vn2_ - temp.vn3_);
         // Phase guess (P0)
-        temp.phi0_ = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_
-                     + ((1.0 / Constants::SIGMA) * ((2.0 * (stepSize_)) / 3.0)) * v0;
+        temp.phi0_ = temp.pn1_ + ((1.0 / 3.0) * (temp.pn1_ - temp.pn2_)
+                                  + ((1.0 / Constants::SIGMA) * ((2.0 * (stepSize_)) / 3.0)) * v0);
         // Ensure timestep is not too large
         if (checkPhase) {
             if (abs(temp.phi0_ - temp.pn1_) > (0.20 * 2 * Constants::PI)) {
@@ -11483,7 +11587,7 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
                     = (Constants::SIGMA) * (-(2.0 / (stepSize_)) * temp.pn1_ + (1.0 / (2.0 * (stepSize_))) * temp.pn2_);
             // (4 / 3) φp1 - (1/3) φp2
         } else if (atyp_ == AnalysisType::Phase) {
-            b_[temp.variableIndex_] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+            b_[temp.variableIndex_] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
         }
         temp.pn4_ = temp.pn3_;
         temp.pn3_ = temp.pn2_;
@@ -11653,9 +11757,9 @@ void Simulation::handle_vs(Matrix& mObj, const int64_t& i, double& step, double 
                 temp.pn1_ = 0.0;
             }
             // (2e/hbar)(2h/3)Vn + (4/3)φn-1 - (1/3)φn-2
-            b_[temp.indexInfo.currentIndex_.value()] = ((2 * stepSize_ * factor) / (3 * Constants::SIGMA))
-                                                               * (mObj.sourcegen[temp.sourceIndex_].value(step))
-                                                       + (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+            b_[temp.indexInfo.currentIndex_.value()] = (temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_))
+                                                       + ((2 * stepSize_ * factor) / (3 * Constants::SIGMA))
+                                                                 * (mObj.sourcegen[temp.sourceIndex_].value(step));
             temp.pn4_ = temp.pn3_;
             temp.pn3_ = temp.pn2_;
             temp.pn2_ = temp.pn1_;
@@ -11702,7 +11806,7 @@ void Simulation::handle_ccvs(Matrix& mObj) {
         } else {
             temp.pn1_ = 0.0;
         }
-        b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+        b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
         temp.pn4_                                = temp.pn3_;
         temp.pn3_                                = temp.pn2_;
         temp.pn2_                                = temp.pn1_;
@@ -11721,7 +11825,7 @@ void Simulation::handle_vccs(Matrix& mObj) {
         } else {
             temp.pn1_ = 0.0;
         }
-        b_[temp.indexInfo.currentIndex_.value()] = (4.0 / 3.0) * temp.pn1_ - (1.0 / 3.0) * temp.pn2_;
+        b_[temp.indexInfo.currentIndex_.value()] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
         temp.pn4_                                = temp.pn3_;
         temp.pn3_                                = temp.pn2_;
         temp.pn2_                                = temp.pn1_;
@@ -11790,7 +11894,7 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
                     const auto& e1 = temp.hist_[(mc - 1) % temp.histSize_];
                     s1             = (field == 0) ? e1.v1 : ((field == 1) ? e1.v2 : ((field == 2) ? e1.i1 : e1.i2));
                 }
-                return (1.0 - ac) * s0 + ac * s1;
+                return s0 - ac * (s0 - s1);
             };
             if (atyp_ == AnalysisType::Voltage) {
                 if (uDel >= 0.0) {
@@ -11811,17 +11915,19 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
                     temp.nk2_2_        = eval_hist(uDel - 2.0 * stepU, 1);
                     const double  I1nk = eval_hist(uDel, 2);
                     const double  I2nk = eval_hist(uDel, 3);
-                    b_[curInd]         = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_
-                                 + temp.atten_
-                                           * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
-                                              + temp.nk_2_ - (4.0 / 3.0) * temp.nk1_2_ + (1.0 / 3.0) * temp.nk2_2_);
-                    b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_
-                                  + temp.atten_
-                                            * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
-                                               + temp.nk_1_ - (4.0 / 3.0) * temp.nk1_1_ + (1.0 / 3.0) * temp.nk2_1_);
+                    b_[curInd]         = temp.n1_1_
+                                 + ((1.0 / 3.0) * (temp.n1_1_ - temp.n2_1_)
+                                    + temp.atten_
+                                              * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
+                                                 + ((temp.nk_2_ - temp.nk1_2_) - (1.0 / 3.0) * (temp.nk1_2_ - temp.nk2_2_))));
+                    b_[curInd2] = temp.n1_2_
+                                  + ((1.0 / 3.0) * (temp.n1_2_ - temp.n2_2_)
+                                     + temp.atten_
+                                               * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
+                                                  + ((temp.nk_1_ - temp.nk1_1_) - (1.0 / 3.0) * (temp.nk1_1_ - temp.nk2_1_))));
                 } else {
-                    b_[curInd]  = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_;
-                    b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_;
+                    b_[curInd]  = temp.n1_1_ + (1.0 / 3.0) * (temp.n1_1_ - temp.n2_1_);
+                    b_[curInd2] = temp.n1_2_ + (1.0 / 3.0) * (temp.n1_2_ - temp.n2_2_);
                 }
             }
             continue;
@@ -11829,30 +11935,29 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
 
         if (temp.fracDelay_ > 0.0) {
             const double alpha     = temp.fracDelay_;
-            const double oma       = 1.0 - alpha;
             auto         interp_v1 = [&](int64_t m) -> double {
                 if (m < 0) { return 0.0; }
                 const double s0 = temp.hist_[m % temp.histSize_].v1;
                 const double s1 = (m >= 1) ? temp.hist_[(m - 1) % temp.histSize_].v1 : 0.0;
-                return oma * s0 + alpha * s1;
+                return s0 - alpha * (s0 - s1);
             };
             auto interp_v2 = [&](int64_t m) -> double {
                 if (m < 0) { return 0.0; }
                 const double s0 = temp.hist_[m % temp.histSize_].v2;
                 const double s1 = (m >= 1) ? temp.hist_[(m - 1) % temp.histSize_].v2 : 0.0;
-                return oma * s0 + alpha * s1;
+                return s0 - alpha * (s0 - s1);
             };
             auto interp_i1 = [&](int64_t m) -> double {
                 if (m < 0) { return 0.0; }
                 const double s0 = temp.hist_[m % temp.histSize_].i1;
                 const double s1 = (m >= 1) ? temp.hist_[(m - 1) % temp.histSize_].i1 : 0.0;
-                return oma * s0 + alpha * s1;
+                return s0 - alpha * (s0 - s1);
             };
             auto interp_i2 = [&](int64_t m) -> double {
                 if (m < 0) { return 0.0; }
                 const double s0 = temp.hist_[m % temp.histSize_].i2;
                 const double s1 = (m >= 1) ? temp.hist_[(m - 1) % temp.histSize_].i2 : 0.0;
-                return oma * s0 + alpha * s1;
+                return s0 - alpha * (s0 - s1);
             };
             if (atyp_ == AnalysisType::Voltage) {
                 if (effStep >= k) {
@@ -11875,17 +11980,19 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
                     temp.nk2_2_        = interp_v2(m - 2);
                     const double  I1nk = interp_i1(m);
                     const double  I2nk = interp_i2(m);
-                    b_[curInd]         = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_
-                                 + temp.atten_
-                                           * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
-                                              + temp.nk_2_ - (4.0 / 3.0) * temp.nk1_2_ + (1.0 / 3.0) * temp.nk2_2_);
-                    b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_
-                                  + temp.atten_
-                                            * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
-                                               + temp.nk_1_ - (4.0 / 3.0) * temp.nk1_1_ + (1.0 / 3.0) * temp.nk2_1_);
+                    b_[curInd]         = temp.n1_1_
+                                 + ((1.0 / 3.0) * (temp.n1_1_ - temp.n2_1_)
+                                    + temp.atten_
+                                              * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
+                                                 + ((temp.nk_2_ - temp.nk1_2_) - (1.0 / 3.0) * (temp.nk1_2_ - temp.nk2_2_))));
+                    b_[curInd2] = temp.n1_2_
+                                  + ((1.0 / 3.0) * (temp.n1_2_ - temp.n2_2_)
+                                     + temp.atten_
+                                               * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
+                                                  + ((temp.nk_1_ - temp.nk1_1_) - (1.0 / 3.0) * (temp.nk1_1_ - temp.nk2_1_))));
                 } else {
-                    b_[curInd]  = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_;
-                    b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_;
+                    b_[curInd]  = temp.n1_1_ + (1.0 / 3.0) * (temp.n1_1_ - temp.n2_1_);
+                    b_[curInd2] = temp.n1_2_ + (1.0 / 3.0) * (temp.n1_2_ - temp.n2_2_);
                 }
             }
             continue;
@@ -11910,31 +12017,35 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
                 const double  I2nk = h_k.i2;
                 if (effStep == k) {
                     // I1 = (4/3)φ1n-1 - (1/3)φ1n-2 + gamma * (Z(2e/hbar)(2h/3)I2n-k + φ2n-k)
-                    b_[curInd]  = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_
-                                 + temp.atten_
-                                           * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
-                                              + temp.nk_2_);
+                    b_[curInd]  = temp.n1_1_
+                                 + ((1.0 / 3.0) * (temp.n1_1_ - temp.n2_1_)
+                                    + temp.atten_
+                                              * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
+                                                 + temp.nk_2_));
                     // I2 = (4/3)φ2n-1 - (1/3)φ2n-2 + gamma * (Z(2e/hbar)(2h/3)I1n-k + φ1n-k)
-                    b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_
-                                  + temp.atten_
-                                            * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
-                                               + temp.nk_1_);
+                    b_[curInd2] = temp.n1_2_
+                                  + ((1.0 / 3.0) * (temp.n1_2_ - temp.n2_2_)
+                                     + temp.atten_
+                                               * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
+                                                  + temp.nk_1_));
                 } else if (effStep == k + 1) {
                     const auto& h_k1 = temp.hist_[(m - 1) % temp.histSize_];
                     temp.nk1_1_      = h_k1.v1;
                     temp.nk1_2_      = h_k1.v2;
                     // I1 = (4/3)φ1n-1 - (1/3)φ1n-2 +
                     //      gamma * (Z(2e/hbar)(2h/3)I2n-k + φ2n-k - (4/3)φ2n-k-1)
-                    b_[curInd]       = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_
-                                 + temp.atten_
-                                           * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
-                                              + temp.nk_2_ - (4.0 / 3.0) * temp.nk1_2_);
+                    b_[curInd]       = temp.n1_1_
+                                 + ((1.0 / 3.0) * (temp.n1_1_ - temp.n2_1_)
+                                    + temp.atten_
+                                              * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
+                                                 + ((temp.nk_2_ - temp.nk1_2_) - (1.0 / 3.0) * temp.nk1_2_)));
                     // I2 = (4/3)φ2n-1 - (1/3)φ2n-2 +
                     //      gamma * (Z(2e/hbar)(2h/3)I1n-k + φ1n-k - (4/3)φ1n-k-1)
-                    b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_
-                                  + temp.atten_
-                                            * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
-                                               + temp.nk_1_ - (4.0 / 3.0) * temp.nk1_1_);
+                    b_[curInd2] = temp.n1_2_
+                                  + ((1.0 / 3.0) * (temp.n1_2_ - temp.n2_2_)
+                                     + temp.atten_
+                                               * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
+                                                  + ((temp.nk_1_ - temp.nk1_1_) - (1.0 / 3.0) * temp.nk1_1_)));
                 } else if (effStep > k + 1) {
                     const auto& h_k1 = temp.hist_[(m - 1) % temp.histSize_];
                     const auto& h_k2 = temp.hist_[(m - 2) % temp.histSize_];
@@ -11944,22 +12055,24 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
                     temp.nk2_2_      = h_k2.v2;
                     // I1 = (4/3)φ1n-1 - (1/3)φ1n-2 +
                     //      gamma * (Z(2e/hbar)(2h/3)I2n-k + φ2n-k - (4/3)φ2n-k-1 + (1/3)φ2n-k-2)
-                    b_[curInd]       = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_
-                                 + temp.atten_
-                                           * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
-                                              + temp.nk_2_ - (4.0 / 3.0) * temp.nk1_2_ + (1.0 / 3.0) * temp.nk2_2_);
+                    b_[curInd]       = temp.n1_1_
+                                 + ((1.0 / 3.0) * (temp.n1_1_ - temp.n2_1_)
+                                    + temp.atten_
+                                              * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I2nk
+                                                 + ((temp.nk_2_ - temp.nk1_2_) - (1.0 / 3.0) * (temp.nk1_2_ - temp.nk2_2_))));
                     // I2 = (4/3)φ2n-1 - (1/3)φ2n-2 +
                     //      gamma * (Z(2e/hbar)(2h/3)I1n-k + φ1n-k - (4/3)φ1n-k-1 + (1/3)φ1n-k-2)
-                    b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_
-                                  + temp.atten_
-                                            * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
-                                               + temp.nk_1_ - (4.0 / 3.0) * temp.nk1_1_ + (1.0 / 3.0) * temp.nk2_1_);
+                    b_[curInd2] = temp.n1_2_
+                                  + ((1.0 / 3.0) * (temp.n1_2_ - temp.n2_2_)
+                                     + temp.atten_
+                                               * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
+                                                  + ((temp.nk_1_ - temp.nk1_1_) - (1.0 / 3.0) * (temp.nk1_1_ - temp.nk2_1_))));
                 }
             } else {
                 // I1 = (4/3)φ1n-1 - (1/3)φ1n-2
-                b_[curInd]  = (4.0 / 3.0) * temp.n1_1_ - (1.0 / 3.0) * temp.n2_1_;
+                b_[curInd]  = temp.n1_1_ + (1.0 / 3.0) * (temp.n1_1_ - temp.n2_1_);
                 // I2 = (4/3)φ2n-1 - (1/3)φ2n-2
-                b_[curInd2] = (4.0 / 3.0) * temp.n1_2_ - (1.0 / 3.0) * temp.n2_2_;
+                b_[curInd2] = temp.n1_2_ + (1.0 / 3.0) * (temp.n1_2_ - temp.n2_2_);
             }
         }
     }
@@ -11984,7 +12097,7 @@ void Simulation::handle_nanowires(Matrix& mObj, int64_t& i, double& step, double
                 nw.phiRn2_          = nw.phiRn1_;
                 nw.phiRn1_          = phiRn1;
             }
-            const double rhs = (4.0 / 3.0) * nw.phiRn1_ - (1.0 / 3.0) * nw.phiRn2_;
+            const double rhs = nw.phiRn1_ + (1.0 / 3.0) * (nw.phiRn1_ - nw.phiRn2_);
             nw.prevRhs_      = rhs;
             b_[curIdx]       = rhs;
         } else {

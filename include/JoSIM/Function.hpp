@@ -60,6 +60,10 @@ class Function {
     std::vector<double>&       ampValues() noexcept { return ampValues_; }
     const std::vector<double>& ampValues() const noexcept { return ampValues_; }
     FunctionType               fType() const noexcept { return fType_; }
+    bool                       same_waveform_as(const Function& o) const noexcept {
+        return fType_ == o.fType_ && fType_ != FunctionType::NOISE && cusSpline_ == o.cusSpline_
+               && timeValues_ == o.timeValues_ && ampValues_ == o.ampValues_ && miscValues_ == o.miscValues_;
+    }
 
     const char*                bias_rule() const noexcept {
         if (ampValues_.empty()) { return nullptr; }

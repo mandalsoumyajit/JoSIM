@@ -72,15 +72,25 @@ def _find_libjosim_c(lib_path: Optional[Union[str, Path]] = None) -> Path:
             return p
 
     repo_root = Path(__file__).resolve().parent.parent
-    candidates = [
-        Path("/tmp/josim-build/libjosim_c.so"),
+    candidates: List[Path] = []
+    env_build = os.environ.get("JOSIM_BUILD_DIR")
+    if env_build:
+        bdir = Path(env_build)
+        candidates.extend([
+            bdir / "libjosim_c.so",
+            bdir / "libjosim_c.dylib",
+            bdir / "josim_c.dll",
+            bdir / "Release" / "josim_c.dll",
+        ])
+    candidates.extend([
         repo_root / "build" / "libjosim_c.so",
         repo_root / "build" / "libjosim_c.dylib",
         repo_root / "build" / "josim_c.dll",
         repo_root / "build" / "Release" / "josim_c.dll",
         Path.cwd() / "libjosim_c.so",
         Path.cwd() / "josim_c.dll",
-    ]
+        Path(os.environ.get("TMPDIR", "/tmp")) / "josim-build" / "libjosim_c.so",
+    ])
     for c in candidates:
         if c.is_file():
             return c
@@ -447,10 +457,19 @@ class Session:
             else:
                 self.load_string(netlist, base_dir=base_dir)
 
-    def __del__(self) -> None:
+    def close(self) -> None:
         if getattr(self, "_ptr", None):
             self._lib.josim_session_destroy(self._ptr)
             self._ptr = None
+
+    def __enter__(self) -> "Session":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def _raise_last_error(self, prefix: str = "JoSIM error") -> None:
         err = self._lib.josim_session_last_error(self._ptr)
@@ -670,6 +689,9 @@ class Session:
         if rc != 0:
             self._raise_last_error("josim_cosim_finalize failed")
         return SimulationResult(self)
+
+
+JoSIMSession = Session
 
 
 def simulate_netlist(

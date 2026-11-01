@@ -54,8 +54,8 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
     - OpenMP-parallelized model/circuit `.iv`, RF Shapiro steps (`RF_AMP=`, `RF_FREQ=`), and 1D/2D SQUID $V(\Phi)$ / $I_c(\Phi)$ flux modulation (`.squid`, `--squid`).
     - Native 2-, 3-, and 4-terminal electrothermal superconducting nanowire / cryotron (`nTron` / `hTron` / `SNSPD`) device element (`N...`, `.model ... ntron/htron/snspd/nanowire`).
 11. **In-Memory Python/C API (`pyjosim` / `libjosim_c`) & Hybrid SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`):**
-    - Zero-copy NumPy views and persistent pre-parsed AST sessions via [`scripts/pyjosim.py`](../scripts/pyjosim.py) and `libjosim_c`.
-    - Lockstep Norton/Thevenin and windowed Branin co-simulation across **`ngspice`** (`josim_cosim.cm` XSPICE code model), **ADI `LTspice`** (`BraninWaveWindowCoordinator` & `run_ltspice_pwl_cosim`), and **Cadence Spectre 25.1** (`libjosim_spectre_dpi.so` + `josim_cosim_port.va` `-cds_va_dpi` + multiplexed `josim-cosim-server`), delivering **$3.4\times\text{–}40.8\times$ speedup in `ngspice`** and **$6.53\times$ transient CPU speedup in Cadence Spectre 25.1** over monolithic Verilog-A (`seeqc_jj3.va`). See [`docs/cosimulation.md`](cosimulation.md) for the complete guide.
+    - Zero-copy NumPy views and persistent pre-parsed AST sessions via [`scripts/pyjosim.py`](../scripts/pyjosim.py) (`pyjosim.Session` / `pyjosim.JoSIMSession`) and `libjosim_c`.
+    - Lockstep Norton/Thevenin and windowed Branin co-simulation across **`ngspice`** (`josim_cosim.cm` XSPICE code model), **ADI `LTspice`** (`BraninWaveWindowCoordinator` & `run_ltspice_pwl_cosim`), and **Cadence Spectre 25.1** (`libjosim_spectre_dpi.so` + `josim_cosim_port.va` 1-/2-/3-/4-/6-/8-port modules + multiplexed `josim-cosim-server`), delivering **$4.6\times\text{–}37.5\times$ speedup in `ngspice`** ($16\text{–}1000$ JJs, $2.0\times$ on `macro-SPLIT`) and **$2.1\times\text{–}7.1\times$ wall-time speedup on 1000-JJ JTLs and PTL macros in Cadence Spectre 25.1** over monolithic Verilog-A (`seeqc_jj3.va`). See [`docs/cosimulation.md`](cosimulation.md) for the complete guide.
 
 ---
 
@@ -131,23 +131,24 @@ All solver modes produce machine-precision equivalent waveforms ($\le 10^{-14}$ 
 | **`-g [1\|2\|3\|4]` / `--gpu=`** | **New (`v2.8`)** | CUDA GPU solver: `1` = Auto, `2` = Hybrid, `3` = `cuSolverRF` MNA, `4` = `cuSolverRF` Nodal. |
 | **`-b <N>` / `--batch=<N>`** | **New (`v2.8`)** | Batched Monte Carlo solver ($N$ simultaneous `.spread` trials; combine with `-p -n` for Batched Nodal). |
 | **`-S <spec>` / `--sweep=<spec>`** | **New (`v2.8`)** | Deterministic parameter/margin sweep (e.g. `-S "@BIAS:MARGIN:0.3:21"` or `-S "Scaling:LIN:21:0.7:1.3"`). Pass twice for 2D Cartesian grid. |
-| **`-M [spec]` / `--margins=`** | **New (`v2.8`)** | One-shot batched critical operating margin finder across `@BIAS,@JJ,@IND,@RES` or `@DEVICES[|X0]`. |
+| **`-M [spec]` / `--margins=`** | **New (`v2.8`)** | One-shot batched critical operating margin finder across `@BIAS,@JJ,@JJ_IC,@IND,@RES` or `@DEVICES[|X0]`. Uses `.assert` slot windows when `.assert` cards are present without explicit `-T`. |
 | **`-F <file>` / `--margin-file=`** | **New (`v2.8`)** | Exports the ranked critical operating margin report to `<file>` (`.csv`). |
-| **`-T <tol>` / `--margin-tol=`** | **New (`v2.8`)** | Timing tolerance for exact SFQ event-sequence verification (default `50p`). |
+| **`-T <tol>` / `--margin-tol=`** | **New (`v2.8`)** | Timing tolerance for exact SFQ event-sequence verification (default `50p`; overrides `.assert` slot criterion). |
+| **`--margin-traces=<spec>`** | **New (`v2.8`)** | Comma-separated list or glob pattern of junction names (`B*`, `BJ2|XJTL*`, or `ALL`) to monitor during `-M` margin analysis. |
 | **`--verify-events=<file>`** | **New (`v2.8`)** | Verifies simulated SFQ event sequence & timestamps against a golden `.events.csv` or `.events.npy` file. |
 | **`-A <spec>` / `--assert=`** | **New (`v2.8`)** | Verifies digital SFQ event assertions (`BITS=`, `COUNT=`, `TIMES=`, `AFTER`). |
 | **`--meas=<spec>`** | **New (`v2.8`)** | Evaluates a SPICE `.meas` statement from the CLI (supports `SFQ=k` triggers and window reductions). |
 | **`--meas-file=<file>`** | **New (`v2.8`)** | Exports evaluated `.meas` values (and batched ensemble stats) to `<file>` (`.csv`). |
 | **`--ic=<spec>`** | **New (`v2.8`)** | Sets initial node/device conditions at $t=0$ (`P(n)=`, `V(n)=`, `I(L)=`). |
-| **`--check-loops[=<file>]`** | **New (`v2.8`)** | Audits superconducting `B+L` loops for $\beta_L$, trapped flux, and `0-L` degeneracy (optional CSV/JSON output). |
+| **`--check-loops[=<file>]`** | **New (`v2.8`)** | Audits superconducting `B+L` loops for $\beta_L$, trapped flux, and `0-L` degeneracy (`DEGENERATE_0L`, `SUB_CRITICAL`, `NON_STORAGE`, `JTL_STAGE`, `STORAGE_QUANT`, `MULTI_FLUX_TRAP`). |
 | **`-J [spec]` / `--jitter=`** | **New (`v2.8`)** | Runs SFQ timing jitter, clock skew, latency & BER analysis (`REF=`, `PER=`, `BITS=`, or ensemble). |
 | **`--jitter-file=<file>`** | **New (`v2.8`)** | Exports timing jitter and BER report to `<file>` (`.csv` or `.json`). |
 | **`--iv=<spec>`** | **New (`v2.8`)** | Extracts model/circuit DC I-V curves or microwave RF Shapiro steps (`RF_AMP=`, `RF_FREQ=`). |
 | **`--squid=<spec>`** | **New (`v2.8`)** | Extracts 1D/2D SQUID $V(\Phi)$ and $I_c(\Phi)$ flux modulation curves. |
-| **`--sens[=<spec>]`** | **New (`v2.8`)** | Runs batched OAAT central-difference sensitivity and automated margin centering (`CENTER`, `GOAL=`). |
+| **`--sens[=<spec>]`** | **New (`v2.8`)** | Runs batched OAAT central-difference sensitivity (`@DEVICES`, `@JJ`, `@JJ_IC`, `@BIAS`, `@IND`, `@RES`) and automated margin centering (`CENTER`, `GOAL=`). |
 | **`--sens-file=<file>`** | **New (`v2.8`)** | Exports sensitivity & margin-centering report to `<file>` (`.csv` or `.json`). |
 | **`-o <file>` / `--output=`** | **Enhanced (`v2.8`)** | Output file: **`.npy`**, **`.bin`**, **`.rawb`** *(New binary formats)* or `.csv`, `.dat`, `.raw` *(Inherited)*. |
-| **`-e [file]` / `--events=`** | **New (`v2.8`)** | Extracts $2\pi$ SFQ phase-slip events to `.npy` or `.csv`. Without `-o`, runs in zero-allocation **Events-Only Mode**. |
+| **`-e [file]` / `--events=`** | **New (`v2.8`)** | Extracts $2\pi$ SFQ phase-slip events to `.npy` or `.csv` (for `.print`ed junctions when `.print` cards exist, all junctions otherwise, or `.option events=all`). Without `-o`, runs in zero-allocation **Events-Only Mode**. |
 | **`-E [spec]` / `--event-metrics=`** | **New (`v2.8`)** | Selects SFQ pulse metrics: `pulse` (default: `t_peak,v_peak,fwhm,dt_pi`), `all` (`+area`), or comma-separated list including `time=peak` / `time=cross`. |
 | **`-c [N]` / `--corrector=`** | **New (`v2.8`)** | Implicit predictor-corrector JJ iterations per step (default $N=2$ if value omitted). |
 | **`-f` / `--fixed-step`** | **New (`v2.8`)** | Disables automatic global timestep halving on $>0.4\pi$ phase jumps. |
@@ -310,15 +311,21 @@ On the 30k-JJ / 89,922-equation macro deck (`r12p15`, `1,982,000` timesteps, 8-p
 
 ### E. Automated Critical Operating Margin Finder (`-M` / `.margins`) & Golden Event Verifier (`--verify-events`)
 
-Instead of running dozens of separate 1D sweeps or relying on net end-of-simulation $2\pi$ winding counts (which miss intermediate extra+dropped pulse pairs, swapped pulse ordering, or cycle timing violations), **`-M` / `.margins`** packs a shared nominal reference (`Trial 0`) and all target perturbations into a single batched Nodal OpenMP pass (`-p -n` in zero-allocation Events-Only mode) and verifies the exact ordered `(polarity, time)` SFQ event sequence across every Josephson junction in the circuit within $\pm\tau_{\text{tol}}$ (default `50 ps`, with local-shift-aware alignment and finite-horizon $t_{\text{stop}}$ awareness):
+Instead of running dozens of separate 1D sweeps or relying on net end-of-simulation $2\pi$ winding counts (which miss intermediate extra+dropped pulse pairs, swapped pulse ordering, or cycle timing violations), **`-M` / `.margins`** packs a shared nominal reference (`Trial 0`) and all target perturbations into a single batched Nodal OpenMP pass (`-p -n` in automatic zero-allocation Events-Only mode) and supports two pass/fail criteria:
+- **`.assert` Slot-Window Criterion (`criterion = .assert`):** When `.assert` cards (`BITS=`, `COUNT=`, `TIMES=`, `AFTER`) are present in the deck and `-T` / `--margin-tol` is not explicitly set, `-M` evaluates every trial directly against the `.assert` slot windows and checks non-asserted monitored junctions (`--margin-traces=<list_or_glob>` / `.option margintraces=...`) for exact pulse count and no extra/stray pulses. On the 382-JJ, 41 ns `q4_pv0_s1.000.cir` fabric confirm deck (41 trials of `@BIAS:0.5:41`), `-M` completes in **`94.31 s` wall / `1,261.8` core-seconds (`30.8 s` per trial, `72.6 MB` RSS)** on 16 threads and reproduces the exact **`[0.90, 1.20]` (`-10.0%` to `+20.0%`)** slot-timed margin window.
+- **Temporal Event-Sequence Criterion (`tol = +/-<tau>`):** Verifies the exact ordered `(polarity, time)` SFQ event sequence across monitored junctions within $\pm\tau_{\text{tol}}$ (default `50 ps`, or set via `-T <tol>` / `--margin-tol=<tol>`) with root-cause failure diagnosis (`EXTRA_PULSE`, `MISSING_PULSE`, `TIMING_VIOLATION`, `POLARITY_FLIP`).
+- **Target Categories:** Supports `@BIAS`, `@JJ` (scales junction area: $I_c, C_j, G_0, G_n$), **`@JJ_IC` / `@IC`** (scales critical current $I_c$ only while keeping $C_j$ and $R_0/R_n$ fixed), `@IND`, `@RES`, `@CAP`, or `@DEVICES[|X0]`.
 
 ```bash
-# Global category critical margins (@BIAS, @JJ, @IND, @RES)
+# Global category critical margins (@BIAS, @JJ, @JJ_IC, @IND, @RES)
 josim-cli -M test/ex_ksa4bit.cir
 
 # Subcircuit-scoped category or per-device critical margins on DUT cell X0 + CSV export
 josim-cli -M "@DEFAULT|X0" test/ex_mitll_dff_wr.cir
 josim-cli -M "@DEVICES|X0" --margin-file=dff_margins.csv test/ex_mitll_dff_wr.cir
+
+# Slot-timed margin sweep using .assert windows and explicit --margin-traces selection
+josim-cli -p -n -M "@BIAS:0.5:41" --margin-traces="BJ2|XJTL*" --margin-file=q4_margins.csv q4_pv0_s1.000.cir
 
 # Export golden SFQ events and verify against golden reference (.csv or .npy)
 josim-cli -e dff_golden.events.npy test/ex_mitll_dff_wr.cir
@@ -432,7 +439,7 @@ josim-cli -A "B2|X3:COUNT=2" -A "B2|X3:TD=100p PER=20p BITS=100000010000" test/e
      C1 1 0 1p IC=0.5m
      ```
 3. **Topological $\beta_L$ Superconducting Loop Auditor (`.check_loops` / `.option checkloops` / `--check-loops[=<file>]`):**
-   - Automatically discovers all fundamental superconducting loops in the `L + B` graph, reports $L_{\text{loop}}$, $I_{c,\min}$, $\beta_L = \frac{2\pi L_{\text{loop}} I_{c,\min}}{\Phi_0}$, net flux offset $|\Phi_{\text{offset}}|/\Phi_0$, and loop classification (`DEGENERATE_0L`, `SUB_CRITICAL`, `NON_STORAGE`, `STORAGE_QUANT`, `MULTI_FLUX_TRAP`), and populates `LOOP_COUNT`, `LOOP_STORAGE_COUNT`, `LOOP_DEGENERATE_COUNT`, `BETA_L_<JJ>`, `L_LOOP_<JJ>`, and `FLUX_LOOP_<JJ>` for `.meas` verification:
+   - Automatically discovers all fundamental superconducting loops in the `L + B` graph, reports $L_{\text{loop}}$, $I_{c,\min}$, $\beta_L = \frac{2\pi L_{\text{loop}} I_{c,\min}}{\Phi_0}$, net flux offset $|\Phi_{\text{offset}}|/\Phi_0$, and loop classification (`DEGENERATE_0L` [$L_{\text{loop}} \approx 0$], `SUB_CRITICAL` [$\beta_L < 0.05$], `NON_STORAGE` [$\beta_L < 0.5\pi$], `JTL_STAGE` [$0.5\pi \le \beta_L \le 1.5\pi$ non-quantizing JTL propagation loop], `STORAGE_QUANT` [$\beta_L > 1.5\pi$ quantizing storage loop], `MULTI_FLUX_TRAP` [$\beta_L > 3\pi$]), and populates `LOOP_COUNT`, `LOOP_STORAGE_COUNT`, `LOOP_DEGENERATE_COUNT`, `BETA_L_<JJ>`, `L_LOOP_<JJ>`, and `FLUX_LOOP_<JJ>` for `.meas` verification:
      ```spice
      .check_loops
      .meas TRAN beta_squid1 PARAM='BETA_L_B1A' MIN=2.9 MAX=3.14
@@ -552,21 +559,16 @@ JoSIM provides a single-batch OAAT central-difference sensitivity and operating-
    ```spice
    .meas tran T_PROP TRIG P(B01) SFQ=1 TARG P(B02) SFQ=1
    .sens @DEVICES DELTA=0.05 METRIC=T_PROP
+   * Or perturb junction critical current Ic only (keeping Cj and R0/Rn fixed):
+   .sens @JJ_IC DELTA=0.05 METRIC=T_PROP
    ```
-   - Perturbs each target $k \in \{1, \dots, D\}$ by $1 \pm \delta$ around the shared nominal trial $0$, computing relative sensitivity $g_k = \frac{\partial M}{\partial s_k}$, dimensionless normalized sensitivity $S_k = \frac{p_{k,0}}{M_0}\frac{\partial M}{\partial p_k}$, curvature $\frac{\partial^2 M}{\partial s_k^2}$, SFQ switching latency sensitivity $\frac{\partial t_{\text{SFQ}}}{\partial s_k}$, and RSS variance contribution percentage $W_k = g_k^2 / \sum_j g_j^2 \times 100\%$.
+   - Perturbs each target $k \in \{1, \dots, D\}$ (`@DEVICES`, `@BIAS`, `@JJ` [junction area], **`@JJ_IC` / `@IC`** [junction critical current $I_c$ only], `@IND`, `@RES`, `@CAP`, or specific devices/globs) by $1 \pm \delta$ around the shared nominal trial $0$, computing relative sensitivity $g_k = \frac{\partial M}{\partial s_k}$, dimensionless normalized sensitivity $S_k = \frac{p_{k,0}}{M_0}\frac{\partial M}{\partial p_k}$, curvature $\frac{\partial^2 M}{\partial s_k^2}$, SFQ switching latency sensitivity $\frac{\partial t_{\text{SFQ}}}{\partial s_k}$, and RSS variance contribution percentage $W_k = g_k^2 / \sum_j g_j^2 \times 100\%$.
 
 2. **Full Operating-Band & Goal-Newton Margin Centering (`CENTER`, `GOAL=`):**
    ```spice
    .sens @DEVICES DELTA=0.05 CENTER MIN=0.4 MAX=1.8 STEP=0.05
    ```
    - Evaluates both the $\pm \delta$ sensitivity Jacobian and the full pass/fail operating margin bracket $[s_{\min,k}, s_{\max,k}]$ in one batched pass, recommending centered component values $p_{k,\text{center}} = \frac{s_{\min,k} + s_{\max,k}}{2} p_{k,0}$ (or 1-step Newton updates toward `GOAL=<val>`), and exporting `SENS_<TGT>`, `SENS_NORM_<TGT>`, `SENS_WEIGHT_<TGT>`, `CENTER_SCALE_<TGT>`, `CENTER_VAL_<TGT>`, `MARGIN_CRIT_PCT_<TGT>`, and `MARGIN_CENTERED_PCT_<TGT>` into `.param` scope for `.meas`.
-
-
-
-
-
-
-
 
 ---
 
@@ -600,14 +602,14 @@ JoSIM includes a native electrothermal superconducting nanowire / cryotron compo
 JoSIM provides a modular co-simulation architecture (see [`docs/cosimulation.md`](cosimulation.md) for full details and runnable example decks) that couples JoSIM superconducting partitions (RSFQ, AQFP, SQUIDs, `nTron`/`hTron`) with semiconducting Cryo-CMOS / SiGe circuits in **`ngspice-45.2`**, **ADI `LTspice.exe`**, and **Cadence Spectre 25.1**:
 
 1. **In-Memory C & Python Co-Simulation Core (`libjosim_c` / `pyjosim`):** Exposes `josim_cosim_add_port`, `josim_cosim_init`, `josim_cosim_step_to`, `josim_cosim_commit`, `josim_cosim_rollback`, `josim_cosim_run_window`, and `josim_cosim_finalize` with exact KLU driving-point Norton conductance $G_{\text{eq}} = \partial I_p / \partial V_p$ and a two-slot checkpoint ring (`ckpt_committed`, `ckpt_eval`) for automatic Newton–Raphson re-evaluation and SPICE LTE rollback.
-2. **Multiplexed Co-Simulation Daemon & `ngspice` XSPICE Adapter (`josim-cosim-server` & `josim_cosim.cm`):** Multiplexed `poll()`-based UNIX/TCP socket daemon supporting multiple concurrent SPICE/Spectre subcircuit instances (`--max-clients <N>`) and native `ngspice` XSPICE code model (`josim_cosim.cm`).
-3. **Cadence Spectre `CDS_VA_DPI` / DPI-C Adapter (`cosim/spectre/` — `libjosim_spectre_dpi.so` + `josim_cosim_port.va`):** Native Cadence Spectre `CDS_VA_DPI` (`-cds_va_dpi`) and Xcelium AMS (`DPI-C`) adapter (`josim_cosim_port_norton`, `josim_cosim_port_thevenin`, `josim_cosim_port_2p`) supporting standard `dcOp dc` (`skipdc=no`) and adaptive `$abstime` LTE rollbacks.
+2. **Multiplexed Co-Simulation Daemon & `ngspice` XSPICE Adapter (`josim-cosim-server` & `josim_cosim.cm`):** Multiplexed `poll()`-based UNIX/TCP socket daemon supporting multiple concurrent SPICE/Spectre subcircuit instances (`--max-clients <N>`) and native `ngspice` XSPICE code model (`josim_cosim.cm`, with `out_csv`, `events`, and `debug_log` parameters).
+3. **Cadence Spectre `CDS_VA_DPI` / DPI-C Adapter (`cosim/spectre/` — `libjosim_spectre_dpi.so` + `josim_cosim_port.va`):** Native Cadence Spectre `CDS_VA_DPI` (`-cds_va_dpi`) and Xcelium AMS (`DPI-C`) adapter (`josim_cosim_port_norton`, `josim_cosim_port_thevenin`, `josim_cosim_port_2p`, `_3p`, `_4p`, `_6p`, `_8p`, with `out_csv` and `events` parameters) supporting standard `dcOp dc` (`skipdc=no`) and adaptive `$abstime` LTE rollbacks.
 4. **Windowed Branin Wave, Iterative PWL (`LTspice`), Spectre Runner & Unified CLI (`scripts/josim_cosim.py`):** Multi-window causal Branin wave relaxation (`BraninWaveWindowCoordinator`, `run_ltspice_branin_cosim`, `run_ngspice_branin_cosim`), damped Robin/Thevenin PWL relaxation (`run_ltspice_pwl_cosim`), local/remote SSH Spectre runner (`SpectreCosimRunner`), and unified JSON CLI (`python3 scripts/josim_cosim.py --config <spec.json> --output-json <report.json>`).
 
-| Benchmark / Comparison | Simulator(s) | Key Verified Result |
+| Benchmark / Comparison (Fair Like-for-Like) | Simulator(s) | Key Verified Result |
 | :--- | :--- | :--- |
-| **`ngspice-45.2` + `openvaf` (`seeqc_jj3.osdi` vs. `josim_cosim.cm`)** | `ngspice-45.2` (32 MOSFETs + $16\text{–}160$ JJs) | **$3.38\times\text{–}40.75\times$ faster** than monolithic Verilog-A (`seeqc_jj3.osdi`), with zero extra SPICE phase nodes |
-| **Live Cadence Spectre 25.1 (`seeqc_jj3.va` vs. `libjosim_spectre_dpi.so`)** | Cadence Spectre 25.1 on `asic2` (32 MOSFETs + 100 JJs) | **$6.53\times$ faster transient CPU** ($0.0365\text{ s}$ vs. $0.2383\text{ s}$), **$2.68\times$ fewer steps**, converges in `dcOp dc` (`skipdc=no`), immune to Spectre `cmin` $\Phi_0$ corruption |
+| **`ngspice-45.2` + `openvaf` (`seeqc_jj3.osdi` vs. 2-Port `josim_cosim.cm`)** | `ngspice-45.2` (32 MOSFETs + $16\text{–}1000$ JJs & `macro-SPLIT`) | **$4.63\times\text{–}11.49\times$ faster** on $16\text{–}160$ JJs ($0.001\text{–}0.003\text{ ps}$ err); **$9.4\times\text{–}37.5\times$ faster** on 1000 JJs ($6.69\text{ s}$, $0.0003\text{ ps}$ err); **$2.0\times$ faster** on 30-JJ `macro-SPLIT` ($0.0002\text{–}0.0021\text{ ps}$ err, 80/80 events) |
+| **Live Cadence Spectre 25.1 (`seeqc_jj3.va` vs. `libjosim_spectre_dpi.so`)** | Cadence Spectre 25.1 on `asic2` (100 & 1000 JJs + `macro-SPLIT`) | **1000 JJs (`0.1p`):** $10.52\text{ s}$ wall ($7.60\text{ s}$ srv CPU, $16.1\text{ MB}$ RSS, $0.0109\text{ ps}$ err) vs. $23.1\text{–}74.5\text{ s}$ monolithic (**$2.2\times\text{–}7.1\times$ faster**); **`macro-SPLIT` (`0.1p`):** $2.67\text{ s}$ wall ($0.49\text{ s}$ srv CPU, $7.0\text{ MB}$ RSS, $0.0025\text{ ps}$ err, 80/80 events); converges in `dcOp dc` (`skipdc=no`) & immune to `cmin` |
 | **Multi-Instance Multiplexed Cryo-CMOS + `nTron` Transceiver** | `ngspice-45.2` & Cadence Spectre 25.1 (2 JoSIM instances + 2-stage LNA) | `V(nd)` peak = $8.939\text{ mV}$ in both `ngspice` and Spectre; LNA `V(vout)` swing = $83.426\text{ mV}$ (`ngspice`) vs. $83.427\text{ mV}$ (`Spectre 25.1`) |
 | **Multi-Window Branin Coax Transceiver** | `LTspice.exe -b` & `ngspice-45.2` ($N_w = 4, 6$) | 4-window in-proc vs. 6-window UNIX diff = $0.0$; `LTspice` vs. `ngspice` NRMSE = $5 \times 10^{-6}$ |
 

@@ -74,14 +74,26 @@ def find_cosim_server_binary(explicit_path: Optional[Union[str, Path]] = None) -
     if env_bin and Path(env_bin).exists():
         return str(Path(env_bin).resolve())
     repo_root = Path(__file__).resolve().parent.parent
-    candidates = [
-        Path("/tmp/josim-build/josim-cosim-server"),
+    candidates: List[Path] = []
+    env_build = os.environ.get("JOSIM_BUILD_DIR")
+    if env_build:
+        bdir = Path(env_build)
+        candidates.extend([
+            bdir / "josim-cosim-server",
+            bdir / "josim-cosim-server.exe",
+            bdir / "Release" / "josim-cosim-server.exe",
+        ])
+    candidates.extend([
         repo_root / "build" / "josim-cosim-server",
         repo_root / "build" / "Release" / "josim-cosim-server.exe",
-    ]
+        Path(os.environ.get("TMPDIR", "/tmp")) / "josim-build" / "josim-cosim-server",
+    ])
     for c in candidates:
         if c.exists():
             return str(c.resolve())
+    which_srv = shutil.which("josim-cosim-server")
+    if which_srv:
+        return which_srv
     raise FileNotFoundError("Could not locate `josim-cosim-server` binary.")
 
 
@@ -92,10 +104,14 @@ def find_xspice_cm_binary(explicit_path: Optional[Union[str, Path]] = None) -> s
     if env_cm and Path(env_cm).exists():
         return str(Path(env_cm).resolve())
     repo_root = Path(__file__).resolve().parent.parent
-    candidates = [
-        Path("/tmp/josim-build/josim_cosim.cm"),
+    candidates: List[Path] = []
+    env_build = os.environ.get("JOSIM_BUILD_DIR")
+    if env_build:
+        candidates.append(Path(env_build) / "josim_cosim.cm")
+    candidates.extend([
         repo_root / "build" / "josim_cosim.cm",
-    ]
+        Path(os.environ.get("TMPDIR", "/tmp")) / "josim-build" / "josim_cosim.cm",
+    ])
     for c in candidates:
         if c.exists():
             return str(c.resolve())
@@ -448,15 +464,19 @@ def read_josim_events_csv(csv_path: Union[str, Path]) -> List[Dict[str, Union[st
     return out
 
 
-def read_josim_meta(csv_path: Union[str, Path]) -> Dict[str, int]:
+def read_josim_meta(csv_path: Union[str, Path]) -> Dict[str, Union[int, float]]:
     p = Path(str(csv_path) + ".meta.txt")
     if not p.exists():
         return {}
-    meta: Dict[str, int] = {}
+    meta: Dict[str, Union[int, float]] = {}
     for line in p.read_text().splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
-            meta[k.strip()] = int(v.strip())
+            vs = v.strip()
+            try:
+                meta[k.strip()] = int(vs)
+            except ValueError:
+                meta[k.strip()] = float(vs)
     return meta
 
 
@@ -509,14 +529,24 @@ def run_ngspice_deck(
         wr_file = tmp_dir / "ng_out.txt"
         vecs_str = " ".join(wrdata_vecs)
 
-        # Inject .control block with pre_codemodel before .end
+        # ngspice lowercases tokens inside .control blocks and does not strip double quotes.
+        # Create a lowercase relative symlink ./josim_cosim.cm inside tmp_dir (cwd) so paths
+        # containing uppercase characters (e.g. /mnt/c/dev/JoSIM/...) always load cleanly.
+        cm_local = tmp_dir / "josim_cosim.cm"
+        try:
+            cm_local.symlink_to(Path(cm_bin).resolve())
+            cm_ctrl_path = "./josim_cosim.cm"
+        except OSError:
+            shutil.copy2(cm_bin, cm_local)
+            cm_ctrl_path = "./josim_cosim.cm"
+
         lines = [ln for ln in spice_deck.splitlines() if ln.strip().lower() != ".end"]
         control_block = [
             ".control",
-            f"pre_codemodel {cm_bin}",
+            f"pre_codemodel {cm_ctrl_path}",
             "set wr_singlescale",
             tran_cmd,
-            f"wrdata {wr_file.as_posix()} {vecs_str}",
+            f"wrdata ng_out.txt {vecs_str}",
             "quit",
             ".endc",
             ".end",
@@ -634,14 +664,28 @@ def parse_ltspice_raw(raw_path: Union[str, Path]) -> Tuple[np.ndarray, Dict[str,
     return time_vec, traces
 
 
+def _default_win_visible_tmp_dir(work_dir: Optional[Union[str, Path]] = None) -> Path:
+    if work_dir:
+        return Path(work_dir)
+    env_tmp = os.environ.get("LTSPICE_TMP_DIR")
+    if env_tmp and Path(env_tmp).is_dir():
+        return Path(env_tmp)
+    for cand in [
+        Path("/mnt/c/Users/super/AppData/Local/Temp"),
+        Path("/mnt/c/Windows/Temp"),
+    ]:
+        if cand.is_dir():
+            return cand
+    return Path(tempfile.gettempdir())
+
+
 def run_ltspice_batch(netlist_str: str, work_dir: Optional[Union[str, Path]] = None) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
     Run ADI `LTspice.exe -b` on `netlist_str` (ensuring `.options numdgt=7` is present)
     and return `(time_vec, traces_dict)`.
     """
     lt_bin = find_ltspice_binary()
-    # Place temp files under /mnt/c/dev/JoSIM/build or user-provided Windows-visible path
-    base_tmp = Path(work_dir) if work_dir else Path("/mnt/c/dev/JoSIM")
+    base_tmp = _default_win_visible_tmp_dir(work_dir)
     with tempfile.TemporaryDirectory(prefix=".ltspice_tmp_", dir=str(base_tmp)) as tmpd:
         tmp_path = Path(tmpd)
         lines = [ln for ln in netlist_str.splitlines() if ln.strip().lower() != ".end"]
@@ -920,7 +964,7 @@ class BraninWaveWindowCoordinator:
             n_windows = max(1, int(np.ceil(self.t_stop / self.window_size - 1e-9)))
             final_spice_traces: Dict[str, np.ndarray] = {}
 
-            base_tmp = Path(self.work_dir) if self.work_dir else Path("/mnt/c/dev/JoSIM")
+            base_tmp = _default_win_visible_tmp_dir(self.work_dir) if self.simulator == "ltspice" else (Path(self.work_dir) if self.work_dir else Path(tempfile.gettempdir()))
             with tempfile.TemporaryDirectory(prefix=".branin_win_", dir=str(base_tmp)) as tmpd:
                 tmp_path = Path(tmpd)
 
@@ -1142,7 +1186,7 @@ def run_ltspice_pwl_cosim(
     max_delta = 0.0
     iters_done = 0
 
-    base_tmp = Path(work_dir) if work_dir else Path("/mnt/c/dev/JoSIM")
+    base_tmp = _default_win_visible_tmp_dir(work_dir)
     with tempfile.TemporaryDirectory(prefix=".ltspice_pwl_", dir=str(base_tmp)) as tmpd:
         tmp_path = Path(tmpd)
         for it in range(1, max_iters + 1):

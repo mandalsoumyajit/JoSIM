@@ -287,6 +287,8 @@ class Input {
     bool                                                         argExplicitNodal = false;
     double                                                       argMarginTol    = 50e-12;
     std::optional<std::string>                                   marginFile;
+    std::vector<std::string>                                     marginTraces;
+    std::vector<std::string>                                     cliMarginTraces;
     std::optional<std::string>                                   verifyEventsFile;
     std::vector<MarginSpec>                                      marginSpecs;
     std::vector<MarginTarget>                                    marginTargets;
@@ -344,6 +346,7 @@ class Input {
         cliMarginSpecs             = cli_options.margin_specs;
         if (cli_options.margin_tol.has_value()) { argMarginTol = cli_options.margin_tol.value(); }
         marginFile                 = cli_options.margin_file;
+        cliMarginTraces            = cli_options.margin_traces;
         verifyEventsFile           = cli_options.verify_events_file;
         cliAssertions              = cli_options.assertions;
         cliMeasurements            = cli_options.measurements;

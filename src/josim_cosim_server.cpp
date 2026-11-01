@@ -6,6 +6,7 @@
 #include "JoSIM/josim_c_api.h"
 #include "JoSIM/josim_cosim_ipc.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -69,45 +70,88 @@ int send_error(int fd, const char* msg) {
     return send_response(fd, -1, s.data(), static_cast<uint64_t>(s.size()));
 }
 
-void write_finalized_csv(josim_session_t* sess, const std::string& csvPath) {
-    if (csvPath.empty() || !sess) { return; }
-    const int64_t nTr = josim_num_traces(sess);
-    const int64_t nSt = josim_num_steps(sess);
-    if (nTr > 0 && nSt > 0) {
-        std::ofstream out(csvPath);
-        if (out.is_open()) {
-            std::vector<const double*> ptrs(static_cast<size_t>(nTr), nullptr);
-            for (int64_t c = 0; c < nTr; ++c) {
-                if (c > 0) { out << ","; }
-                const char* nm = josim_trace_name(sess, c);
-                out << (nm ? nm : "");
-                ptrs[static_cast<size_t>(c)] = josim_trace_data(sess, c);
-            }
-            out << "\n";
-            out << std::scientific << std::setprecision(10);
-            for (int64_t r = 0; r < nSt; ++r) {
+void write_finalized_csv(josim_session_t* sess, const std::string& csvSpec) {
+    if (csvSpec.empty() || !sess) { return; }
+    std::string outCsv = csvSpec;
+    std::string evCsv;
+    const size_t barPos = csvSpec.find('|');
+    if (barPos != std::string::npos) {
+        outCsv = csvSpec.substr(0, barPos);
+        evCsv  = csvSpec.substr(barPos + 1);
+    }
+
+    if (!outCsv.empty()) {
+        const int64_t nTr = josim_num_traces(sess);
+        const int64_t nSt = josim_num_steps(sess);
+        if (nTr > 0 && nSt > 0) {
+            std::ofstream out(outCsv);
+            if (out.is_open()) {
+                std::vector<const double*> ptrs(static_cast<size_t>(nTr), nullptr);
                 for (int64_t c = 0; c < nTr; ++c) {
                     if (c > 0) { out << ","; }
-                    const double* p = ptrs[static_cast<size_t>(c)];
-                    out << (p ? p[r] : 0.0);
+                    const char* nm = josim_trace_name(sess, c);
+                    out << (nm ? nm : "");
+                    ptrs[static_cast<size_t>(c)] = josim_trace_data(sess, c);
                 }
                 out << "\n";
+                out << std::scientific << std::setprecision(10);
+                for (int64_t r = 0; r < nSt; ++r) {
+                    for (int64_t c = 0; c < nTr; ++c) {
+                        if (c > 0) { out << ","; }
+                        const double* p = ptrs[static_cast<size_t>(c)];
+                        out << (p ? p[r] : 0.0);
+                    }
+                    out << "\n";
+                }
             }
+        }
+
+        const int64_t            nEv = josim_num_events(sess);
+        const josim_sfq_event_t* evs = josim_events_data(sess);
+        std::ofstream            evOut(outCsv + ".events.csv");
+        if (evOut.is_open()) {
+            evOut << "trace,time,t_peak,v_peak,fwhm,dt_pi,area,phase,polarity,winding,trace_id,trial\n";
+            evOut << std::scientific << std::setprecision(12);
+            for (int64_t i = 0; i < nEv; ++i) {
+                const auto& e  = evs[i];
+                const char* tn = josim_event_trace_name(sess, e.trace_id);
+                evOut << (tn ? tn : "") << "," << e.time << "," << e.t_peak << "," << e.v_peak << "," << e.fwhm << ","
+                      << e.dt_pi << "," << e.area << "," << e.phase << "," << e.polarity << "," << e.winding << ","
+                      << e.trace_id << "," << e.trial << "\n";
+            }
+        }
+
+        int64_t calls = 0, rollbacks = 0, substeps = 0;
+        double  ckptSec = 0.0;
+        josim_cosim_stats(sess, &calls, &rollbacks, &substeps, &ckptSec);
+        std::ofstream metaOut(outCsv + ".meta.txt");
+        if (metaOut.is_open()) {
+            metaOut << "rollback_count=" << rollbacks << "\n"
+                    << "calls=" << calls << "\n"
+                    << "rollbacks=" << rollbacks << "\n"
+                    << "substeps=" << substeps << "\n"
+                    << std::fixed << std::setprecision(6) << "ckpt_time_s=" << ckptSec << "\n";
         }
     }
 
-    const int64_t            nEv = josim_num_events(sess);
-    const josim_sfq_event_t* evs = josim_events_data(sess);
-    std::ofstream            evOut(csvPath + ".events.csv");
-    if (evOut.is_open()) {
-        evOut << "trace,time,t_peak,v_peak,fwhm,dt_pi,area,phase,polarity,winding,trace_id,trial\n";
-        evOut << std::scientific << std::setprecision(12);
-        for (int64_t i = 0; i < nEv; ++i) {
-            const auto& e  = evs[i];
-            const char* tn = josim_event_trace_name(sess, e.trace_id);
-            evOut << (tn ? tn : "") << "," << e.time << "," << e.t_peak << "," << e.v_peak << "," << e.fwhm << ","
-                  << e.dt_pi << "," << e.area << "," << e.phase << "," << e.polarity << "," << e.winding << ","
-                  << e.trace_id << "," << e.trial << "\n";
+    if (!evCsv.empty()) {
+        const int64_t            nEv = josim_num_events(sess);
+        const josim_sfq_event_t* evs = josim_events_data(sess);
+        std::vector<size_t>      order(static_cast<size_t>(nEv));
+        for (size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return evs[a].time < evs[b].time; });
+
+        std::ofstream evOut(evCsv);
+        if (evOut.is_open()) {
+            evOut << "trial,trace,time,polarity,winding,t_peak,v_peak,fwhm,dt_pi,area,phase\n";
+            evOut << std::scientific << std::setprecision(12);
+            for (size_t idx : order) {
+                const auto& e  = evs[idx];
+                const char* tn = josim_event_trace_name(sess, e.trace_id);
+                evOut << e.trial << "," << (tn ? tn : "") << "," << e.time << "," << e.polarity << "," << e.winding
+                      << "," << e.t_peak << "," << e.v_peak << "," << e.fwhm << "," << e.dt_pi << "," << e.area << ","
+                      << e.phase << "\n";
+            }
         }
     }
 }
@@ -313,6 +357,12 @@ bool handle_client_request(ClientContext& ctx, const std::string& defaultNetlist
             send_error(clientFd, josim_session_last_error(sess));
             return true;
         }
+        int64_t calls = 0, rollbacks = 0, substeps = 0;
+        double  ckptSec = 0.0;
+        josim_cosim_stats(sess, &calls, &rollbacks, &substeps, &ckptSec);
+        std::cout << "[josim-cosim-server] calls=" << calls << " rollbacks=" << rollbacks
+                  << " substeps=" << substeps << " ckpt_time_s=" << std::fixed << std::setprecision(6) << ckptSec
+                  << std::endl;
         if (!csvPath.empty()) {
             write_finalized_csv(sess, csvPath);
         }

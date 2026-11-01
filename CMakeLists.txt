@@ -180,7 +180,18 @@ target_add_warnings(josim_spectre_dpi)
 # Optional ngspice XSPICE Co-Simulation Code Model (josim_cosim.cm)
 # -----------------------------------------------------------------
 
-set(NGSPICE_SRC_DIR "/home/supertjhok/ngspice-45.2" CACHE PATH "Path to ngspice source tree for XSPICE code model build")
+set(_DEFAULT_NGSPICE_SRC_DIR "$ENV{NGSPICE_SRC_DIR}")
+if(NOT _DEFAULT_NGSPICE_SRC_DIR)
+  foreach(_CAND
+    "$ENV{HOME}/local/src/ngspice-45.2"
+    "$ENV{HOME}/ngspice-45.2")
+    if(EXISTS "${_CAND}/src/include/ngspice/cm.h")
+      set(_DEFAULT_NGSPICE_SRC_DIR "${_CAND}")
+      break()
+    endif()
+  endforeach()
+endif()
+set(NGSPICE_SRC_DIR "${_DEFAULT_NGSPICE_SRC_DIR}" CACHE PATH "Path to ngspice source tree for XSPICE code model build")
 if(EXISTS "${NGSPICE_SRC_DIR}/src/include/ngspice/cm.h")
   enable_language(C)
   add_library(

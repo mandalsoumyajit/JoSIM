@@ -136,6 +136,8 @@ A_ntron [%gd(nd 0)] josim_ntron_mod
 + phase_mode=1
 + server_addr=""
 + out_csv="ntron_traces.csv"
++ events="ntron_events.csv"
++ debug_log=""
 + )
 
 * 2-Port JoSIM subcircuit (Port 1 = sfq_set, Port 2 = sfq_ro)
@@ -155,13 +157,24 @@ tran 0.2p 60p
 .endc
 ```
 
+> **Note on `ngspice` `.control` Path Lowercasing:** `ngspice`'s deck reader lowercases unquoted lines inside `.control ... .endc` blocks and does not strip double quotes around path arguments to `pre_codemodel`, `pre_osdi`, or `wrdata`. Always place or symlink `josim_cosim.cm`, `.osdi` files, and `.dat` outputs under an **all-lowercase directory path** (e.g., `/tmp/josim-build/josim_cosim.cm` or `~/local/src/josim/build/josim_cosim.cm`) when loading them from `.control`. Inside `.model ... josim_cosim(...)`, double-quoted strings (`netlist="..."`, `out_csv="..."`, `events="..."`, `debug_log="..."`) preserve case.
+
 ---
 
 ## 4. Cadence Spectre `CDS_VA_DPI` / DPI-C Adapter (`cosim/spectre/`)
 
 ### 4.1 Using `libjosim_spectre_dpi.so` + `josim_cosim_port.va` in Cadence Spectre
 
-[`cosim/spectre/josim_cosim_port.va`](../cosim/spectre/josim_cosim_port.va) provides three ready-to-use Verilog-A modules (`josim_cosim_port_norton`, `josim_cosim_port_thevenin`, and `josim_cosim_port_2p`) that import [`libjosim_spectre_dpi.so`](../cosim/spectre/josim_cosim_dpi.c) via Cadence Spectre's native `CDS_VA_DPI` interface (or standard `DPI-C` under Xcelium AMS when `` `ifdef INCA `` is defined):
+[`cosim/spectre/josim_cosim_port.va`](../cosim/spectre/josim_cosim_port.va) provides seven ready-to-use Verilog-A modules that import [`libjosim_spectre_dpi.so`](../cosim/spectre/josim_cosim_dpi.c) via Cadence Spectre's native `CDS_VA_DPI` interface (or standard `DPI-C` under Xcelium AMS when `` `ifdef INCA `` is defined):
+
+- **1-Port Modules:** `josim_cosim_port_norton (p, n)` ($V \to I$ Norton companion) and `josim_cosim_port_thevenin (p, n)` ($I \to V$ Thevenin companion). Both cache `(handle, $abstime, V/I)` in `libjosim_spectre_dpi.so` so `josim_dpi_eval_ihist` and `josim_dpi_eval_geq` share a single JoSIM evaluation per Spectre call.
+- **Multi-Port Modules ($N = 2, 3, 4, 6, 8$):**
+  - `josim_cosim_port_2p (p1, n1, p2, n2)`
+  - `josim_cosim_port_3p (p1, n1, p2, n2, p3, n3)`
+  - `josim_cosim_port_4p (p1, n1, p2, n2, p3, n3, p4, n4)`
+  - `josim_cosim_port_6p (p1, n1, ..., p6, n6)`
+  - `josim_cosim_port_8p (p1, n1, ..., p8, n8)`
+- **JoSIM-Side Waveform & Event Observability (`out_csv` & `events`):** Every module accepts optional parameters `out_csv="<path.csv>"` and `events="<events.csv>"` (forwarded via `josim_dpi_set_output(h, out_csv, events)` / `JOSIM_IPC_CMD_SET_OUTPUT` to `josim-cosim-server` or in-process `libjosim_c.so`), writing all `.print` traces and $2\pi$ SFQ switching events of the internal JoSIM subcircuit upon `@(final_step)`.
 
 ```spectre
 // Example Cadence Spectre (.scs) Hybrid Cryo-CMOS + JoSIM Co-Simulation Deck
@@ -176,8 +189,10 @@ opts options temp=4.2 tnom=4.2 gmin=1e-12
 // Partition 1: 1-Port JoSIM SFQ Transmitter
 X_sfq_tx (n2 0) josim_cosim_port_norton netlist="sfq_tx.cir" port_nodes="n2" port_modes="0"
 
-// Partition 2: 2-Port JoSIM SFQ Receiver + Electrothermal nTron Driver
-X_ntron_rx (n3 0 nd 0) josim_cosim_port_2p netlist="ntron_rx_2p.cir" port_nodes="n3,nch" port_modes="0,0"
+// Partition 2: 3-Port JoSIM SFQ Splitter Macro with Internal Waveform & Event Output
+X_split (min_a 0 mout_q0 0 mout_q1 0) josim_cosim_port_3p \
+    netlist="split_core.cir" port_nodes="min_a,mout_q0,mout_q1" port_modes="0,0,0" \
+    out_csv="split_macro_traces.csv" events="split_macro_events.csv"
 
 // Standard Spectre DC Operating Point (skipdc=no) + Transient Analysis
 dcOp dc
@@ -206,14 +221,20 @@ tran1 tran stop=60p step=0.2p maxstep=0.2p errpreset=conservative
   print(res.ok, res.dc_ok, res.accepted_steps, res.tran_cpu_s)
   ```
 
-### 4.3 Why Partitioned JoSIM Co-Simulation Outperforms Monolithic Verilog-A (`seeqc_jj3.va`)
+### 4.3 Fair Like-for-Like Performance & Accuracy vs. Monolithic Verilog-A (`seeqc_jj3.va`)
 
-| Metric / Capability | Monolithic Verilog-A (`seeqc_jj3.va` in Spectre / `ngspice`) | Partitioned JoSIM Co-Simulation (`libjosim_spectre_dpi.so` / `josim_cosim.cm`) |
+All benchmarks below use identical junction parameters (`ic=100u, cap=50f, rqp=4.0`), return the far-end node(s) (`jtl_N` or `mout_q0, mout_q1`) to SPICE/Spectre via 2-port/3-port co-simulation modules, run until all SFQ pulses reach the far end, and compare timing accuracy against monolithic JoSIM at `0.025 ps`:
+
+| Benchmark / Capability | Monolithic Verilog-A (`seeqc_jj3.va` / `.osdi`) | Partitioned JoSIM Co-Simulation (`libjosim_spectre_dpi.so` / `josim_cosim.cm`) |
 | :--- | :--- | :--- |
-| **`ngspice-45.2` + `openvaf` Speedup ($16\text{–}160$ JJs + 32 MOSFETs)** | $1.00\times$ baseline ($0.068\text{–}4.36\text{ s}$) | **$3.38\times\text{–}40.75\times$ faster** ($0.020\text{–}0.107\text{ s}$) |
-| **Live Cadence Spectre 25.1 Speedup (100 JJs + 32 MOSFETs, $150\text{ ps}$)** | $0.2383\text{ s}$ transient CPU, 2,072 steps | **$6.53\times$ faster** ($0.0365\text{ s}$ CPU), **772 steps ($2.68\times$ fewer)** |
+| **`ngspice-45.2` + `openvaf`: 16–160 JJs + 32 MOSFETs (`0.1 ps` step)** | $0.119\text{–}2.289\text{ s}$ wall ($0.014\text{–}0.066\text{ ps}$ arrival error) | **$4.63\times\text{–}11.49\times$ faster** ($0.026\text{–}0.199\text{ s}$ wall, **$0.001\text{–}0.003\text{ ps}$ error**) |
+| **`ngspice-45.2` + `openvaf`: 1000 JJs + 32 MOSFETs ($1.8\text{ ns}$)** | $63.0\text{ s}$ (`0.1p`, $0.37\text{ ps}$ err) / $251.0\text{ s}$ (`0.025p`, $0.029\text{ ps}$ err) | **$6.69\text{ s}$ wall (`0.1p`) — $9.4\times\text{–}37.5\times$ faster**, **$0.0003\text{ ps}$ arrival error** |
+| **`ngspice-45.2` + `openvaf`: 30-JJ `macro-SPLIT` PTL Macro ($1.05\text{ ns}$, 80 events)** | $43.0\text{ s}$ (`0.05p`, $0.0006\text{ ps}$ err) / $66.0\text{ s}$ (`0.025p`, $0.0003\text{ ps}$ err) | **$21.93\text{ s}$ wall (`0.1p`, $0.0021\text{ ps}$ err, 80/80 events)** / **$33.09\text{ s}$ (`0.025p`, $0.0002\text{ ps}$ err)** |
+| **Cadence Spectre 25.1 (`asic2`): 100 JJs + 32 MOSFETs ($260\text{ ps}$)** | `0.1p`: $0.336\text{ s}$ `tran` ($1.90\text{ s}$ wall, $0.0595\text{ ps}$ err)<br>`0.025p`: $1.15\text{ s}$ `tran` ($2.95\text{ s}$ wall, $0.0005\text{ ps}$ err) | `0.1p`: $0.224\text{ s}$ `tran` ($2.38\text{ s}$ wall, $0.13\text{ s}$ srv CPU, $7.5\text{ MB}$ RSS, **$0.0113\text{ ps}$ err**)<br>`0.5p`: $0.305\text{ s}$ `tran` ($2.50\text{ s}$ wall, $0.23\text{ s}$ srv CPU, **$0.0364\text{ ps}$ err**) |
+| **Cadence Spectre 25.1 (`asic2`): 1000 JJs + 32 MOSFETs ($1.8\text{ ns}$)** | `0.1p`: $21.1\text{ s}$ `tran` ($23.1\text{ s}$ wall, $0.630\text{ ps}$ err)<br>`0.025p`: $72.2\text{ s}$ `tran` ($74.5\text{ s}$ wall, $0.0024\text{ ps}$ err) | `0.1p`: **$8.48\text{ s}$ `tran` / $10.52\text{ s}$ wall ($2.2\times\text{–}7.1\times$ faster)**, $7.60\text{ s}$ srv CPU, **$16.1\text{ MB}$ RSS**, **$0.0109\text{ ps}$ err** |
+| **Cadence Spectre 25.1 (`asic2`): 30-JJ `macro-SPLIT` PTL Macro ($1.05\text{ ns}$, 80 events)** | `0.05p`: $3.4\text{ s}$ `tran` ($0.015\text{ ps}$ err, 80/80)<br>`0.025p`: $6.4\text{ s}$ `tran` ($0.0061\text{ ps}$ err, 80/80) | `0.1p`: **$2.67\text{ s}$ wall ($0.49\text{ s}$ srv CPU, $7.0\text{ MB}$ RSS, $0.0025\text{ ps}$ err, 80/80)**<br>`0.025p`: $7.15\text{ s}$ wall ($1.12\text{ s}$ srv CPU, **$0.0001\text{ ps}$ err, 80/80**) |
 | **Spectre `dcOp dc` Convergence (`skipdc=no`)** | **Fails** (`skipdc=yes` required due to floating phase capacitor `ph`) | **Converges in 2 NR iterations** via JoSIM's $t=0$ Norton companion |
-| **Spectre `cmin` Option Immunity** | Setting `cmin=0.1f` adds $0.1\text{ fF}$ in parallel with `PHI0_2PI = 0.3291 fF`, **corrupting $\Phi_0$ by $+30.4\%$** | **100% immune** (Josephson phase is internal to JoSIM) |
+| **Spectre `cmin` Option Immunity** | Setting `cmin=0.1f` adds $0.1\text{ fF}$ in parallel with `PHI0_2PI = 0.3291 fF`, **corrupting $\Phi_0$ by $+30.4\%$** ($20.8\text{ ps}$ late over $184\text{ ps}$) | **100% immune** (Josephson phase is internal to JoSIM) |
 | **Device Physics** | Linear `rtype=0` resistor only; no `nTron`/`hTron`, no thermal noise | Full `rtype=1` nonlinear subgap/gap $I\text{–}V$, thermal noise, lossy PTLs, and electrothermal `nTron`/`hTron` |
 
 ---

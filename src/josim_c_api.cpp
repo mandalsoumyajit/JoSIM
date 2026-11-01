@@ -20,6 +20,7 @@
 #include "JoSIM/Transient.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -45,9 +46,26 @@ struct CosimPortEntry {
     double      phiCommitted0 = 0.0;
     double      phiCommitted1 = 0.0;
     double      phiCommitted2 = 0.0;
+    double      phiFloor0     = 0.0;
+    double      phiFloor1     = 0.0;
+    double      phiFloor2     = 0.0;
     double      phiEval0      = 0.0;
     double      phiEval1      = 0.0;
     double      phiEval2      = 0.0;
+};
+
+struct CosimPhaseTracker {
+    std::string            name;
+    std::optional<int64_t> i1;
+    std::optional<int64_t> i2;
+    std::optional<int64_t> vi;
+    int64_t                idx1       = -1;
+    int64_t                idx2       = -1;
+    int64_t                idxVi      = -1;
+    bool                   isJJ       = false;
+    bool                   useVi      = false;
+    uint32_t               metricMask = 0u;
+    InLoopEventTracker     tracker;
 };
 
 struct josim_session {
@@ -67,18 +85,56 @@ struct josim_session {
     std::vector<CosimPortEntry>                                             cosimPorts;
     std::unique_ptr<Simulation>                                             cosimSim;
     RollingCheckpoint                                                       ckptCommitted;
+    RollingCheckpoint                                                       ckptFloor;
     RollingCheckpoint                                                       ckptEval;
-    int64_t                                                                 committedStep = 0;
-    double                                                                  committedTime = 0.0;
-    int64_t                                                                 evalStep      = 0;
-    double                                                                  evalTime      = 0.0;
-    bool                                                                    hasEvalState  = false;
-    int64_t                                                                 rollbackCount = 0;
+    RollingCheckpoint                                                       ckptOneStep;
+    int64_t                                                                 committedStep    = 0;
+    double                                                                  committedTime    = 0.0;
+    double                                                                  acceptedTime     = 0.0;
+    int64_t                                                                 evalFloorStep    = 0;
+    int64_t                                                                 evalStep         = 0;
+    double                                                                  evalTime         = 0.0;
+    bool                                                                    hasEvalState     = false;
+    bool                                                                    simAtEvalStep    = false;
+    int64_t                                                                 oneStepValidStep = -1;
+    int64_t                                                                 rollbackCount    = 0;
+    int64_t                                                                 callCount        = 0;
+    int64_t                                                                 substepCount     = 0;
+    double                                                                  ckptTimeSec      = 0.0;
+    int64_t                                                                 cachedStepJacM       = 0;
+    double                                                                  cachedStepJacTime    = -1.0;
+    double                                                                  cachedStepJacTau     = -1.0;
+    double                                                                  cachedStepJacDtRatio = -1.0;
+    std::vector<uint8_t>                                                    portStepJacDirty;
     std::vector<double>                                                     committedInputs;
     std::vector<double>                                                     committedOutputs;
+    std::vector<double>                                                     committedHistDelta;
+    std::vector<double>                                                     acceptedInputs;
+    std::vector<double>                                                     evalFloorInputs;
+    std::vector<double>                                                     evalFloorOutputs;
+    std::vector<double>                                                     evalFloorHistDelta;
+    std::vector<double>                                                     prevSubstepInputs;
+    std::vector<double>                                                     prevSubstepOutputs;
+    std::vector<double>                                                     prevSubstepHistDelta;
     std::vector<double>                                                     evalInputs;
     std::vector<double>                                                     evalOutputs;
+    std::vector<double>                                                     lastInterpOutputs;
+    std::vector<double>                                                     oneStepRefInputs;
+    std::vector<double>                                                     oneStepRawOutputs;
+    std::vector<double>                                                     oneStepPhi0;
+    std::vector<double>                                                     oneStepPhi1;
+    std::vector<double>                                                     oneStepPhi2;
+    std::vector<int64_t>                                                    oneStepPendingSteps;
+    std::vector<double>                                                     oneStepPendingTimes;
+    std::vector<double>                                                     oneStepPendingRelVals;
+    std::vector<double>                                                     oneStepPendingPhases;
     std::vector<double>                                                     evalJacobian;
+    std::vector<double>                                                     cachedStepJacobian;
+    std::vector<CosimPhaseTracker>                                          cosimPhaseTrackers;
+    std::vector<int64_t>                                                    pendingSteps;
+    std::vector<double>                                                     pendingTimes;
+    std::vector<double>                                                     pendingRelVals;
+    std::vector<double>                                                     pendingPhases;
     std::vector<double>                                                     windowTimePts;
     std::vector<double>                                                     windowPortOutFlat;
 
@@ -112,6 +168,31 @@ std::string unquote(std::string s) {
 void extract_session_events(josim_session* s, const Input& iObj, const Matrix& mObj, const Simulation& sObj) {
     s->events.clear();
     s->eventTraceNames.clear();
+
+    if (!s->cosimPhaseTrackers.empty()) {
+        for (size_t tIdx = 0; tIdx < s->cosimPhaseTrackers.size(); ++tIdx) {
+            auto&         pt      = s->cosimPhaseTrackers[tIdx];
+            const int32_t traceId = static_cast<int32_t>(s->eventTraceNames.size());
+            s->eventTraceNames.push_back(pt.name);
+            pt.tracker.finalize(pt.metricMask);
+            for (const auto& ev : pt.tracker.events) {
+                josim_sfq_event_t cev{};
+                cev.time     = ev.time;
+                cev.t_peak   = ev.tPeak;
+                cev.v_peak   = ev.vPeak;
+                cev.fwhm     = ev.fwhm;
+                cev.dt_pi    = ev.dtPi;
+                cev.area     = ev.area;
+                cev.phase    = ev.phase;
+                cev.polarity = ev.polarity;
+                cev.winding  = ev.winding;
+                cev.trace_id = traceId;
+                cev.trial    = 0;
+                s->events.push_back(cev);
+            }
+        }
+        return;
+    }
 
     const int64_t B = std::max<int64_t>(1, sObj.results.mcRuns);
     if (sObj.eventsOnly_ && !sObj.mcEventTrackers_.empty()) {
@@ -167,11 +248,13 @@ void extract_session_events(josim_session* s, const Input& iObj, const Matrix& m
             targets.push_back({nm, tr.index1, tr.index2, tr.variableIndex, isJJ});
         }
     }
-    for (const auto& jIdx : mObj.components.junctionIndices) {
-        const auto& jj = std::get<JJ>(mObj.components.devices.at(static_cast<size_t>(jIdx)));
-        std::string nm = "P(" + jj.netlistInfo.label_ + ")";
-        if (seen.insert(nm).second) {
-            targets.push_back({nm, jj.indexInfo.posIndex_, jj.indexInfo.negIndex_, jj.variableIndex_, true});
+    if (targets.empty()) {
+        for (const auto& jIdx : mObj.components.junctionIndices) {
+            const auto& jj = std::get<JJ>(mObj.components.devices.at(static_cast<size_t>(jIdx)));
+            std::string nm = "P(" + jj.netlistInfo.label_ + ")";
+            if (seen.insert(nm).second) {
+                targets.push_back({nm, jj.indexInfo.posIndex_, jj.indexInfo.negIndex_, jj.variableIndex_, true});
+            }
         }
     }
 
@@ -432,8 +515,15 @@ JOSIM_API int josim_run(josim_session_t* s) {
         s->activeMatrix.create_matrix(s->activeInput);
         find_relevant_traces(s->activeInput, s->activeMatrix);
 
-        // Ensure junction indices are recorded so SFQ events are always available in memory
-        if (!s->activeInput.argEventsOnly && !s->activeMatrix.relevantTraces.empty()) {
+        // Ensure junction indices are recorded when no phase traces were explicitly requested in .print
+        bool hasPhaseTrace = false;
+        for (const auto& rt : s->activeMatrix.relevantTraces) {
+            if (rt.storageType == StorageType::Phase) {
+                hasPhaseTrace = true;
+                break;
+            }
+        }
+        if (!s->activeInput.argEventsOnly && !s->activeMatrix.relevantTraces.empty() && !hasPhaseTrace) {
             for (const auto& jIdx : s->activeMatrix.components.junctionIndices) {
                 const auto& jj = std::get<JJ>(s->activeMatrix.components.devices.at(static_cast<size_t>(jIdx)));
                 if (jj.indexInfo.posIndex_.has_value()) {
@@ -686,14 +776,26 @@ double read_port_node_diff(const Simulation& sim, const CosimPortEntry& pe) {
 }
 
 double compute_port_output(
-    const Simulation& sim, const CosimPortEntry& pe, double u, double phi0, double phi1, double phi2) {
+    const Simulation& sim, const CosimPortEntry& pe, double u, double phi0, double phi1, double phi2, double gPort) {
     if (pe.mode == JOSIM_PORT_VOLTAGE_IN_CURRENT_OUT) {
-        return (pe.curRowIdx >= 0) ? (-sim.cosim_read_x(pe.curRowIdx)) : 0.0;
+        if (pe.curRowIdx < 0) { return 0.0; }
+        double iOut = -sim.cosim_read_x(pe.curRowIdx);
+        if (sim.cosim_analysis_type() == AnalysisType::Phase) {
+            const double h     = sim.cosim_step_size();
+            const double scale = (2.0 * h) / (3.0 * Constants::SIGMA);
+            const double a     = phi1 + (1.0 / 3.0) * (phi1 - phi2);
+            const double w     = scale * u;
+            const double s     = a + w;
+            const double aVirt = s - w;
+            const double wLost = (w - (s - aVirt)) + (a - aVirt);
+            iOut += gPort * (wLost / scale);
+        }
+        return iOut;
     }
     double vPort = phi0;
     if (sim.cosim_analysis_type() == AnalysisType::Phase) {
         const double h = sim.cosim_step_size();
-        vPort          = ((3.0 * Constants::SIGMA) / (2.0 * h)) * (phi0 - (4.0 / 3.0) * phi1 + (1.0 / 3.0) * phi2);
+        vPort          = ((3.0 * Constants::SIGMA) / (2.0 * h)) * ((phi0 - phi1) - (1.0 / 3.0) * (phi1 - phi2));
     }
     if (pe.mode == JOSIM_PORT_CURRENT_IN_VOLTAGE_OUT) {
         return vPort;
@@ -702,16 +804,53 @@ double compute_port_output(
     return vPort - u;
 }
 
+inline double read_phase_target(const Simulation& sim, const CosimPhaseTracker& tgt) {
+    const auto& x = sim.cosim_x();
+    if (tgt.useVi) {
+        return x[static_cast<size_t>(tgt.idxVi)];
+    }
+    const double v1 = (tgt.idx1 >= 0) ? x[static_cast<size_t>(tgt.idx1)] : 0.0;
+    const double v2 = (tgt.idx2 >= 0) ? x[static_cast<size_t>(tgt.idx2)] : 0.0;
+    return v1 - v2;
+}
+
 void run_cosim_substeps(josim_session*             s,
                         int64_t                    targetStep,
+                        double                     targetTime,
                         const std::vector<double>& trialInputs,
                         std::vector<double>&       outPortVals,
                         bool                       recordHistory) {
-    Simulation&   sim   = *s->cosimSim;
-    const size_t  nP    = s->cosimPorts.size();
-    const int64_t start = s->committedStep;
-    const int64_t M     = std::max<int64_t>(1, targetStep - start);
-    const double  h     = sim.cosim_step_size();
+    Simulation&   sim        = *s->cosimSim;
+    const size_t  nP         = s->cosimPorts.size();
+    const int64_t start      = s->committedStep;
+    const int64_t M          = std::max<int64_t>(1, targetStep - start);
+    const double  h          = sim.cosim_step_size();
+    const double  tStart     = static_cast<double>(start) * h;
+    const double  uTotal     = std::max(1e-9, (targetTime - tStart) / h);
+    const double  tau        = std::clamp(uTotal - static_cast<double>(M - 1), 0.0, 1.0);
+    const bool    needFlCkpt = recordHistory && (M >= 2) && (tau < 1.0 - 1e-6);
+    const size_t  nRel       = s->activeMatrix.relevantIndices.size();
+    const size_t  nTrackers  = s->cosimPhaseTrackers.size();
+
+    s->prevSubstepInputs.resize(nP);
+    s->prevSubstepOutputs.resize(nP);
+    s->prevSubstepHistDelta.resize(nP);
+    if (M == 1) {
+        s->prevSubstepInputs    = s->committedInputs;
+        s->prevSubstepOutputs   = s->committedOutputs;
+        s->prevSubstepHistDelta = s->committedHistDelta;
+    }
+
+    if (recordHistory) {
+        s->pendingSteps.clear();
+        s->pendingTimes.clear();
+        s->pendingRelVals.clear();
+        s->pendingPhases.clear();
+        s->pendingSteps.reserve(static_cast<size_t>(M));
+        s->pendingTimes.reserve(static_cast<size_t>(M));
+        if (nRel > 0) { s->pendingRelVals.reserve(static_cast<size_t>(M) * nRel); }
+        if (nTrackers > 0) { s->pendingPhases.reserve(static_cast<size_t>(M) * nTrackers); }
+    }
 
     std::vector<double> phi0(nP), phi1(nP), phi2(nP);
     for (size_t p = 0; p < nP; ++p) {
@@ -720,32 +859,103 @@ void run_cosim_substeps(josim_session*             s,
         phi2[p] = s->cosimPorts[p].phiCommitted2;
     }
 
+    const double        dtAcc = std::max(1e-18, targetTime - s->acceptedTime);
+    std::vector<double> uStepVec(nP, 0.0);
+    std::vector<double> uPrev2 = s->committedInputs;
+    std::vector<double> yPrev2 = s->committedOutputs;
     for (int64_t k = 1; k <= M; ++k) {
-        const int64_t stepIdx = start + k;
-        const double  alpha   = static_cast<double>(k) / static_cast<double>(M);
+        const int64_t stepIdx  = start + k;
+        const double  stepTime = static_cast<double>(stepIdx) * h;
+        const double  frac     = (k < M) ? std::clamp((stepTime - s->acceptedTime) / dtAcc, 0.0, 1.0) : 1.0;
         for (size_t p = 0; p < nP; ++p) {
-            const double uStep = (1.0 - alpha) * s->committedInputs[p] + alpha * trialInputs[p];
+            const double uStep = (1.0 - frac) * s->acceptedInputs[p] + frac * trialInputs[p];
+            uStepVec[p]        = uStep;
             apply_port_input_to_source(s, s->cosimPorts[p], uStep);
             phi2[p] = phi1[p];
             phi1[p] = phi0[p];
         }
-        const double stepTime = static_cast<double>(stepIdx) * h;
         sim.cosim_step_one(s->activeMatrix, stepIdx, stepTime);
-        if (recordHistory) {
-            sim.cosim_record_step(s->activeMatrix, stepIdx, stepTime);
-        }
+        ++s->substepCount;
         for (size_t p = 0; p < nP; ++p) {
             phi0[p] = read_port_node_diff(sim, s->cosimPorts[p]);
+        }
+        if (k == M - 2) {
+            for (size_t p = 0; p < nP; ++p) {
+                uPrev2[p] = uStepVec[p];
+                yPrev2[p] = compute_port_output(
+                    sim, s->cosimPorts[p], uStepVec[p], phi0[p], phi1[p], phi2[p], s->evalJacobian[p]);
+            }
+        }
+        if (k == M - 1) {
+            for (size_t p = 0; p < nP; ++p) {
+                s->prevSubstepInputs[p]  = uStepVec[p];
+                s->prevSubstepOutputs[p] = compute_port_output(
+                    sim, s->cosimPorts[p], uStepVec[p], phi0[p], phi1[p], phi2[p], s->evalJacobian[p]);
+                s->prevSubstepHistDelta[p] = (s->prevSubstepOutputs[p] - yPrev2[p])
+                                             - s->evalJacobian[p] * (s->prevSubstepInputs[p] - uPrev2[p]);
+            }
+        }
+        if (recordHistory) {
+            s->pendingSteps.push_back(stepIdx);
+            s->pendingTimes.push_back(stepTime);
+            for (size_t r = 0; r < nRel; ++r) {
+                s->pendingRelVals.push_back(sim.cosim_read_x(s->activeMatrix.relevantIndices[r]));
+            }
+            for (size_t t = 0; t < nTrackers; ++t) {
+                s->pendingPhases.push_back(read_phase_target(sim, s->cosimPhaseTrackers[t]));
+            }
+            if (k == M - 1 && needFlCkpt) {
+                auto t0 = std::chrono::steady_clock::now();
+                sim.cosim_save_ckpt(s->ckptFloor, stepIdx);
+                auto t1 = std::chrono::steady_clock::now();
+                s->ckptTimeSec += std::chrono::duration<double>(t1 - t0).count();
+                s->evalFloorStep      = stepIdx;
+                s->evalFloorInputs    = s->prevSubstepInputs;
+                s->evalFloorOutputs   = s->prevSubstepOutputs;
+                s->evalFloorHistDelta = s->prevSubstepHistDelta;
+                for (size_t p = 0; p < nP; ++p) {
+                    s->cosimPorts[p].phiFloor0 = phi0[p];
+                    s->cosimPorts[p].phiFloor1 = phi1[p];
+                    s->cosimPorts[p].phiFloor2 = phi2[p];
+                }
+            }
         }
     }
 
     outPortVals.resize(nP);
     for (size_t p = 0; p < nP; ++p) {
-        outPortVals[p] = compute_port_output(sim, s->cosimPorts[p], trialInputs[p], phi0[p], phi1[p], phi2[p]);
+        outPortVals[p] = compute_port_output(
+            sim, s->cosimPorts[p], trialInputs[p], phi0[p], phi1[p], phi2[p], s->evalJacobian[p]);
         if (recordHistory) {
             s->cosimPorts[p].phiEval0 = phi0[p];
             s->cosimPorts[p].phiEval1 = phi1[p];
             s->cosimPorts[p].phiEval2 = phi2[p];
+        }
+    }
+    if (recordHistory) {
+        s->simAtEvalStep = true;
+        if (tau >= 1.0 - 1e-6) {
+            s->evalFloorStep    = targetStep;
+            s->evalFloorInputs  = trialInputs;
+            s->evalFloorOutputs = outPortVals;
+            s->evalFloorHistDelta.resize(nP);
+            for (size_t p = 0; p < nP; ++p) {
+                s->evalFloorHistDelta[p] = (outPortVals[p] - s->prevSubstepOutputs[p])
+                                           - s->evalJacobian[p] * (trialInputs[p] - s->prevSubstepInputs[p]);
+                s->cosimPorts[p].phiFloor0 = phi0[p];
+                s->cosimPorts[p].phiFloor1 = phi1[p];
+                s->cosimPorts[p].phiFloor2 = phi2[p];
+            }
+        } else if (M == 1) {
+            s->evalFloorStep      = s->committedStep;
+            s->evalFloorInputs    = s->committedInputs;
+            s->evalFloorOutputs   = s->committedOutputs;
+            s->evalFloorHistDelta = s->committedHistDelta;
+            for (size_t p = 0; p < nP; ++p) {
+                s->cosimPorts[p].phiFloor0 = s->cosimPorts[p].phiCommitted0;
+                s->cosimPorts[p].phiFloor1 = s->cosimPorts[p].phiCommitted1;
+                s->cosimPorts[p].phiFloor2 = s->cosimPorts[p].phiCommitted2;
+            }
         }
     }
 }
@@ -884,25 +1094,8 @@ JOSIM_API int josim_cosim_init(josim_session_t* s) {
             }
         }
 
-        // Ensure junction and port indices are recorded in xVector
-        if (!s->activeMatrix.relevantTraces.empty()) {
-            for (const auto& jIdx : s->activeMatrix.components.junctionIndices) {
-                const auto& jj = std::get<JJ>(s->activeMatrix.components.devices.at(static_cast<size_t>(jIdx)));
-                if (jj.indexInfo.posIndex_.has_value()) {
-                    s->activeMatrix.relevantIndices.push_back(*jj.indexInfo.posIndex_);
-                }
-                if (jj.indexInfo.negIndex_.has_value()) {
-                    s->activeMatrix.relevantIndices.push_back(*jj.indexInfo.negIndex_);
-                }
-                if (jj.variableIndex_ >= 0) {
-                    s->activeMatrix.relevantIndices.push_back(jj.variableIndex_);
-                }
-            }
-            for (const auto& pe : s->cosimPorts) {
-                if (pe.posRowIdx >= 0) { s->activeMatrix.relevantIndices.push_back(pe.posRowIdx); }
-                if (pe.negRowIdx >= 0) { s->activeMatrix.relevantIndices.push_back(pe.negRowIdx); }
-                if (pe.curRowIdx >= 0) { s->activeMatrix.relevantIndices.push_back(pe.curRowIdx); }
-            }
+        // Deduplicate relevantIndices for explicit .print traces only
+        if (!s->activeMatrix.relevantIndices.empty()) {
             s->activeMatrix.relevantIndices.erase(
                 uniquify(s->activeMatrix.relevantIndices.begin(), s->activeMatrix.relevantIndices.end()),
                 s->activeMatrix.relevantIndices.end());
@@ -911,34 +1104,119 @@ JOSIM_API int josim_cosim_init(josim_session_t* s) {
         s->cosimSim = std::make_unique<Simulation>();
         s->cosimSim->cosim_initialize(s->activeInput, s->activeMatrix);
 
+        // Set up lightweight in-loop phase event trackers for .print phase traces and all junctions
+        s->cosimPhaseTrackers.clear();
+        {
+            const bool                      isVoltAnal = (s->cosimSim->cosim_analysis_type() == AnalysisType::Voltage);
+            std::unordered_set<std::string> seen;
+            for (const auto& tr : s->activeMatrix.relevantTraces) {
+                if (tr.storageType != StorageType::Phase) { continue; }
+                std::string nm = unquote(tr.deviceLabel.value_or("P"));
+                if (seen.insert(nm).second) {
+                    const bool        isJJ = (nm.size() > 2 && nm[0] == 'P' && nm[1] == '(' && nm[2] == 'B');
+                    CosimPhaseTracker pt;
+                    pt.name            = nm;
+                    pt.i1              = tr.index1;
+                    pt.i2              = tr.index2;
+                    pt.vi              = tr.variableIndex;
+                    pt.idx1            = tr.index1.value_or(-1);
+                    pt.idx2            = tr.index2.value_or(-1);
+                    pt.idxVi           = tr.variableIndex.value_or(-1);
+                    pt.isJJ            = isJJ;
+                    pt.useVi           = isVoltAnal && isJJ && (pt.idxVi >= 0);
+                    pt.metricMask      = EVENT_METRIC_ALL;
+                    pt.tracker.traceId = static_cast<int32_t>(s->cosimPhaseTrackers.size());
+                    pt.tracker.init_metrics(pt.metricMask);
+                    pt.tracker.step(0.0, read_phase_target(*s->cosimSim, pt), pt.metricMask);
+                    s->cosimPhaseTrackers.push_back(std::move(pt));
+                }
+            }
+            if (s->activeMatrix.components.junctionIndices.size() <= 256) {
+                for (const auto& jIdx : s->activeMatrix.components.junctionIndices) {
+                    const auto& jj = std::get<JJ>(s->activeMatrix.components.devices.at(static_cast<size_t>(jIdx)));
+                    std::string nm = "P(" + jj.netlistInfo.label_ + ")";
+                    if (seen.insert(nm).second) {
+                        CosimPhaseTracker pt;
+                        pt.name            = nm;
+                        pt.i1              = jj.indexInfo.posIndex_;
+                        pt.i2              = jj.indexInfo.negIndex_;
+                        pt.vi              = jj.variableIndex_;
+                        pt.idx1            = jj.indexInfo.posIndex_.value_or(-1);
+                        pt.idx2            = jj.indexInfo.negIndex_.value_or(-1);
+                        pt.idxVi           = jj.variableIndex_;
+                        pt.isJJ            = true;
+                        pt.useVi           = isVoltAnal && (pt.idxVi >= 0);
+                        pt.metricMask      = 0u;
+                        pt.tracker.traceId = static_cast<int32_t>(s->cosimPhaseTrackers.size());
+                        pt.tracker.init_metrics(pt.metricMask);
+                        pt.tracker.step(0.0, read_phase_target(*s->cosimSim, pt), pt.metricMask);
+                        s->cosimPhaseTrackers.push_back(std::move(pt));
+                    }
+                }
+            }
+        }
+
         const size_t nP = s->cosimPorts.size();
         for (size_t p = 0; p < nP; ++p) {
             const double phi0             = read_port_node_diff(*s->cosimSim, s->cosimPorts[p]);
             s->cosimPorts[p].phiCommitted0 = phi0;
             s->cosimPorts[p].phiCommitted1 = phi0;
             s->cosimPorts[p].phiCommitted2 = phi0;
+            s->cosimPorts[p].phiFloor0     = phi0;
+            s->cosimPorts[p].phiFloor1     = phi0;
+            s->cosimPorts[p].phiFloor2     = phi0;
             s->cosimPorts[p].phiEval0      = phi0;
             s->cosimPorts[p].phiEval1      = phi0;
             s->cosimPorts[p].phiEval2      = phi0;
         }
 
-        s->committedStep = 0;
-        s->committedTime = 0.0;
-        s->evalStep      = 0;
-        s->evalTime      = 0.0;
-        s->hasEvalState  = false;
-        s->rollbackCount = 0;
+        s->committedStep       = 0;
+        s->committedTime       = 0.0;
+        s->acceptedTime        = 0.0;
+        s->evalFloorStep       = 0;
+        s->evalStep            = 0;
+        s->evalTime            = 0.0;
+        s->hasEvalState        = false;
+        s->simAtEvalStep       = false;
+        s->oneStepValidStep    = -1;
+        s->rollbackCount       = 0;
+        s->callCount           = 0;
+        s->substepCount        = 0;
+        s->ckptTimeSec         = 0.0;
+        s->cachedStepJacM       = 0;
+        s->cachedStepJacTime    = -1.0;
+        s->cachedStepJacTau     = -1.0;
+        s->cachedStepJacDtRatio = -1.0;
+        s->portStepJacDirty.assign(nP, 1);
         s->committedInputs.assign(nP, 0.0);
         s->committedOutputs.assign(nP, 0.0);
+        s->committedHistDelta.assign(nP, 0.0);
+        s->acceptedInputs.assign(nP, 0.0);
+        s->evalFloorInputs.assign(nP, 0.0);
+        s->evalFloorOutputs.assign(nP, 0.0);
+        s->evalFloorHistDelta.assign(nP, 0.0);
+        s->prevSubstepInputs.assign(nP, 0.0);
+        s->prevSubstepOutputs.assign(nP, 0.0);
+        s->prevSubstepHistDelta.assign(nP, 0.0);
         s->evalInputs.assign(nP, 0.0);
         s->evalOutputs.assign(nP, 0.0);
+        s->lastInterpOutputs.assign(nP, 0.0);
+        s->oneStepRefInputs.assign(nP, 0.0);
+        s->oneStepRawOutputs.assign(nP, 0.0);
         s->evalJacobian.assign(nP, 0.0);
+        s->cachedStepJacobian.assign(nP, 0.0);
         for (size_t p = 0; p < nP; ++p) {
-            s->evalJacobian[p] = compute_single_step_port_jacobian(s, s->cosimPorts[p]);
+            s->evalJacobian[p]       = compute_single_step_port_jacobian(s, s->cosimPorts[p]);
+            s->cachedStepJacobian[p] = s->evalJacobian[p];
         }
+        s->cosimSim->cosim_clear_lu_changed();
 
+        auto tCkpt0 = std::chrono::steady_clock::now();
         s->cosimSim->cosim_save_ckpt(s->ckptCommitted, 0);
-        s->ckptEval = s->ckptCommitted;
+        auto tCkpt1 = std::chrono::steady_clock::now();
+        s->ckptTimeSec += std::chrono::duration<double>(tCkpt1 - tCkpt0).count();
+        s->ckptFloor = s->ckptCommitted;
+        s->ckptEval  = s->ckptCommitted;
         return 0;
     } catch (const std::exception& e) {
         s->lastError = e.what();
@@ -961,31 +1239,107 @@ JOSIM_API int64_t josim_cosim_rollback_count(const josim_session_t* s) {
     return s->rollbackCount;
 }
 
+JOSIM_API void josim_cosim_stats(
+    const josim_session_t* s, int64_t* out_calls, int64_t* out_rollbacks, int64_t* out_substeps, double* out_ckpt_sec) {
+    if (out_calls) { *out_calls = s ? s->callCount : 0; }
+    if (out_rollbacks) { *out_rollbacks = s ? s->rollbackCount : 0; }
+    if (out_substeps) { *out_substeps = s ? s->substepCount : 0; }
+    if (out_ckpt_sec) { *out_ckpt_sec = s ? s->ckptTimeSec : 0.0; }
+}
+
 JOSIM_API int josim_cosim_commit(josim_session_t* s) {
     if (!s || !s->cosimSim) { return -1; }
     if (s->hasEvalState) {
-        s->ckptCommitted    = s->ckptEval;
-        s->committedStep    = s->evalStep;
-        s->committedTime    = s->evalTime;
-        s->committedInputs  = s->evalInputs;
-        s->committedOutputs = s->evalOutputs;
-        for (auto& pe : s->cosimPorts) {
-            pe.phiCommitted0 = pe.phiEval0;
-            pe.phiCommitted1 = pe.phiEval1;
-            pe.phiCommitted2 = pe.phiEval2;
+        Simulation&   sim       = *s->cosimSim;
+        const double  h         = sim.cosim_step_size();
+        const size_t  nRel      = s->activeMatrix.relevantIndices.size();
+        const size_t  nTrackers = s->cosimPhaseTrackers.size();
+        const int64_t nCommit   = std::max<int64_t>(0, s->evalFloorStep - s->committedStep);
+
+        s->acceptedTime   = s->evalTime;
+        s->acceptedInputs = s->evalInputs;
+
+        for (int64_t c = 0; c < nCommit && static_cast<size_t>(c) < s->pendingSteps.size(); ++c) {
+            const int64_t stepIdx  = s->pendingSteps[static_cast<size_t>(c)];
+            const double  stepTime = s->pendingTimes[static_cast<size_t>(c)];
+            for (size_t t = 0; t < nTrackers; ++t) {
+                const double phi = s->pendingPhases[static_cast<size_t>(c) * nTrackers + t];
+                s->cosimPhaseTrackers[t].tracker.step(stepTime, phi, s->cosimPhaseTrackers[t].metricMask);
+            }
+            if (sim.cosim_keep_step(stepIdx)) {
+                sim.results.timeAxis.emplace_back(stepTime);
+                for (size_t r = 0; r < nRel; ++r) {
+                    const int64_t rowIdx = s->activeMatrix.relevantIndices[r];
+                    if (sim.results.xVector[rowIdx]) {
+                        sim.results.xVector[rowIdx]->emplace_back(
+                            s->pendingRelVals[static_cast<size_t>(c) * nRel + r]);
+                    }
+                }
+            }
         }
-        s->hasEvalState = false;
+
+        if (s->evalFloorStep > s->committedStep) {
+            auto t0 = std::chrono::steady_clock::now();
+            if (s->evalFloorStep == s->evalStep && s->simAtEvalStep) {
+                sim.cosim_save_ckpt(s->ckptCommitted, s->evalStep);
+            } else {
+                std::swap(s->ckptCommitted, s->ckptFloor);
+                sim.cosim_restore_ckpt(s->activeMatrix, s->ckptCommitted);
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            s->ckptTimeSec += std::chrono::duration<double>(t1 - t0).count();
+
+            s->committedStep      = s->evalFloorStep;
+            s->committedTime      = static_cast<double>(s->committedStep) * h;
+            s->committedInputs    = s->evalFloorInputs;
+            s->committedOutputs   = s->evalFloorOutputs;
+            s->committedHistDelta = s->evalFloorHistDelta;
+            for (auto& pe : s->cosimPorts) {
+                pe.phiCommitted0 = pe.phiFloor0;
+                pe.phiCommitted1 = pe.phiFloor1;
+                pe.phiCommitted2 = pe.phiFloor2;
+                pe.phiEval0      = pe.phiFloor0;
+                pe.phiEval1      = pe.phiFloor1;
+                pe.phiEval2      = pe.phiFloor2;
+            }
+        } else {
+            if (s->simAtEvalStep) {
+                auto t0 = std::chrono::steady_clock::now();
+                sim.cosim_restore_ckpt(s->activeMatrix, s->ckptCommitted);
+                auto t1 = std::chrono::steady_clock::now();
+                s->ckptTimeSec += std::chrono::duration<double>(t1 - t0).count();
+            }
+            for (auto& pe : s->cosimPorts) {
+                pe.phiEval0 = pe.phiCommitted0;
+                pe.phiEval1 = pe.phiCommitted1;
+                pe.phiEval2 = pe.phiCommitted2;
+            }
+        }
+        s->pendingSteps.clear();
+        s->pendingTimes.clear();
+        s->pendingRelVals.clear();
+        s->pendingPhases.clear();
+        s->hasEvalState  = false;
+        s->simAtEvalStep = false;
     }
     return 0;
 }
 
 JOSIM_API int josim_cosim_rollback(josim_session_t* s) {
     if (!s || !s->cosimSim) { return -1; }
+    auto t0 = std::chrono::steady_clock::now();
     s->cosimSim->cosim_restore_ckpt(s->activeMatrix, s->ckptCommitted);
-    s->evalStep     = s->committedStep;
-    s->evalTime     = s->committedTime;
-    s->evalInputs   = s->committedInputs;
-    s->hasEvalState = false;
+    auto t1 = std::chrono::steady_clock::now();
+    s->ckptTimeSec += std::chrono::duration<double>(t1 - t0).count();
+    s->evalFloorStep = s->committedStep;
+    s->evalStep      = s->committedStep;
+    s->evalTime      = s->acceptedTime;
+    s->evalInputs    = s->acceptedInputs;
+    s->hasEvalState  = false;
+    s->pendingSteps.clear();
+    s->pendingTimes.clear();
+    s->pendingRelVals.clear();
+    s->pendingPhases.clear();
     for (auto& pe : s->cosimPorts) {
         pe.phiEval0 = pe.phiCommitted0;
         pe.phiEval1 = pe.phiCommitted1;
@@ -1003,6 +1357,7 @@ JOSIM_API int josim_cosim_step_to(
         return -1;
     }
     try {
+        ++s->callCount;
         const size_t nP = s->cosimPorts.size();
         const double h  = s->cosimSim->cosim_step_size();
 
@@ -1011,44 +1366,100 @@ JOSIM_API int josim_cosim_step_to(
             std::memcpy(trialIn.data(), port_inputs, nP * sizeof(double));
         }
 
-        // Automatic commit / rollback based on target_time progression
-        const auto grid_step_for_time = [&](double t) -> int64_t {
-            return std::max<int64_t>(s->committedStep + 1, std::llround(t / h));
-        };
         if (s->hasEvalState) {
-            const int64_t candidateStep = grid_step_for_time(target_time);
-            const double  evalStepTime  = static_cast<double>(s->evalStep) * h;
-            if (target_time > s->evalTime + 0.25 * h && candidateStep > s->evalStep &&
-                target_time >= evalStepTime - 0.1 * h) {
-                // SPICE accepted the previous step and advanced past evalStepTime
+            if (target_time > s->evalTime) {
+                // SPICE accepted s->evalTime and is advancing to a later time
                 josim_cosim_commit(s);
             } else {
-                // Either same-time Newton-Raphson re-evaluation, sub-grid step within the same h interval, or LTE rejection
-                const bool isRollback = (target_time < s->evalTime - 0.25 * h);
-                s->cosimSim->cosim_restore_ckpt(s->activeMatrix, s->ckptCommitted);
+                // Same-time Newton-Raphson re-evaluation or backward-time LTE step rejection
+                const bool isRollback = (target_time < s->evalTime);
+                if (!isRollback && s->simAtEvalStep && (s->evalFloorStep == s->evalStep || nP <= 2)
+                    && (s->evalStep - s->committedStep) >= 2) {
+                    bool smallDiff = true;
+                    for (size_t p = 0; p < nP; ++p) {
+                        const double tol = (s->cosimPorts[p].mode == 0) ? 1e-6 : 1e-7;
+                        if (std::abs(trialIn[p] - s->evalInputs[p]) >= tol) {
+                            smallDiff = false;
+                            break;
+                        }
+                    }
+                    if (smallDiff) {
+                        const double tFloor    = static_cast<double>(s->evalFloorStep) * h;
+                        const double dtAcc     = std::max(1e-18, target_time - s->acceptedTime);
+                        const double fracFloor = (s->evalFloorStep == s->evalStep)
+                                                         ? 1.0
+                                                         : std::clamp((tFloor - s->acceptedTime) / dtAcc, 0.0, 1.0);
+                        for (size_t p = 0; p < nP; ++p) {
+                            const double du = trialIn[p] - s->evalInputs[p];
+                            s->lastInterpOutputs[p] += s->cachedStepJacobian[p] * du;
+                            s->evalOutputs[p] += s->cachedStepJacobian[p] * du;
+                            if (s->evalFloorStep > s->committedStep && p < s->evalFloorOutputs.size()) {
+                                s->evalFloorInputs[p]  += fracFloor * du;
+                                s->evalFloorOutputs[p] += s->cachedStepJacobian[p] * fracFloor * du;
+                            }
+                        }
+                        s->evalInputs = std::move(trialIn);
+                        if (port_outputs && nP > 0) {
+                            std::memcpy(port_outputs, s->lastInterpOutputs.data(), nP * sizeof(double));
+                        }
+                        if (port_jacobian_diag && nP > 0) {
+                            std::memcpy(port_jacobian_diag, s->cachedStepJacobian.data(), nP * sizeof(double));
+                        }
+                        return 0;
+                    }
+                }
+                if (s->simAtEvalStep) {
+                    auto t0 = std::chrono::steady_clock::now();
+                    s->cosimSim->cosim_restore_ckpt(s->activeMatrix, s->ckptCommitted);
+                    auto t1 = std::chrono::steady_clock::now();
+                    s->ckptTimeSec += std::chrono::duration<double>(t1 - t0).count();
+                    s->simAtEvalStep = false;
+                }
                 if (isRollback) { ++s->rollbackCount; }
+                s->hasEvalState = false;
             }
         }
 
         if (target_time <= s->committedTime + 1e-18 && s->committedStep == 0) {
-            // Re-evaluate at t = 0
-            s->cosimSim->cosim_restore_ckpt(s->activeMatrix, s->ckptCommitted);
+            // Re-evaluate at t = 0 (DC operating point / initial transient point)
+            auto t0 = std::chrono::steady_clock::now();
+            s->cosimSim->cosim_restore_ckpt(s->activeMatrix, s->cosimSim->cosim_init_ckpt());
+            auto t1 = std::chrono::steady_clock::now();
+            s->ckptTimeSec += std::chrono::duration<double>(t1 - t0).count();
             for (size_t p = 0; p < nP; ++p) {
                 apply_port_input_to_source(s, s->cosimPorts[p], trialIn[p]);
             }
             s->cosimSim->cosim_step_one(s->activeMatrix, 0, 0.0);
+            ++s->substepCount;
+            const bool needJac = s->cosimSim->cosim_lu_changed();
             for (size_t p = 0; p < nP; ++p) {
-                const double phi0    = read_port_node_diff(*s->cosimSim, s->cosimPorts[p]);
-                s->evalOutputs[p]    = compute_port_output(*s->cosimSim, s->cosimPorts[p], trialIn[p], phi0, phi0, phi0);
-                s->evalJacobian[p]   = compute_single_step_port_jacobian(s, s->cosimPorts[p]);
-                s->cosimPorts[p].phiEval0 = phi0;
-                s->cosimPorts[p].phiEval1 = phi0;
-                s->cosimPorts[p].phiEval2 = phi0;
+                const double phi0 = read_port_node_diff(*s->cosimSim, s->cosimPorts[p]);
+                if (needJac) { s->evalJacobian[p] = compute_single_step_port_jacobian(s, s->cosimPorts[p]); }
+                s->evalOutputs[p] = compute_port_output(
+                    *s->cosimSim, s->cosimPorts[p], trialIn[p], phi0, phi0, phi0, s->evalJacobian[p]);
+                s->cosimPorts[p].phiCommitted0 = phi0;
+                s->cosimPorts[p].phiCommitted1 = phi0;
+                s->cosimPorts[p].phiCommitted2 = phi0;
+                s->cosimPorts[p].phiFloor0     = phi0;
+                s->cosimPorts[p].phiFloor1     = phi0;
+                s->cosimPorts[p].phiFloor2     = phi0;
+                s->cosimPorts[p].phiEval0      = phi0;
+                s->cosimPorts[p].phiEval1      = phi0;
+                s->cosimPorts[p].phiEval2      = phi0;
+            }
+            if (needJac) {
+                s->cosimSim->cosim_clear_lu_changed();
+                s->cachedStepJacM = 0;
             }
             s->evalInputs       = trialIn;
             s->committedInputs  = trialIn;
             s->committedOutputs = s->evalOutputs;
-            s->cosimSim->cosim_save_ckpt(s->ckptEval, 0);
+            s->acceptedTime     = 0.0;
+            s->acceptedInputs   = trialIn;
+            auto t2             = std::chrono::steady_clock::now();
+            s->cosimSim->cosim_save_ckpt(s->ckptCommitted, 0);
+            auto t3 = std::chrono::steady_clock::now();
+            s->ckptTimeSec += std::chrono::duration<double>(t3 - t2).count();
             if (port_outputs && nP > 0) { std::memcpy(port_outputs, s->evalOutputs.data(), nP * sizeof(double)); }
             if (port_jacobian_diag && nP > 0) {
                 std::memcpy(port_jacobian_diag, s->evalJacobian.data(), nP * sizeof(double));
@@ -1056,49 +1467,115 @@ JOSIM_API int josim_cosim_step_to(
             return 0;
         }
 
-        const int64_t targetStep = grid_step_for_time(target_time);
-        const int64_t M          = targetStep - s->committedStep;
-        const bool    sameStepNR = (s->hasEvalState && targetStep == s->evalStep);
+        const double  tCommittedGrid = static_cast<double>(s->committedStep) * h;
+        const double  uTotal         = std::max(1e-9, (target_time - tCommittedGrid) / h);
+        const int64_t M              = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(uTotal - 1e-6)));
+        const int64_t targetStep     = s->committedStep + M;
+        const double  tau            = std::clamp(uTotal - static_cast<double>(M - 1), 0.0, 1.0);
 
-        run_cosim_substeps(s, targetStep, trialIn, s->evalOutputs, true);
-        s->cosimSim->cosim_save_ckpt(s->ckptEval, targetStep);
+        auto compute_interp = [&](const std::vector<double>& uIn, const std::vector<double>& rawOut) {
+            std::vector<double> res = rawOut;
+            if (tau < 1.0 - 1e-6) {
+                for (size_t p = 0; p < nP; ++p) {
+                    const double yPrev     = (p < s->prevSubstepOutputs.size()) ? s->prevSubstepOutputs[p] : 0.0;
+                    const double uPrev     = (p < s->prevSubstepInputs.size()) ? s->prevSubstepInputs[p] : 0.0;
+                    const double dHistPrev = (p < s->prevSubstepHistDelta.size()) ? s->prevSubstepHistDelta[p] : 0.0;
+                    const double geq       = s->evalJacobian[p];
+                    const double dHistCurr = (rawOut[p] - yPrev) - geq * (uIn[p] - uPrev);
+                    const double omTau     = 1.0 - tau;
+                    const double hermite   = (targetStep >= 2) ? (-tau * omTau * omTau * (dHistCurr - dHistPrev)) : 0.0;
+                    res[p]                 = yPrev + geq * (uIn[p] - uPrev) + tau * dHistCurr + hermite;
+                }
+            }
+            return res;
+        };
 
-        std::vector<double> interpOutputs = s->evalOutputs;
+        run_cosim_substeps(s, targetStep, target_time, trialIn, s->evalOutputs, true);
 
-        // Compute exact driving-point Jacobian (1-step KLU solve for M == 1, or multi-substep tangent for M > 1)
-        if (M == 1) {
+        if (s->cosimSim->cosim_lu_changed()) {
             for (size_t p = 0; p < nP; ++p) {
-                s->evalJacobian[p] = compute_single_step_port_jacobian(s, s->cosimPorts[p]);
-            }
-            // Smooth sub-grid interpolation if target_time < targetStep * h (keep s->evalOutputs as exact grid value!)
-            const double tCommittedGrid = static_cast<double>(s->committedStep) * h;
-            const double alpha          = std::clamp((target_time - tCommittedGrid) / h, 0.0, 1.0);
-            if (alpha < 0.999999) {
-                for (size_t p = 0; p < nP; ++p) {
-                    const double y_c = (p < s->committedOutputs.size()) ? s->committedOutputs[p] : 0.0;
-                    const double u_c = (p < s->committedInputs.size()) ? s->committedInputs[p] : 0.0;
-                    interpOutputs[p] =
-                        (1.0 - alpha) * y_c + alpha * s->evalOutputs[p] +
-                        (1.0 - alpha) * s->evalJacobian[p] * (trialIn[p] - u_c);
+                const double newJac = compute_single_step_port_jacobian(s, s->cosimPorts[p]);
+                if (std::abs(newJac - s->evalJacobian[p]) > 1e-7 * (std::abs(s->evalJacobian[p]) + 1e-12)) {
+                    s->portStepJacDirty[p] = 1;
                 }
+                s->evalJacobian[p] = newJac;
             }
-        } else if (!sameStepNR || port_jacobian_diag != nullptr) {
-            if (!sameStepNR) {
-                std::vector<double> pertIn  = trialIn;
-                std::vector<double> pertOut(nP, 0.0);
+            s->cosimSim->cosim_clear_lu_changed();
+        }
+
+        s->lastInterpOutputs = compute_interp(trialIn, s->evalOutputs);
+
+        if (M == 1) {
+            s->cachedStepJacobian   = s->evalJacobian;
+            s->cachedStepJacM       = 1;
+            s->cachedStepJacDtRatio = 1.0;
+            s->cachedStepJacTime    = target_time;
+        } else {
+            const double uMacro      = std::max(1e-9, (target_time - s->acceptedTime) / h);
+            const bool   geomChanged = (s->cachedStepJacM <= 1)
+                                       || (std::abs(uMacro - s->cachedStepJacDtRatio)
+                                           > 0.20 * std::max(1.0, s->cachedStepJacDtRatio));
+            bool anyDirty = geomChanged;
+            if (!anyDirty) {
                 for (size_t p = 0; p < nP; ++p) {
-                    if (s->cosimPorts[p].mode == JOSIM_PORT_WAVE_BRANIN) {
-                        s->evalJacobian[p] = 1.0 / s->cosimPorts[p].z0;
-                        continue;
+                    if (s->portStepJacDirty[p]) {
+                        anyDirty = true;
+                        break;
                     }
-                    const double eps = 1e-6 * std::max(1e-3, std::abs(trialIn[p]));
-                    pertIn[p]        = trialIn[p] + eps;
-                    s->cosimSim->cosim_restore_ckpt(s->activeMatrix, s->ckptCommitted);
-                    run_cosim_substeps(s, targetStep, pertIn, pertOut, false);
-                    s->evalJacobian[p] = (pertOut[p] - s->evalOutputs[p]) / eps;
-                    pertIn[p]          = trialIn[p];
                 }
+            }
+            if (anyDirty) {
+                auto tSave0 = std::chrono::steady_clock::now();
+                s->cosimSim->cosim_save_ckpt(s->ckptEval, targetStep);
+                auto tSave1 = std::chrono::steady_clock::now();
+                s->ckptTimeSec += std::chrono::duration<double>(tSave1 - tSave0).count();
+
+                const std::vector<double> savedPrevIn   = s->prevSubstepInputs;
+                const std::vector<double> savedPrevOut  = s->prevSubstepOutputs;
+                const std::vector<double> savedPrevHist = s->prevSubstepHistDelta;
+
+                s->cachedStepJacobian.resize(nP);
+                std::vector<double> pertIn = trialIn;
+                std::vector<double> pertRaw(nP, 0.0);
+                const double        eps = 1e-7;
+                for (size_t p = 0; p < nP; ++p) {
+                    if (!geomChanged && !s->portStepJacDirty[p]) { continue; }
+                    auto t0 = std::chrono::steady_clock::now();
+                    s->cosimSim->cosim_restore_ckpt(s->activeMatrix, s->ckptCommitted);
+                    auto t1 = std::chrono::steady_clock::now();
+                    s->ckptTimeSec += std::chrono::duration<double>(t1 - t0).count();
+
+                    pertIn[p] = trialIn[p] + eps;
+                    run_cosim_substeps(s, targetStep, target_time, pertIn, pertRaw, false);
+                    pertIn[p] = trialIn[p];
+
+                    double pertInterp = pertRaw[p];
+                    if (tau < 1.0 - 1e-6) {
+                        const double yPrev     = (p < s->prevSubstepOutputs.size()) ? s->prevSubstepOutputs[p] : 0.0;
+                        const double uPrev     = (p < s->prevSubstepInputs.size()) ? s->prevSubstepInputs[p] : 0.0;
+                        const double dHistPrev = (p < s->prevSubstepHistDelta.size()) ? s->prevSubstepHistDelta[p] : 0.0;
+                        const double geq       = s->evalJacobian[p];
+                        const double dHistCurr = (pertRaw[p] - yPrev) - geq * ((trialIn[p] + eps) - uPrev);
+                        const double omTau     = 1.0 - tau;
+                        const double hermite   = (targetStep >= 2) ? (-tau * omTau * omTau * (dHistCurr - dHistPrev)) : 0.0;
+                        pertInterp             = yPrev + geq * ((trialIn[p] + eps) - uPrev) + tau * dHistCurr + hermite;
+                    }
+                    s->cachedStepJacobian[p] = (pertInterp - s->lastInterpOutputs[p]) / eps;
+                    s->portStepJacDirty[p]   = 0;
+                }
+
+                auto tRest0 = std::chrono::steady_clock::now();
                 s->cosimSim->cosim_restore_ckpt(s->activeMatrix, s->ckptEval);
+                auto tRest1 = std::chrono::steady_clock::now();
+                s->ckptTimeSec += std::chrono::duration<double>(tRest1 - tRest0).count();
+
+                s->prevSubstepInputs    = savedPrevIn;
+                s->prevSubstepOutputs   = savedPrevOut;
+                s->prevSubstepHistDelta = savedPrevHist;
+                s->cachedStepJacM       = M;
+                s->cachedStepJacTau     = tau;
+                s->cachedStepJacDtRatio = uMacro;
+                s->cachedStepJacTime    = target_time;
             }
         }
 
@@ -1108,10 +1585,10 @@ JOSIM_API int josim_cosim_step_to(
         s->hasEvalState = true;
 
         if (port_outputs && nP > 0) {
-            std::memcpy(port_outputs, interpOutputs.data(), nP * sizeof(double));
+            std::memcpy(port_outputs, s->lastInterpOutputs.data(), nP * sizeof(double));
         }
         if (port_jacobian_diag && nP > 0) {
-            std::memcpy(port_jacobian_diag, s->evalJacobian.data(), nP * sizeof(double));
+            std::memcpy(port_jacobian_diag, s->cachedStepJacobian.data(), nP * sizeof(double));
         }
         return 0;
     } catch (const std::exception& e) {
@@ -1164,7 +1641,7 @@ JOSIM_API int josim_cosim_run_window(
             const auto&  pe   = s->cosimPorts[p];
             const double u0   = eval_pwl_port(s->committedStep * h, p);
             const double out0 = compute_port_output(
-                sim, pe, u0, pe.phiCommitted0, pe.phiCommitted1, pe.phiCommitted2);
+                sim, pe, u0, pe.phiCommitted0, pe.phiCommitted1, pe.phiCommitted2, s->evalJacobian[p]);
             s->windowPortOutFlat.push_back(out0);
         }
 
@@ -1179,26 +1656,35 @@ JOSIM_API int josim_cosim_run_window(
                 pe.phiCommitted1      = pe.phiCommitted0;
             }
             sim.cosim_step_one(s->activeMatrix, stepIdx, stepTime);
+            ++s->substepCount;
             sim.cosim_record_step(s->activeMatrix, stepIdx, stepTime);
+            for (auto& pt : s->cosimPhaseTrackers) {
+                pt.tracker.step(stepTime, read_phase_target(sim, pt), EVENT_METRIC_ALL);
+            }
 
             s->windowTimePts.push_back(stepTime);
             for (size_t p = 0; p < nP; ++p) {
                 auto& pe         = s->cosimPorts[p];
                 pe.phiCommitted0 = read_port_node_diff(sim, pe);
                 const double out = compute_port_output(
-                    sim, pe, s->committedInputs[p], pe.phiCommitted0, pe.phiCommitted1, pe.phiCommitted2);
+                    sim, pe, s->committedInputs[p], pe.phiCommitted0, pe.phiCommitted1, pe.phiCommitted2, s->evalJacobian[p]);
                 s->windowPortOutFlat.push_back(out);
             }
         }
 
         s->committedStep = stopStep;
         s->committedTime = static_cast<double>(stopStep) * h;
+        s->evalFloorStep = s->committedStep;
         s->evalStep      = s->committedStep;
         s->evalTime      = s->committedTime;
         s->evalInputs    = s->committedInputs;
         s->hasEvalState  = false;
+        auto t0          = std::chrono::steady_clock::now();
         sim.cosim_save_ckpt(s->ckptCommitted, stopStep);
-        s->ckptEval = s->ckptCommitted;
+        auto t1 = std::chrono::steady_clock::now();
+        s->ckptTimeSec += std::chrono::duration<double>(t1 - t0).count();
+        s->ckptFloor = s->ckptCommitted;
+        s->ckptEval  = s->ckptCommitted;
 
         if (out_n_pts) { *out_n_pts = static_cast<int64_t>(s->windowTimePts.size()); }
         if (out_t_pts) { *out_t_pts = s->windowTimePts.data(); }
@@ -1213,6 +1699,16 @@ JOSIM_API int josim_cosim_run_window(
 JOSIM_API int josim_cosim_finalize(josim_session_t* s) {
     if (!s || !s->cosimSim) { return -1; }
     try {
+        if (s->hasEvalState) {
+            s->evalFloorStep    = s->evalStep;
+            s->evalFloorInputs  = s->evalInputs;
+            s->evalFloorOutputs = s->evalOutputs;
+            for (auto& pe : s->cosimPorts) {
+                pe.phiFloor0 = pe.phiEval0;
+                pe.phiFloor1 = pe.phiEval1;
+                pe.phiFloor2 = pe.phiEval2;
+            }
+        }
         josim_cosim_commit(s);
         Simulation& sObj = *s->cosimSim;
         sObj.cosim_finish(s->activeMatrix);
@@ -1231,8 +1727,12 @@ JOSIM_API int josim_cosim_finalize(josim_session_t* s) {
         if (!s->activeInput.measurements.empty()) {
             s->activeOutput.evaluate_measurements(s->activeInput, s->activeMatrix, sObj);
         }
-        if (!s->activeInput.argEventsOnly) {
+        if (!s->activeInput.argEventsOnly && !s->activeMatrix.relevantTraces.empty()) {
             s->activeOutput.write_output(s->activeInput, s->activeMatrix, sObj);
+        } else if (s->activeOutput.traces.empty() && !sObj.results.timeAxis.empty()) {
+            s->activeOutput.traces.emplace_back("time");
+            s->activeOutput.traces.back().type_ = 'T';
+            s->activeOutput.traces.back().data_ = sObj.results.timeAxis;
         }
 
         s->cleanTraceNames.clear();

@@ -34,6 +34,9 @@ typedef struct JosimXspiceState_s {
     double                    *y_out;
     double                    *dy_du;
     char                      *out_csv;
+    char                      *debug_log;
+    FILE                      *dbg_fp;
+    int64_t                    call_idx;
     int64_t                    last_rb_count;
     struct JosimXspiceState_s *next;
 } JosimXspiceState_t;
@@ -101,7 +104,14 @@ static void write_inproc_csv(josim_session_t *sess, const char *csv_path) {
     snprintf(meta_path, sizeof(meta_path), "%s.meta.txt", csv_path);
     FILE *mfp = fopen(meta_path, "w");
     if (mfp) {
-        fprintf(mfp, "rollback_count=%lld\n", (long long) josim_cosim_rollback_count(sess));
+        int64_t calls = 0, rollbacks = 0, substeps = 0;
+        double  ckpt_sec = 0.0;
+        josim_cosim_stats(sess, &calls, &rollbacks, &substeps, &ckpt_sec);
+        fprintf(mfp, "rollback_count=%lld\n", (long long) rollbacks);
+        fprintf(mfp, "calls=%lld\n", (long long) calls);
+        fprintf(mfp, "rollbacks=%lld\n", (long long) rollbacks);
+        fprintf(mfp, "substeps=%lld\n", (long long) substeps);
+        fprintf(mfp, "ckpt_time_s=%.6f\n", ckpt_sec);
         fclose(mfp);
     }
 }
@@ -109,6 +119,10 @@ static void write_inproc_csv(josim_session_t *sess, const char *csv_path) {
 static void finalize_xspice_state(JosimXspiceState_t *st) {
     if (!st || st->finalized) { return; }
     st->finalized = 1;
+    if (st->dbg_fp) {
+        fclose(st->dbg_fp);
+        st->dbg_fp = NULL;
+    }
     if (st->use_socket) {
         if (st->sock_fd >= 0) {
             const char *csv = (st->out_csv && st->out_csv[0]) ? st->out_csv : "";
@@ -134,6 +148,15 @@ static void finalize_xspice_state(JosimXspiceState_t *st) {
             st->sock_fd = -1;
         }
     } else if (st->sess) {
+        int64_t calls = 0, rollbacks = 0, substeps = 0;
+        double  ckpt_sec = 0.0;
+        josim_cosim_stats(st->sess, &calls, &rollbacks, &substeps, &ckpt_sec);
+        fprintf(stderr,
+                "[josim_cosim] calls=%lld rollbacks=%lld substeps=%lld ckpt_time_s=%.6f\n",
+                (long long) calls,
+                (long long) rollbacks,
+                (long long) substeps,
+                ckpt_sec);
         josim_cosim_finalize(st->sess);
         if (st->out_csv && st->out_csv[0]) {
             write_inproc_csv(st->sess, st->out_csv);
@@ -173,6 +196,7 @@ static void cm_josim_cosim_callback(Mif_Private_t *mif_private, Mif_Callback_Rea
         free(st->y_out);
         free(st->dy_du);
         free(st->out_csv);
+        free(st->debug_log);
         free(st);
         mif_private->inst_var[0]->element[0].pvalue = NULL;
     }
@@ -199,8 +223,22 @@ void cm_josim_cosim(Mif_Private_t *mif_private) {
         int         phase_mode  = (!mif_private->param[4]->is_null) ? mif_private->param[4]->element[0].ivalue : 1;
         const char *server_addr = (!mif_private->param[5]->is_null) ? mif_private->param[5]->element[0].svalue : "";
         const char *out_csv     = (!mif_private->param[6]->is_null) ? mif_private->param[6]->element[0].svalue : "";
+        const char *debug_log   = (mif_private->num_param > 7 && !mif_private->param[7]->is_null)
+                                          ? mif_private->param[7]->element[0].svalue
+                                          : "";
 
         if (out_csv && out_csv[0]) { st->out_csv = strdup(out_csv); }
+        if (debug_log && debug_log[0]) {
+            st->debug_log = strdup(debug_log);
+            st->dbg_fp    = fopen(st->debug_log, "w");
+            if (st->dbg_fp) {
+                fprintf(st->dbg_fp, "call,t,rollbacks,rollback_delta");
+                for (int i = 0; i < n_ports; ++i) { fprintf(st->dbg_fp, ",u_%d", i); }
+                for (int i = 0; i < n_ports; ++i) { fprintf(st->dbg_fp, ",y_%d", i); }
+                for (int i = 0; i < n_ports; ++i) { fprintf(st->dbg_fp, ",g_%d", i); }
+                fputc('\n', st->dbg_fp);
+            }
+        }
 
         if (server_addr && server_addr[0]) {
             st->use_socket = 1;
@@ -338,6 +376,24 @@ void cm_josim_cosim(Mif_Private_t *mif_private) {
         josim_cosim_step_to(st->sess, t_eval, st->u_in, st->y_out, st->dy_du);
     }
 
+    if (st->dbg_fp) {
+        int64_t cur_rb   = st->use_socket ? st->last_rb_count : josim_cosim_rollback_count(st->sess);
+        int64_t rb_delta = cur_rb - st->last_rb_count;
+        if (!st->use_socket) { st->last_rb_count = cur_rb; }
+        ++st->call_idx;
+        fprintf(st->dbg_fp,
+                "%lld,%.12e,%lld,%lld",
+                (long long) st->call_idx,
+                t_eval,
+                (long long) cur_rb,
+                (long long) rb_delta);
+        for (int i = 0; i < n_ports; ++i) { fprintf(st->dbg_fp, ",%.10e", st->u_in[i]); }
+        for (int i = 0; i < n_ports; ++i) { fprintf(st->dbg_fp, ",%.10e", st->y_out[i]); }
+        for (int i = 0; i < n_ports; ++i) { fprintf(st->dbg_fp, ",%.10e", st->dy_du[i]); }
+        fputc('\n', st->dbg_fp);
+        fflush(st->dbg_fp);
+    }
+
     for (int i = 0; i < n_ports; ++i) {
         mif_private->conn[0]->port[i]->output.rvalue = st->y_out[i];
         for (int j = 0; j < n_ports; ++j) {
@@ -354,10 +410,11 @@ static IFparm MIFmPTable[] = {
     IOP("phase_mode", 4, IF_INTEGER, "JoSIM analysis type (1=phase, 0=voltage)"),
     IOP("server_addr", 5, IF_STRING, "Optional josim-cosim-server address (unix:... or tcp:...)"),
     IOP("out_csv", 6, IF_STRING, "Optional output CSV file path for JoSIM traces and events"),
+    IOP("debug_log", 7, IF_STRING, "Optional per-call debug CSV log path"),
 };
 
 static IFparm MIFpTable[] = {
-    OP("locdata", 7, IF_STRING, "local static state"),
+    OP("locdata", 8, IF_STRING, "local static state"),
 };
 
 static Mif_Port_Type_t MIFportEnum0[] = {
@@ -530,6 +587,25 @@ static Mif_Param_Info_t MIFparamTable[] = {
         0,
         MIF_TRUE,
     },
+    {
+        "debug_log",
+        "Optional per-call debug CSV log path",
+        MIF_STRING,
+        0,
+        NULL,
+        MIF_FALSE,
+        {.bvalue = MIF_FALSE},
+        MIF_FALSE,
+        {.bvalue = MIF_FALSE},
+        MIF_FALSE,
+        MIF_FALSE,
+        0,
+        MIF_FALSE,
+        0,
+        MIF_FALSE,
+        0,
+        MIF_TRUE,
+    },
 };
 
 static Mif_Inst_Var_Info_t MIFinst_varTable[] = {
@@ -544,7 +620,7 @@ static Mif_Inst_Var_Info_t MIFinst_varTable[] = {
 static int val_terms             = 0;
 static int val_numNames          = 0;
 static int val_numInstanceParms  = 1;
-static int val_numModelParms     = 7;
+static int val_numModelParms     = 8;
 static int val_sizeofMIFinstance = sizeof(MIFinstance);
 static int val_sizeofMIFmodel    = sizeof(MIFmodel);
 
@@ -565,7 +641,7 @@ SPICEdev cm_josim_cosim_info = {
             .cm_func      = cm_josim_cosim,
             .num_conn     = 1,
             .conn         = MIFconnTable,
-            .num_param    = 7,
+            .num_param    = 8,
             .param        = MIFparamTable,
             .num_inst_var = 1,
             .inst_var     = MIFinst_varTable,

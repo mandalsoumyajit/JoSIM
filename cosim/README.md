@@ -14,7 +14,7 @@ cosim/
 │       └── multi_instance_transceiver.sp   # 2 concurrent JoSIM XSPICE partitions + pad filter + Cryo-CMOS LNA
 ├── spectre/
 │   ├── josim_cosim_dpi.c                   # Cadence Spectre CDS_VA_DPI C bridge (libjosim_spectre_dpi.so)
-│   ├── josim_cosim_port.va                 # Verilog-A boundary port modules (1-port Norton/Thevenin & 2-port)
+│   ├── josim_cosim_port.va                 # Verilog-A boundary port modules (1-port Norton/Thevenin & 2-/3-/4-/6-/8-port)
 │   └── examples/
 │       ├── sfq_dff.cir                     # JoSIM 2-port RSFQ D-Flip-Flop (DRO) subcircuit
 │       ├── ntron_driver.cir                # JoSIM 1-port 2-JJ SFQ + electrothermal nTron driver subcircuit

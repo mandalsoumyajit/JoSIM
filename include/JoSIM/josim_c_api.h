@@ -98,6 +98,8 @@ JOSIM_API int     josim_cosim_init(josim_session_t* s);
 JOSIM_API double  josim_cosim_tstep(const josim_session_t* s);
 JOSIM_API double  josim_cosim_current_time(const josim_session_t* s);
 JOSIM_API int64_t josim_cosim_rollback_count(const josim_session_t* s);
+JOSIM_API void    josim_cosim_stats(
+    const josim_session_t* s, int64_t* out_calls, int64_t* out_rollbacks, int64_t* out_substeps, double* out_ckpt_sec);
 
 /* Advance (or auto-rollback/re-evaluate) to target_time.
    - If target_time == last evaluated time: re-evaluates from last committed checkpoint (Newton-Raphson iteration).

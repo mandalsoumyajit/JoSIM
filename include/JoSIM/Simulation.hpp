@@ -45,6 +45,8 @@ struct InLoopEventTracker {
     double                firstPhi         = 0.0;
     double                prevPhi          = 0.0;
     double                prevT            = 0.0;
+    double                loThresh         = -Constants::PI;
+    double                hiThresh         = Constants::PI;
     int64_t               prevK            = 0;
     int32_t               traceId          = -1;
     int32_t               sign             = 1;
@@ -205,17 +207,24 @@ struct InLoopEventTracker {
 
     inline void step(double tCurr, double rawVal, uint32_t metricsMask) {
         const double  phi     = (sign >= 0) ? rawVal : -rawVal;
-        const int64_t k       = static_cast<int64_t>(std::floor((phi + Constants::PI) / (2.0 * Constants::PI)));
         const int32_t curStep = stepCount++;
         if (metricsMask != 0u && !histT.empty()) {
             histT[curStep & HIST_MASK]   = tCurr;
             histPhi[curStep & HIST_MASK] = phi;
         }
+        if (initialized && !hasPending && phi >= loThresh && phi < hiThresh) {
+            prevPhi = phi;
+            prevT   = tCurr;
+            return;
+        }
+        const int64_t k = static_cast<int64_t>(std::floor((phi + Constants::PI) / (2.0 * Constants::PI)));
         if (!initialized) {
             firstPhi    = phi;
             prevPhi     = phi;
             prevT       = tCurr;
             prevK       = k;
+            loThresh    = (2.0 * static_cast<double>(k) - 1.0) * Constants::PI;
+            hiThresh    = (2.0 * static_cast<double>(k) + 1.0) * Constants::PI;
             initialized = 1;
             return;
         }
@@ -245,7 +254,9 @@ struct InLoopEventTracker {
                 }
                 curK = nextK;
             }
-            prevK = k;
+            prevK    = k;
+            loThresh = (2.0 * static_cast<double>(k) - 1.0) * Constants::PI;
+            hiThresh = (2.0 * static_cast<double>(k) + 1.0) * Constants::PI;
         } else if (hasPending && (curStep - pendingCrossStep) >= LOOKAHEAD) {
             finalize_pending(curStep, metricsMask);
         }
@@ -365,6 +376,7 @@ struct TrialDeviceScales {
     std::vector<double>                       resScale;
     std::vector<double>                       capScale;
     std::vector<double>                       jjScale;
+    std::vector<double>                       jjIcScale;
     std::vector<double>                       nwScale;
     std::vector<double>                       vsScale;
     std::vector<double>                       psScale;
@@ -466,6 +478,7 @@ class Simulation {
     double              bypassTol_               = 1e-6;
     bool                fixedStep_               = false;
     bool                cosimMode_               = false;
+    bool                cosimLuChanged_          = false;
     bool                warnStep_                = false;
     int64_t             rollbackMode_            = 1;
     int64_t             verb_                    = 0;
@@ -505,6 +518,7 @@ class Simulation {
     std::vector<CCVS>             ccvss_;
     std::vector<VCCS>             vccss_;
     std::vector<Nanowire>         nanowires_;
+    std::vector<uint8_t>          csSameAsPrev_;
 #ifdef SLU
     LUSolve lu;
 #else
@@ -644,6 +658,7 @@ class Simulation {
     void         cosim_record_step(const Matrix& mObj, int64_t stepIdx, double stepTime);
     void         cosim_save_ckpt(RollingCheckpoint& ckpt, int64_t stepIdx) { save_mna_checkpoint(ckpt, stepIdx); }
     void         cosim_restore_ckpt(Matrix& mObj, const RollingCheckpoint& ckpt);
+    const RollingCheckpoint& cosim_init_ckpt() const noexcept { return ckpt_[0]; }
     double       cosim_solve_unit_rhs(Matrix& mObj,
                                       int64_t rhsRow1,
                                       double  rhsVal1,
@@ -653,6 +668,15 @@ class Simulation {
                                       int64_t outRow2);
     double       cosim_read_x(int64_t row) const noexcept {
         return (row >= 0 && static_cast<size_t>(row) < x_.size()) ? x_[static_cast<size_t>(row)] : 0.0;
+    }
+    const std::vector<double>& cosim_x() const noexcept { return x_; }
+    bool         cosim_lu_changed() const noexcept { return cosimLuChanged_; }
+    void         cosim_clear_lu_changed() noexcept { cosimLuChanged_ = false; }
+    bool         cosim_keep_step(int64_t stepIdx) const noexcept {
+        if (stepIdx >= 0 && stepIdx < static_cast<int64_t>(keepStep_.size()) && useDecimation_) {
+            return keepStep_[static_cast<size_t>(stepIdx)] != 0;
+        }
+        return true;
     }
     double       cosim_step_size() const noexcept { return stepSize_; }
     AnalysisType cosim_analysis_type() const noexcept { return atyp_; }

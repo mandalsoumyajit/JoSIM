@@ -29,6 +29,8 @@ typedef struct {
     char             port_nodes_csv[512];
     char             port_modes_csv[256];
     char             endpoint[256];
+    char             out_csv[512];
+    char             events_csv[512];
 
 #ifndef JOSIM_DPI_SOCKET_ONLY
     josim_session_t* session;
@@ -74,16 +76,75 @@ static int parse_csv_tokens(const char* csv, char tokens[][128], int max_tokens)
     return count;
 }
 
+#ifndef JOSIM_DPI_SOCKET_ONLY
+static void dpi_write_events_csv(josim_session_t* s, const char* ev_path) {
+    if (!s || !ev_path || !ev_path[0]) return;
+    int64_t                  n_ev = josim_num_events(s);
+    const josim_sfq_event_t* evs  = josim_events_data(s);
+    FILE*                    ef   = fopen(ev_path, "w");
+    if (!ef) return;
+    fprintf(ef, "trace,trial,time_s,polarity,winding,phase_rad,t_peak_s,v_peak_v,fwhm_s,dt_pi_s,area_v_s\n");
+    for (int64_t e = 0; e < n_ev && evs; ++e) {
+        const char* tname = josim_event_trace_name(s, evs[e].trace_id);
+        fprintf(ef, "%s,%d,%.15e,%d,%d,%.10e,%.15e,%.10e,%.10e,%.10e,%.10e\n",
+                tname ? tname : "", evs[e].trial, evs[e].time, evs[e].polarity, evs[e].winding,
+                evs[e].phase, evs[e].t_peak, evs[e].v_peak, evs[e].fwhm, evs[e].dt_pi, evs[e].area);
+    }
+    fclose(ef);
+}
+
+static void dpi_write_traces_csv(josim_session_t* s, const char* csv_path,
+                                 int64_t n_calls, int64_t n_rbs, int64_t n_subs, double ckpt_sec, double dt) {
+    if (!s || !csv_path || !csv_path[0]) return;
+    int64_t n_traces = josim_num_traces(s);
+    int64_t n_steps  = josim_num_steps(s);
+    if (n_steps > 0 && n_traces > 0) {
+        FILE* fp = fopen(csv_path, "w");
+        if (fp) {
+            for (int64_t c = 0; c < n_traces; ++c) {
+                if (c > 0) fputc(',', fp);
+                const char* nm = josim_trace_name(s, c);
+                fprintf(fp, "%s", nm ? nm : "col");
+            }
+            fputc('\n', fp);
+            for (int64_t r = 0; r < n_steps; ++r) {
+                for (int64_t c = 0; c < n_traces; ++c) {
+                    if (c > 0) fputc(',', fp);
+                    const double* col_data = josim_trace_data(s, c);
+                    fprintf(fp, "%.12e", col_data ? col_data[r] : 0.0);
+                }
+                fputc('\n', fp);
+            }
+            fclose(fp);
+        }
+    }
+    char meta_path[560];
+    snprintf(meta_path, sizeof(meta_path), "%s.meta.txt", csv_path);
+    FILE* mf = fopen(meta_path, "w");
+    if (mf) {
+        fprintf(mf, "calls=%lld\nrollbacks=%lld\nsubsteps=%lld\nckpt_time_s=%.6f\ntstep_s=%.12e\n",
+                (long long)n_calls, (long long)n_rbs, (long long)n_subs, ckpt_sec, dt);
+        fclose(mf);
+    }
+}
+#endif
+
 static void dpi_slot_free(josim_dpi_slot_t* st) {
     if (!st || !st->active) return;
 #if !defined(_WIN32)
     if (st->use_socket) {
         if (st->sock_fd >= 0) {
-            uint32_t zero_len = 0;
-            if (josim_ipc_send_req(st->sock_fd, JOSIM_IPC_OP_FINALIZE, &zero_len, sizeof(zero_len)) == 0) {
+            char fin_path[1060];
+            if (st->events_csv[0]) {
+                snprintf(fin_path, sizeof(fin_path), "%s|%s", st->out_csv, st->events_csv);
+            } else {
+                snprintf(fin_path, sizeof(fin_path), "%s", st->out_csv);
+            }
+            uint32_t path_len = (uint32_t)strlen(fin_path);
+            if (josim_ipc_send_req(st->sock_fd, JOSIM_IPC_OP_FINALIZE, fin_path, path_len) == 0) {
                 int32_t  status  = 0;
                 uint64_t out_len = 0;
-                uint8_t  resp[16];
+                uint8_t  resp[32];
                 josim_ipc_recv_resp(st->sock_fd, &status, resp, sizeof(resp), &out_len);
             }
             close(st->sock_fd);
@@ -95,6 +156,22 @@ static void dpi_slot_free(josim_dpi_slot_t* st) {
 #ifndef JOSIM_DPI_SOCKET_ONLY
         if (st->session) {
             josim_cosim_finalize(st->session);
+            int64_t n_calls = 0, n_rbs = 0, n_subs = 0;
+            double  ckpt_sec = 0.0;
+            josim_cosim_stats(st->session, &n_calls, &n_rbs, &n_subs, &ckpt_sec);
+            fprintf(stderr, "[josim_spectre_dpi] calls=%lld rollbacks=%lld substeps=%lld ckpt_time_s=%.6f\n",
+                    (long long)n_calls, (long long)n_rbs, (long long)n_subs, ckpt_sec);
+            if (st->out_csv[0]) {
+                dpi_write_traces_csv(st->session, st->out_csv, n_calls, n_rbs, n_subs, ckpt_sec, st->tstep);
+                if (!st->events_csv[0]) {
+                    char ev_path[560];
+                    snprintf(ev_path, sizeof(ev_path), "%s.events.csv", st->out_csv);
+                    dpi_write_events_csv(st->session, ev_path);
+                }
+            }
+            if (st->events_csv[0]) {
+                dpi_write_events_csv(st->session, st->events_csv);
+            }
             josim_session_destroy(st->session);
             st->session = NULL;
         }
@@ -508,6 +585,20 @@ JOSIM_DPI_API double josim_dpi_eval_r(int handle, double t_s, double i_pn) {
     if (josim_dpi_set_input(handle, 0, i_pn) != 0) return JOSIM_DPI_MIN_G;
     if (josim_dpi_eval(handle, t_s) != 0) return JOSIM_DPI_MIN_G;
     return josim_dpi_get_jacobian(handle, 0);
+}
+
+JOSIM_DPI_API int josim_dpi_set_output(int handle, const char* out_csv, const char* events_csv) {
+    josim_dpi_slot_t* st = get_slot(handle);
+    if (!st) return -1;
+    if (out_csv && out_csv[0]) {
+        strncpy(st->out_csv, out_csv, sizeof(st->out_csv) - 1);
+        st->out_csv[sizeof(st->out_csv) - 1] = '\0';
+    }
+    if (events_csv && events_csv[0]) {
+        strncpy(st->events_csv, events_csv, sizeof(st->events_csv) - 1);
+        st->events_csv[sizeof(st->events_csv) - 1] = '\0';
+    }
+    return 0;
 }
 
 JOSIM_DPI_API int josim_dpi_close(int handle) {

@@ -211,7 +211,7 @@ void JoSIM::find_relevant_traces(Input& iObj, Matrix& mObj) {
             }
         }
     }
-    if (!iObj.assertions.empty() || !iObj.jitterSpecs.empty()) {
+    if (!iObj.assertions.empty() || !iObj.jitterSpecs.empty() || !iObj.marginTraces.empty()) {
         auto ensure_assert_phase_trace = [&](std::string rawName) {
             rawName.erase(std::remove(rawName.begin(), rawName.end(), '\"'), rawName.end());
             rawName.erase(std::remove(rawName.begin(), rawName.end(), ' '), rawName.end());
@@ -256,6 +256,9 @@ void JoSIM::find_relevant_traces(Input& iObj, Matrix& mObj) {
         for (const auto& js : iObj.jitterSpecs) {
             ensure_assert_phase_trace(js.trace);
             if (!js.refTrace.empty()) { ensure_assert_phase_trace(js.refTrace); }
+        }
+        for (const auto& mt : iObj.marginTraces) {
+            ensure_assert_phase_trace(mt);
         }
     }
     if (!iObj.measurements.empty()) {

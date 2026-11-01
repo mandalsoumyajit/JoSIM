@@ -503,7 +503,7 @@ Simulator options can be configured in the netlist using the `.option` (or `.opt
 | `.option lumpptl[=0\|1]` | **New (`v2.8`)** | Replaces sub-timestep lossless PTLs ($T_d < 0.5\Delta t$) with matched $L$-$C$ $\pi$-equivalents (disable: `.option nolumpptl`). |
 | `.option minptl=<val>` | **New (`v2.8`)** | Custom delay threshold $T_{d,\min}$ for `.option lumpptl`. |
 | `.option rollback[=0\|1\|2\|window\|stay]` | **New (`v2.8`)** | In-memory rolling checkpoint rollback on $>0.4\pi$ phase jumps (`1`/`window` default, `2`/`stay`, `0`/`.option norollback`). |
-| `.option gpu[=1\|2\|3\|4]` | **New (`v2.8`)** | Enables CUDA GPU solver (`-g [1\|2\|3\|4]`): `1` = Auto, `2` = Hybrid, `3` (`gpumono`/`cusolverrf`) = Tier 3 Monolithic MNA, `4` (`gpunodal`) = Tier 4 Monolithic Nodal. |
+| `.option gpu[=1\|2\|3\|4]` | **New (`v2.8`)** | Enables CUDA GPU solver (`-g [1\|2\|3\|4]`): `1` = Auto, `2` = Hybrid, `3` (`gpumono`/`cusolverrf`) = GPU-Resident Monolithic MNA, `4` (`gpunodal`) = GPU-Resident Monolithic Nodal. |
 | `.option bypass` | **New (`v2.8`)** | Skips `klu_l_tsolve` on quiescent PTL partitions during OpenMP windowed simulation (`-p`). Alias: `.option latency`. |
 | `.option bypasstol=<val>` | **New (`v2.8`)** | Activity threshold for `.option bypass` (default `1e-12`). |
 | `.option mc=<N>` | **New (`v2.8`)** | Executes `N` batched Monte Carlo (`.spread`) trials in one run (`-b <N>`, aliases: `batch`, `runs`). |

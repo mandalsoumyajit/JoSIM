@@ -2,8 +2,8 @@
  * Native ngspice XSPICE Code Model for JoSIM Superconducting Co-Simulation (josim_cosim)
  *
  * Supports:
- *   - Mode A (Step 1 In-Process): Direct calls into libjosim_c.so (server_addr = "")
- *   - Mode B (Step 2 Out-of-Process IPC): UNIX/TCP socket connection to josim-cosim-server
+ *   - Mode A (In-Process): Direct calls into libjosim_c.so (server_addr = "")
+ *   - Mode B (Out-of-Process IPC): UNIX/TCP socket connection to josim-cosim-server
  *   - Multi-port differential conductance (%gd: V in -> I out, dI/dV = G_eq) and
  *     differential resistance (%hd: I in -> V out, dV/dI = R_eq) ports
  *   - Automatic Newton-Raphson same-time re-evaluation and LTE step-rejection rollback

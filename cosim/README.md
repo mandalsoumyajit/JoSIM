@@ -7,13 +7,13 @@ This directory contains the native simulator adapters and ready-to-run hybrid su
 ```text
 cosim/
 ├── ngspice/
-│   ├── josim_cosim_cm.cpp                  # Layer 3A native ngspice XSPICE code model (josim_cosim.cm)
+│   ├── josim_xspice.c                      # Native ngspice XSPICE code model (josim_cosim.cm)
 │   └── examples/
 │       ├── cmos_to_sfq_dff.sp              # 4K Cryo-CMOS DATA/CLOCK drivers -> 2-port RSFQ DFF
 │       ├── ntron_to_cmos_lna.sp            # SFQ-triggered electrothermal nTron -> 2-stage Cryo-CMOS LNA
 │       └── multi_instance_transceiver.sp   # 2 concurrent JoSIM XSPICE partitions + pad filter + Cryo-CMOS LNA
 ├── spectre/
-│   ├── josim_spectre_dpi.cpp               # Layer 3A Cadence Spectre CDS_VA_DPI C bridge (libjosim_spectre_dpi.so)
+│   ├── josim_cosim_dpi.c                   # Cadence Spectre CDS_VA_DPI C bridge (libjosim_spectre_dpi.so)
 │   ├── josim_cosim_port.va                 # Verilog-A boundary port modules (1-port Norton/Thevenin & 2-port)
 │   └── examples/
 │       ├── sfq_dff.cir                     # JoSIM 2-port RSFQ D-Flip-Flop (DRO) subcircuit
@@ -42,10 +42,10 @@ cmake --build /tmp/josim-build -j
 ```
 
 This produces:
-- `/tmp/josim-build/libjosim_c.so` (Layer 1 C API shared library)
-- `/tmp/josim-build/josim-cosim-server` (Layer 2 multiplexed `poll()` UNIX/TCP socket daemon)
-- `/tmp/josim-build/josim_cosim.cm` (Layer 3A `ngspice` XSPICE code model)
-- `/tmp/josim-build/libjosim_spectre_dpi.so` (Layer 3A Cadence Spectre `CDS_VA_DPI` shared library)
+- `/tmp/josim-build/libjosim_c.so` (In-memory C API shared library)
+- `/tmp/josim-build/josim-cosim-server` (Multiplexed `poll()` UNIX/TCP socket daemon)
+- `/tmp/josim-build/josim_cosim.cm` (`ngspice` XSPICE code model)
+- `/tmp/josim-build/libjosim_spectre_dpi.so` (Cadence Spectre `CDS_VA_DPI` shared library)
 
 ### 2. Run `ngspice` XSPICE Co-Simulation Examples
 

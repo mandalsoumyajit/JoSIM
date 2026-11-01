@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-josim_cosim.py - JoSIM / SPICE Co-Simulation Coordinator & IPC Client (Layers 1 & 2)
+josim_cosim.py - JoSIM / SPICE Co-Simulation Coordinator & IPC Client
 
 Provides:
   1. CosimSocketClient & CosimServerProcess:
@@ -8,7 +8,7 @@ Provides:
      over AF_UNIX (`unix:/path`) and AF_INET (`tcp:host:port`, TCP_NODELAY) sockets.
   2. run_ngspice_cosim:
      Executes real `ngspice` with the native `josim_cosim.cm` XSPICE code model
-     in either Step 1 (in-process `libjosim_c.so`) or Step 2 (`josim-cosim-server`
+     in either in-process (`libjosim_c.so`) or out-of-process (`josim-cosim-server`
      UNIX/TCP socket) mode.
   3. parse_ltspice_raw, run_ltspice_branin_cosim, run_ltspice_pwl_cosim:
      Executes real ADI `LTspice.exe -b` in batch mode with double-precision binary
@@ -132,7 +132,7 @@ def find_ltspice_binary() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: Binary IPC Socket Client & Server Process Manager
+# Binary IPC Socket Client & Server Process Manager
 # ---------------------------------------------------------------------------
 class CosimSocketClient:
     """Client for the `josim-cosim-server` binary IPC socket protocol (`JCSM` v1)."""
@@ -678,12 +678,12 @@ def format_inline_pwl(t: np.ndarray, y: np.ndarray) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3B: Unified Co-Simulation Session (In-Process Layer 1 or Socket Layer 2)
+# Unified Co-Simulation Session (In-Process or Socket IPC)
 # ---------------------------------------------------------------------------
 class UnifiedCosimSession:
     """
-    Unified interface wrapping either an in-process `pyjosim.Session` (Layer 1)
-    or an out-of-process `CosimSocketClient` (Layer 2 UNIX/TCP socket).
+    Unified interface wrapping either an in-process `pyjosim.Session`
+    or an out-of-process `CosimSocketClient` (UNIX/TCP socket).
     """
 
     def __init__(
@@ -821,7 +821,7 @@ class UnifiedCosimSession:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3B: Multi-Window Branin Wave Relaxation Coordinator (ngspice & LTspice)
+# Multi-Window Branin Wave Relaxation Coordinator (ngspice & LTspice)
 # ---------------------------------------------------------------------------
 @dataclass
 class BraninPortLink:
@@ -1073,7 +1073,7 @@ def run_ngspice_branin_cosim(
 
 
 # ---------------------------------------------------------------------------
-# Layer 3B: Damped Robin/Thevenin PWL Waveform Relaxation Coordinator
+# Damped Robin/Thevenin PWL Waveform Relaxation Coordinator
 # ---------------------------------------------------------------------------
 @dataclass
 class PWLCosimResult:
@@ -1188,7 +1188,7 @@ def run_ltspice_pwl_cosim(
 
 
 # ---------------------------------------------------------------------------
-# Layer 3B: Cadence Spectre Co-Simulation Runner (Local or BNL Cluster SSH)
+# Cadence Spectre Co-Simulation Runner (Local or BNL Cluster SSH)
 # ---------------------------------------------------------------------------
 @dataclass
 class SpectreCosimResult:
@@ -1366,7 +1366,7 @@ rm -rf {rdir}
 
 
 # ---------------------------------------------------------------------------
-# Layer 3B: Unified CLI (`python3 scripts/josim_cosim.py --config spec.json`)
+# Unified CLI (`python3 scripts/josim_cosim.py --config spec.json`)
 # ---------------------------------------------------------------------------
 def run_cosim_from_config(config: Dict) -> Dict:
     """
@@ -1527,7 +1527,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     import argparse
     import json
 
-    parser = argparse.ArgumentParser(description="JoSIM / SPICE Unified Co-Simulation Coordinator (Layer 3B)")
+    parser = argparse.ArgumentParser(description="JoSIM / SPICE Unified Co-Simulation Coordinator")
     parser.add_argument("--config", "-c", required=True, help="Path to co-simulation JSON specification file")
     parser.add_argument("--output-json", "-o", default="", help="Optional path to write JSON summary report")
     args = parser.parse_args(argv)

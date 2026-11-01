@@ -1,17 +1,48 @@
 # Superconducting / Semiconducting SPICE Co-Simulation & In-Memory Python/C API
 
-JoSIM (`v2.8`) includes a generic **4-layer superconducting/semiconducting co-simulation framework** and an **in-memory C/Python API (`libjosim_c` / `pyjosim`)** for simulating hybrid circuits that combine superconducting subsystems (**JoSIM**: RSFQ, AQFP, dc-SQUIDs, SNSPDs, and electrothermal `nTron`/`hTron` nanowires) with semiconducting Cryo-CMOS / SiGe / III-V circuits in **`ngspice`**, **ADI `LTspice`**, and **Cadence Spectre / APS / Spectre X**.
+JoSIM (`v2.8`) includes a modular **superconducting/semiconducting co-simulation framework** and an **in-memory C/Python API (`libjosim_c` / `pyjosim`)** for simulating hybrid cryogenic circuits that combine superconducting subsystems (**JoSIM**: RSFQ, AQFP, dc-SQUIDs, SNSPDs, and electrothermal `nTron`/`hTron` nanowires) with semiconducting Cryo-CMOS / SiGe / III-V circuits in **`ngspice`**, **ADI `LTspice`**, and **Cadence Spectre / APS / Spectre X**.
 
 ---
 
-## 1. Four-Layer Co-Simulation Architecture
+## 1. Co-Simulation Architecture & Block Diagram
 
-| Layer | Component | Target Simulators / Use Cases | Key Files |
-| :---: | :--- | :--- | :--- |
-| **Layer 1** | **In-Memory C/Python Core Stepping, Exact KLU Norton Jacobian & Auto-Rollback Engine (`libjosim_c` / `pyjosim`)** | Python optimization loops, custom solvers, in-process lockstep or windowed co-simulation | [`include/JoSIM/josim_c_api.h`](../include/JoSIM/josim_c_api.h), [`src/josim_c_api.cpp`](../src/josim_c_api.cpp), [`scripts/pyjosim.py`](../scripts/pyjosim.py) |
-| **Layer 2** | **Multiplexed IPC Socket Daemon (`josim-cosim-server`) & `ngspice` XSPICE Code Model (`josim_cosim.cm`)** | Out-of-process UNIX (`AF_UNIX`) & TCP (`AF_INET`) multi-instance co-simulation; native `ngspice` MNA lockstep coupling | [`include/JoSIM/josim_cosim_ipc.h`](../include/JoSIM/josim_cosim_ipc.h), [`src/josim_cosim_server.cpp`](../src/josim_cosim_server.cpp), [`cosim/ngspice/josim_xspice.c`](../cosim/ngspice/josim_xspice.c) |
-| **Layer 3A** | **Cadence Spectre `CDS_VA_DPI` / DPI-C Adapter (`libjosim_spectre_dpi.so` + `josim_cosim_port.va`)** | Native Cadence Spectre (`-cds_va_dpi`) and Xcelium AMS (`DPI-C`) lockstep co-simulation with `dcOp dc` (`skipdc=no`) | [`include/JoSIM/josim_spectre_dpi.h`](../include/JoSIM/josim_spectre_dpi.h), [`cosim/spectre/josim_cosim_dpi.c`](../cosim/spectre/josim_cosim_dpi.c), [`cosim/spectre/josim_cosim_port.va`](../cosim/spectre/josim_cosim_port.va), [`cosim/spectre/run_spectre_cosim.sh`](../cosim/spectre/run_spectre_cosim.sh) |
-| **Layer 3B** | **Multi-Window Branin, Iterative PWL (`LTspice`), Spectre Runner & Unified CLI (`scripts/josim_cosim.py`)** | Multi-window causal Branin wave relaxation, `LTspice.exe -b` `.raw` coupling, remote SSH Spectre runner, and JSON CLI | [`scripts/josim_cosim.py`](../scripts/josim_cosim.py) |
+```mermaid
+flowchart TB
+    subgraph SPICE["Semiconducting SPICE Simulators (4K Cryo-CMOS / SiGe / BiCMOS)"]
+        direction LR
+        SPECTRE["<b>Cadence Spectre / APS / Spectre X</b><br/><code>josim_cosim_port.va</code><br/>+ <code>libjosim_spectre_dpi.so</code> (<code>-cds_va_dpi</code>)"]
+        NGSPICE["<b>ngspice</b><br/>Native XSPICE Code Model<br/><code>josim_cosim.cm</code> (<code>%gd</code> ports)"]
+        LTSPICE["<b>ADI LTspice / Batch SPICE</b><br/>Multi-Window Branin Wave &amp; Damped PWL<br/><code>scripts/josim_cosim.py</code>"]
+        PYAPP["<b>Python / C Flows</b><br/><code>pyjosim</code> &amp; <code>libjosim_c</code><br/>Zero-Copy NumPy &amp; AST Sessions"]
+    end
+
+    subgraph TRANSPORT["Boundary Coupling & Transport"]
+        direction LR
+        INPROC["<b>In-Process Shared Library</b><br/>Direct C ABI calls into <code>libjosim_c.so</code>"]
+        SERVER["<b>Multiplexed Co-Simulation Server</b><br/><code>josim-cosim-server</code> (<code>poll()</code> UNIX / TCP Sockets)<br/>Hosts 1..N Concurrent Superconducting Partitions"]
+    end
+
+    subgraph JOSIM["JoSIM Superconducting Engine (Phase / Voltage MNA + Nodal KLU)"]
+        direction LR
+        PORT["<b>Exact KLU Boundary Companion</b><br/>• Driving-Point Norton: I_p(V_p) &amp; G_eq = dI_p/dV_p<br/>• Driving-Point Thevenin: V_p(I_p) &amp; R_eq = dV_p/dI_p<br/>• Branin Wave Port: w_in(t) = 2 b(t - Td) (Z0, Td)"]
+        CKPT["<b>2-Slot State Rollback Ring</b><br/><code>ckpt_committed</code> (t_n) &amp; <code>ckpt_eval</code> (t_{n+1})<br/>• Same-time NR re-evaluation<br/>• Automatic SPICE LTE step-rejection rollback"]
+        PHYS["<b>Superconducting Device Physics</b><br/>• RCSJ Josephson Junctions (<code>B</code>, RTYPE=0/1, Thermal Noise)<br/>• Electrothermal Nanowires (<code>N</code>: nTron / hTron / SNSPD)<br/>• Coupled Inductors (<code>L</code>, <code>K</code>) &amp; Lossy/Lossless PTLs (<code>T</code>)"]
+    end
+
+    SPECTRE --> INPROC & SERVER
+    NGSPICE --> INPROC & SERVER
+    LTSPICE --> INPROC & SERVER
+    PYAPP --> INPROC
+    INPROC & SERVER --> PORT
+    PORT <--> CKPT <--> PHYS
+```
+
+| Architectural Component | Target Simulators / Use Cases | Key Files |
+| :--- | :--- | :--- |
+| **In-Memory C/Python Core Stepping, Exact KLU Norton Jacobian & Auto-Rollback Engine (`libjosim_c` / `pyjosim`)** | Python optimization loops, custom solvers, in-process lockstep or windowed co-simulation | [`include/JoSIM/josim_c_api.h`](../include/JoSIM/josim_c_api.h), [`src/josim_c_api.cpp`](../src/josim_c_api.cpp), [`scripts/pyjosim.py`](../scripts/pyjosim.py) |
+| **Multiplexed IPC Socket Daemon (`josim-cosim-server`) & `ngspice` XSPICE Code Model (`josim_cosim.cm`)** | Out-of-process UNIX (`AF_UNIX`) & TCP (`AF_INET`) multi-instance co-simulation; native `ngspice` MNA lockstep coupling | [`include/JoSIM/josim_cosim_ipc.h`](../include/JoSIM/josim_cosim_ipc.h), [`src/josim_cosim_server.cpp`](../src/josim_cosim_server.cpp), [`cosim/ngspice/josim_xspice.c`](../cosim/ngspice/josim_xspice.c) |
+| **Cadence Spectre `CDS_VA_DPI` / DPI-C Adapter (`libjosim_spectre_dpi.so` + `josim_cosim_port.va`)** | Native Cadence Spectre (`-cds_va_dpi`) and Xcelium AMS (`DPI-C`) lockstep co-simulation with `dcOp dc` (`skipdc=no`) | [`include/JoSIM/josim_spectre_dpi.h`](../include/JoSIM/josim_spectre_dpi.h), [`cosim/spectre/josim_cosim_dpi.c`](../cosim/spectre/josim_cosim_dpi.c), [`cosim/spectre/josim_cosim_port.va`](../cosim/spectre/josim_cosim_port.va), [`cosim/spectre/run_spectre_cosim.sh`](../cosim/spectre/run_spectre_cosim.sh) |
+| **Multi-Window Branin Wave, Iterative PWL (`LTspice`), Spectre Runner & Unified CLI (`scripts/josim_cosim.py`)** | Multi-window causal Branin wave relaxation, `LTspice.exe -b` `.raw` coupling, remote SSH Spectre runner, and JSON CLI | [`scripts/josim_cosim.py`](../scripts/josim_cosim.py) |
 
 ### Key Mathematical & Numerical Features
 1. **Exact KLU Driving-Point Norton/Thevenin Jacobian:**
@@ -28,7 +59,7 @@ JoSIM (`v2.8`) includes a generic **4-layer superconducting/semiconducting co-si
 
 ---
 
-## 2. Layer 1: In-Memory Python (`pyjosim`) & C API (`libjosim_c`)
+## 2. In-Memory Python (`pyjosim`) & C API (`libjosim_c`)
 
 ### 2.1 One-Shot & Persistent Session Simulation in Python
 
@@ -93,7 +124,7 @@ with pyjosim.Session() as sess:
 
 ---
 
-## 3. Layer 2: Multiplexed IPC Daemon (`josim-cosim-server`) & `ngspice` XSPICE Code Model (`josim_cosim.cm`)
+## 3. Multiplexed IPC Daemon (`josim-cosim-server`) & `ngspice` XSPICE Code Model (`josim_cosim.cm`)
 
 ### 3.1 `josim-cosim-server` CLI Reference
 
@@ -101,7 +132,7 @@ with pyjosim.Session() as sess:
 
 ```bash
 # Listen on a UNIX domain socket for 2 concurrent SPICE/Spectre subcircuit instances
-josim-cosim-server --unix /tmp/josim_cosim.sock --expected-clients 2 --quiet
+josim-cosim-server --unix /tmp/josim_cosim.sock --max-clients 2 --quiet
 
 # Listen on a TCP socket (port 0 auto-selects an ephemeral port and prints JOSIM_COSIM_PORT=<port>)
 josim-cosim-server --port 0 --once --output cosim_traces.csv
@@ -114,40 +145,46 @@ josim-cosim-server --port 0 --once --output cosim_traces.csv
 | `--netlist <file.cir>` | Optional default netlist pre-loaded for connecting clients. |
 | `--output <file.csv>` | Write finalized JoSIM `.print` waveforms to `<file.csv>` and SFQ events to `<file.csv>.events.csv` upon `FINALIZE`. |
 | `--once` | Exit automatically after the first client disconnects. |
-| `--expected-clients <N>` | Exit automatically after `<N>` concurrent/sequential clients have connected and disconnected. |
+| `--max-clients <N>` / `--expected-clients <N>` | Exit automatically after `<N>` concurrent/sequential clients have connected and disconnected. |
 | `--quiet` | Suppress startup banner messages (prints only `JOSIM_COSIM_PORT=<port>` when `--port` is used). |
 
 ### 3.2 Native `ngspice` XSPICE Code Model (`josim_cosim.cm`)
 
-When built on Linux/WSL (`cmake --build build`), CMake compiles `josim_cosim.cm` from [`cosim/ngspice/josim_xspice.c`](../cosim/ngspice/josim_xspice.c). It supports both **in-process `dlopen("libjosim_c.so")`** (`server_socket=""`) and **IPC socket mode** (`server_socket="/tmp/josim.sock"` or `"tcp:127.0.0.1:54321"`), as well as arbitrary multi-port (`%gd` voltage-input / `%hd` current-output) vector ports:
+When built on Linux/WSL (`cmake --build build`), CMake compiles `josim_cosim.cm` from [`cosim/ngspice/josim_xspice.c`](../cosim/ngspice/josim_xspice.c). It supports both **in-process `dlopen("libjosim_c.so")`** (`server_addr=""`) and **IPC socket mode** (`server_addr="unix:/tmp/josim.sock"` or `"tcp:127.0.0.1:54321"`), as well as arbitrary multi-port (`[%gd(p1 n1) %gd(p2 n2) ...]`) voltage-controlled current ports:
 
 ```spice
-* Load the JoSIM XSPICE code model in ngspice
-.control
-codemodel /tmp/josim-build/josim_cosim.cm
-tran 0.2p 60p
-.endc
-
 * 1-Port JoSIM SFQ/nTron subcircuit coupled to ngspice nodes (nd, 0)
-A_ntron %gd([nd 0]) %hd([nd 0]) josim_ntron_mod
+A_ntron [%gd(nd 0)] josim_ntron_mod
 .model josim_ntron_mod josim_cosim(
-+ netlist="ntron_driver.cir"
-+ port_nodes="nch"
-+ port_modes="0"
-+ analysis_type=1
-+ server_socket="unix:/tmp/josim_cosim.sock"
-+ libjosim_path="/tmp/josim-build/libjosim_c.so"
-+ output_csv="ntron_traces.csv"
++ netlist="cosim/spectre/examples/ntron_driver.cir"
++ pos_nodes=["nd"]
++ neg_nodes=["0"]
++ port_modes=[0]
++ phase_mode=1
++ server_addr=""
++ out_csv="ntron_traces.csv"
 + )
 
-* 2-Port JoSIM subcircuit (Port 1 = din, Port 2 = clk)
-A_dff %gd([din 0 clk 0]) %hd([din 0 clk 0]) josim_dff_mod
-.model josim_dff_mod josim_cosim(netlist="rsfq_dff.cir" port_nodes="ndin,nclk" port_modes="0,0")
+* 2-Port JoSIM subcircuit (Port 1 = sfq_set, Port 2 = sfq_ro)
+A_dff [%gd(sfq_set 0) %gd(sfq_ro 0)] josim_dff_mod
+.model josim_dff_mod josim_cosim(
++ netlist="cosim/spectre/examples/sfq_dff.cir"
++ pos_nodes=["n_set" "n_ro"]
++ neg_nodes=["0" "0"]
++ port_modes=[0 0]
++ )
+
+* Load the JoSIM XSPICE code model and run transient analysis in ngspice
+.control
+pre_codemodel /tmp/josim-build/josim_cosim.cm
+set wr_singlescale
+tran 0.2p 60p
+.endc
 ```
 
 ---
 
-## 4. Layer 3A: Cadence Spectre `CDS_VA_DPI` / DPI-C Adapter (`cosim/spectre/`)
+## 4. Cadence Spectre `CDS_VA_DPI` / DPI-C Adapter (`cosim/spectre/`)
 
 ### 4.1 Using `libjosim_spectre_dpi.so` + `josim_cosim_port.va` in Cadence Spectre
 
@@ -208,7 +245,7 @@ tran1 tran stop=60p step=0.2p maxstep=0.2p errpreset=conservative
 
 ---
 
-## 5. Layer 3B: Multi-Window Branin, Iterative PWL (`LTspice`) & Unified CLI (`scripts/josim_cosim.py`)
+## 5. Multi-Window Branin Wave, Iterative PWL (`LTspice`) & Unified CLI (`scripts/josim_cosim.py`)
 
 ### 5.1 Multi-Window Causal Branin Wave Relaxation (`LTspice` & `ngspice`)
 
@@ -218,8 +255,8 @@ When coupling `LTspice.exe -b` or `ngspice -b` to JoSIM across one or more trans
 from josim_cosim import BraninPortLink, run_ltspice_branin_cosim
 
 links = [
-    BraninPortLink("TX", "n_rx_port", "0", z0=50.0, td=15e-12, spice_v_expr="v(tx_port)", spice_i_expr="i(R_tx_z0)"),
-    BraninPortLink("RX", "n_tx_port", "0", z0=50.0, td=15e-12, spice_v_expr="v(rx_port)", spice_i_expr="i(R_rx_z0)"),
+    BraninPortLink("n_rx_port", "0", spice_port_trace="v(tx_port)", spice_pwl_placeholder="{PWL_WIN_TX}", z0=50.0, td=15e-12),
+    BraninPortLink("n_tx_port", "0", spice_port_trace="v(rx_port)", spice_pwl_placeholder="{PWL_WIN_RX}", z0=50.0, td=15e-12),
 ]
 res = run_ltspice_branin_cosim(
     ltspice_template_str,
@@ -227,7 +264,7 @@ res = run_ltspice_branin_cosim(
     links=links,
     t_stop=60e-12,
     window_size=10e-12,         # W = 10 ps <= Td = 15 ps -> 6 causal windows
-    endpoint="inproc",          # or "/tmp/josim.sock" / "tcp:127.0.0.1:54321"
+    endpoint="inproc",          # or "unix:/tmp/josim.sock" / "tcp:127.0.0.1:54321"
     spice_vectors=["v(tx_port)", "v(rx_out)"],
     josim_trace_names=["P(B_RX1)", "P(B_RX2)"],
 )

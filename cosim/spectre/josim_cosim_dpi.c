@@ -1,7 +1,7 @@
 // Copyright (c) 2026 JoSIM Developers
 // This file is part of JoSIM. Details are in the LICENSE file.
 //
-// Layer 3A: Cadence Spectre Verilog-A (CDS_VA_DPI) & IEEE 1800 SystemVerilog (DPI-C)
+// Cadence Spectre Verilog-A (CDS_VA_DPI) & IEEE 1800 SystemVerilog (DPI-C)
 // Co-Simulation Shared Library Implementation (libjosim_spectre_dpi.so).
 
 #include "JoSIM/josim_spectre_dpi.h"

@@ -2,7 +2,7 @@
 # Copyright (c) 2026 JoSIM Developers
 # This file is part of JoSIM. Details are in the LICENSE file.
 #
-# Layer 3A Helper Script: Run Cadence Spectre with JoSIM Co-Simulation
+# Helper Script: Run Cadence Spectre with JoSIM Co-Simulation
 # Works on BNL cluster ASIC hosts (asic1..asic10, pmos) and local Linux workstations.
 #
 # Usage:

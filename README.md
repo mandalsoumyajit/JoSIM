@@ -3,19 +3,11 @@
 
 ---
 
-## Full Documentation
-
-- **Upstream Documentation:** [JoSIM Documentation](https://joeydelp.github.io/JoSIM)
-- **Fork Usage, Options & Benchmark Guide:** [**`docs/usage_and_benchmarks.md`**](docs/usage_and_benchmarks.md)
-- **SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`) & Python API:** [**`docs/cosimulation.md`**](docs/cosimulation.md)
-- **Netlist Syntax & `.option` Reference:** [**`docs/syntax.md`**](docs/syntax.md)
-- **GPU & Nodal Solver Architecture:** [**`docs/gpu_architecture.md`**](docs/gpu_architecture.md)
-
 ## Overview
 
 JoSIM was developed under IARPA contract SuperTools (via the U.S. Army Research Office grant W911NF-17-1-0120).
 
-JoSIM is a SPICE syntax circuit simulator specifically created to handle superconducting elements such as the Josephson junction. It reads in a standard SPICE deck, creates an $A$ matrix and solves the linear algebra problem $Ax=b$ using SuiteSparse KLU (or `cuSolverRF` on GPU). JoSIM builds both a command-line executable (`josim-cli`) and a C++ library (`libjosim`), and outputs results in text formats (`.csv`, `.dat`, `.raw`) or high-speed binary formats (`.npy`, `.bin`, `.rawb`).
+JoSIM is a SPICE-syntax circuit simulator created to simulate superconducting integrated circuits containing Josephson junctions (`B`), superconducting nanowires/cryotrons (`N`), coupled inductors (`L`, `K`), and passive transmission lines (`T`). It reads a standard SPICE deck, constructs the Modified Nodal Analysis (MNA) or reduced Nodal Admittance system $Ax=b$, and solves it using SuiteSparse KLU on CPU or `cuSolverRF` / warp-parallel kernels on NVIDIA GPUs. JoSIM builds a command-line executable (`josim-cli`), a C++/C shared library (`libjosim` / `libjosim_c`), a Python interface (`pyjosim`), and native SPICE co-simulation adapters (`josim_cosim.cm` for `ngspice`, `libjosim_spectre_dpi.so` for Cadence Spectre, and `josim-cosim-server`).
 
 Referencing: [JoSIM — Superconductor SPICE Simulator](https://ieeexplore.ieee.org/document/8633946/)
 
@@ -23,6 +15,100 @@ If you find this tool useful, you can help keep it alive by \
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/joeydelp) \
 or via \
 [![](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&logo=GitHub&color=%23fe8e86)](https://github.com/sponsors/JoeyDelp)
+
+---
+
+## Documentation Structure & Guide
+
+The documentation is organized by workflow so you can jump directly to netlist syntax, solver flags, GPU architecture, or hybrid SPICE co-simulation:
+
+| Document | Scope & Key Topics |
+| :--- | :--- |
+| [**`docs/index.md`**](docs/index.md) | **Getting Started & Build Guide:** Dependencies, CMake build instructions (Linux, WSL, macOS, Windows), OpenMP (`-DUSING_OPENMP=ON`) and CUDA (`-DUSING_CUDA=ON`) compilation. |
+| [**`docs/syntax.md`**](docs/syntax.md) | **Netlist Syntax & Control Reference:** Device cards (`B`, `N` `nTron`/`hTron`/`SNSPD`, `L`, `K`, `T`, `R`, `C`, `V`/`I`/`P` with `PAT` & `SFQ`), `.model`, `.subckt`, `.param`, `.option`, `.sweep`, `.margins`, `.sens`, `.assert`, `.meas`, `.jitter`, `.ic`, `.check_loops`, `.iv`, and `.squid`. |
+| [**`docs/ex_usage.md`**](docs/ex_usage.md) | **Practical Examples & Solver Selection:** Step-by-step JTL walkthrough, binary `.npy`/`.bin` loading with [`scripts/josim_io.py`](scripts/josim_io.py), choosing between `-n`, `-p -n`, `-g`, and `-b <N>`, and running SPICE co-simulation decks. |
+| [**`docs/usage_and_benchmarks.md`**](docs/usage_and_benchmarks.md) | **Complete Feature Reference & Benchmarks:** Comprehensive CLI flag and `.option` tables, verification & margin-analysis workflows, and full performance/memory benchmarks across `spec2si-seeqc` and multi-tile RSFQ/AQFP circuits. |
+| [**`docs/cosimulation.md`**](docs/cosimulation.md) | **Superconducting / Semiconducting SPICE Co-Simulation & Python/C API:** Architecture, mathematical formulation, `pyjosim` / `libjosim_c` API, `ngspice` XSPICE, Cadence Spectre `CDS_VA_DPI`, `LTspice` Branin/PWL coordinators, and complete runnable example decks. |
+| [**`cosim/README.md`**](cosim/README.md) | **Co-Simulation Adapters & Example Decks Directory:** Layout and quick-start commands for `cosim/ngspice/examples/`, `cosim/spectre/examples/`, and `cosim/ltspice/examples/`. |
+| [**`docs/gpu_architecture.md`**](docs/gpu_architecture.md) | **Parallel & GPU Solver Architecture:** Mathematical formulation and scaling benchmarks for Windowed PTL Block-Parallel (`-p`, `-g`), Batched Monte Carlo (`-b`), Monolithic `cuSolverRF` (`-g 3`), and Schur-Complement Nodal Admittance (`-n`, `-g 4`). |
+| [**`docs/comp_stamps.md`**](docs/comp_stamps.md) & [**`docs/tech_disc.md`**](docs/tech_disc.md) | **MNA Formulation & Component Stamps:** Detailed derivations of JoSIM's phase-mode and voltage-mode Modified Nodal Analysis stamps and BDF2 integration. |
+
+---
+
+## Highlight: Superconducting / Semiconducting SPICE Co-Simulation
+
+JoSIM provides a general-purpose co-simulation framework for simulating **hybrid cryogenic systems** that combine superconducting electronics (**JoSIM**: RSFQ/ERSFQ/AQFP logic, dc-SQUIDs, SNSPDs, and electrothermal `nTron`/`hTron` nanowires) with semiconducting circuits (**SPICE**: 4K Cryo-CMOS, SiGe HBT, or III-V LNA/driver circuits) in **Cadence Spectre**, **`ngspice`**, and **ADI `LTspice`**.
+
+### Co-Simulation Block Diagram
+
+```mermaid
+flowchart TB
+    subgraph SPICE["Semiconducting SPICE Simulators (4K Cryo-CMOS / SiGe / BiCMOS)"]
+        direction LR
+        SPECTRE["<b>Cadence Spectre / APS / Spectre X</b><br/><code>josim_cosim_port.va</code><br/>+ <code>libjosim_spectre_dpi.so</code> (<code>-cds_va_dpi</code>)"]
+        NGSPICE["<b>ngspice</b><br/>Native XSPICE Code Model<br/><code>josim_cosim.cm</code> (<code>%gd</code> ports)"]
+        LTSPICE["<b>ADI LTspice / Batch SPICE</b><br/>Multi-Window Branin Wave &amp; Damped PWL<br/><code>scripts/josim_cosim.py</code>"]
+        PYAPP["<b>Python / C Flows</b><br/><code>pyjosim</code> &amp; <code>libjosim_c</code><br/>Zero-Copy NumPy &amp; AST Sessions"]
+    end
+
+    subgraph TRANSPORT["Boundary Coupling & Transport"]
+        direction LR
+        INPROC["<b>In-Process Shared Library</b><br/>Direct C ABI calls into <code>libjosim_c.so</code>"]
+        SERVER["<b>Multiplexed Co-Simulation Server</b><br/><code>josim-cosim-server</code> (<code>poll()</code> UNIX / TCP Sockets)<br/>Hosts 1..N Concurrent Superconducting Partitions"]
+    end
+
+    subgraph JOSIM["JoSIM Superconducting Engine (Phase / Voltage MNA + Nodal KLU)"]
+        direction LR
+        PORT["<b>Exact KLU Boundary Companion</b><br/>• Driving-Point Norton: I_p(V_p) &amp; G_eq = dI_p/dV_p<br/>• Driving-Point Thevenin: V_p(I_p) &amp; R_eq = dV_p/dI_p<br/>• Branin Wave Port: w_in(t) = 2 b(t - Td) (Z0, Td)"]
+        CKPT["<b>2-Slot State Rollback Ring</b><br/><code>ckpt_committed</code> (t_n) &amp; <code>ckpt_eval</code> (t_{n+1})<br/>• Same-time NR re-evaluation<br/>• Automatic SPICE LTE step-rejection rollback"]
+        PHYS["<b>Superconducting Device Physics</b><br/>• RCSJ Josephson Junctions (<code>B</code>, RTYPE=0/1, Thermal Noise)<br/>• Electrothermal Nanowires (<code>N</code>: nTron / hTron / SNSPD)<br/>• Coupled Inductors (<code>L</code>, <code>K</code>) &amp; Lossy/Lossless PTLs (<code>T</code>)"]
+    end
+
+    SPECTRE --> INPROC & SERVER
+    NGSPICE --> INPROC & SERVER
+    LTSPICE --> INPROC & SERVER
+    PYAPP --> INPROC
+    INPROC & SERVER --> PORT
+    PORT <--> CKPT <--> PHYS
+```
+
+```text
++---------------------------------------------------------------------------------------------------+
+|                   SEMICONDUCTING SPICE SIMULATORS (4K Cryo-CMOS / SiGe / BiCMOS)                  |
+|                                                                                                   |
+|  +-----------------------------+  +-----------------------------+  +---------------------------+  |
+|  |   Cadence Spectre / APS     |  |          ngspice            |  |       ADI LTspice         |  |
+|  |  josim_cosim_port.va        |  |  XSPICE josim_cosim.cm      |  |  Multi-Window Branin Wave |  |
+|  |  + libjosim_spectre_dpi.so  |  |  A_x [%gd(p1 n1 ...)] mod   |  |  & Damped PWL Relaxation  |  |
+|  +--------------+--------------+  +--------------+--------------+  +-------------+-------------+  |
++-----------------|--------------------------------|-------------------------------|----------------+
+                  | Lockstep V(t) -> I_hist, G_eq  | Lockstep V(t) -> I(V), dI/dV  | Windowed Wave /
+                  | (with DC OP & LTE Rollback)    | (with NR & LTE Rollback)      | PWL Companion
+                  v                                v                               v
++---------------------------------------------------------------------------------------------------+
+|            IN-PROCESS C API (libjosim_c.so)   OR   MULTIPLEXED IPC DAEMON (josim-cosim-server)    |
+|                        (Supports 1..N Concurrent JoSIM Subcircuit Partitions)                     |
++---------------------------------------------------------------------------------------------------+
+                                                   |
+                                                   v
++---------------------------------------------------------------------------------------------------+
+|                                 JoSIM SUPERCONDUCTING SOLVER CORE                                 |
+|  * Exact KLU Driving-Point Norton/Thevenin Jacobian (G_eq = dI_p/dV_p via A * u_p = e_p)          |
+|  * Two-Slot Checkpoint Ring (ckpt_committed, ckpt_eval) for NR Iteration & SPICE Step Rollback    |
+|  * Full RCSJ JJs (B), Electrothermal Nanowires (N: nTron/hTron/SNSPD), Mutual L/K, and PTLs (T)   |
++---------------------------------------------------------------------------------------------------+
+```
+
+### Co-Simulation Highlights & Ready-to-Run Example Decks
+- **Lockstep Native MNA Coupling (`ngspice` & Cadence Spectre):** Stamps JoSIM's exact KLU driving-point Norton conductance $G_{\text{eq}} = \partial I_p / \partial V_p$ and companion current directly into the SPICE Jacobian at every Newton–Raphson iteration, with automatic state rollback whenever SPICE rejects a timestep due to local truncation error (LTE).
+- **Windowed Branin Wave & Damped PWL Relaxation (`LTspice` & `ngspice`):** Couples simulators across transmission lines of impedance $Z_0$ and delay $T_d$ over exact causal windows $W \le T_d$ (`BraninWaveWindowCoordinator`), or across direct wire interfaces via damped Robin/Thevenin waveform relaxation (`run_ltspice_pwl_cosim`).
+- **Performance vs. Monolithic Verilog-A (`seeqc_jj3.va`):** Achieves **$3.4\times\text{–}40.8\times$ speedup in `ngspice`** and **$6.53\times$ transient CPU speedup ($2.68\times$ fewer timesteps) in Cadence Spectre 25.1**, while supporting standard Spectre `dcOp dc` (`skipdc=no`), immunity to Spectre `cmin` $\Phi_0$ corruption, and full `RTYPE=1` JJ + electrothermal `nTron` physics.
+- **Runnable Example Decks (`cosim/*/examples/`):**
+  - **`ngspice` (`cosim/ngspice/examples/`):** [`cmos_to_sfq_dff.sp`](cosim/ngspice/examples/cmos_to_sfq_dff.sp), [`ntron_to_cmos_lna.sp`](cosim/ngspice/examples/ntron_to_cmos_lna.sp), [`multi_instance_transceiver.sp`](cosim/ngspice/examples/multi_instance_transceiver.sp)
+  - **Cadence Spectre (`cosim/spectre/examples/`):** [`cryo_cmos_sfq.scs`](cosim/spectre/examples/cryo_cmos_sfq.scs), [`ntron_lna.scs`](cosim/spectre/examples/ntron_lna.scs), [`multi_partition_transceiver.scs`](cosim/spectre/examples/multi_partition_transceiver.scs)
+  - **ADI `LTspice` (`cosim/ltspice/examples/`):** [`branin_duplex_job.json`](cosim/ltspice/examples/branin_duplex_job.json) ([`ltspice_branin_transceiver.cir`](cosim/ltspice/examples/ltspice_branin_transceiver.cir)), [`pwl_lna_job.json`](cosim/ltspice/examples/pwl_lna_job.json) ([`ltspice_pwl_lna.cir`](cosim/ltspice/examples/ltspice_pwl_lna.cir))
+
+See [**`docs/cosimulation.md`**](docs/cosimulation.md) and [**`cosim/README.md`**](cosim/README.md) for full details and example listings.
 
 ---
 
@@ -44,7 +130,7 @@ This repository is an enhanced fork of [`JoeyDelp/JoSIM`](https://github.com/Joe
   8. **High-Speed Binary I/O & New Controls:** `.npy` (NumPy structured array), `.bin` (`JOSIMBIN` float64), `.rawb`, [`scripts/josim_io.py`](scripts/josim_io.py), `.savestate`/`.loadstate` checkpointing, `.option txinterp` fractional PTL interpolation, `.option kcutoff`, `-c` predictor-corrector, and `-f` fixed-step control.
   9. **Automated Critical Operating Margin Finder, OAAT Sensitivity & Digital Verification (`.margins`, `.sens`, `.assert`, `.meas`, `.jitter`):** One-shot batched critical margin discovery (`-M` / `.margins`) and golden event verification (`--verify-events`) with root-cause failure diagnosis (`EXTRA_PULSE`, `MISSING_PULSE`, `TIMING_VIOLATION`); single-batch OAAT central-difference sensitivity and margin centering (`--sens` / `.sens ... CENTER`); digital bitstream/pulse-train sources (`PAT`, `SFQ`) and vector assertions (`.assert` / `-A`); SPICE `.meas` / `.measure` (`--meas`, `--meas-file`) with native `SFQ=k` triggers; and built-in timing jitter, clock skew, and BER analysis (`.jitter` / `.ber`, `-J`).
   10. **Expanded SPICE Netlist Physics & Characterization (`.subckt`, `.ic`, `FLUX=`, `.check_loops`, `T` Loss, `.iv`, `.squid`, `Nanowire` `N`):** Parameterized `.subckt`s, 30+ `.param` math functions, inline `{...}` expressions, wildcard `.print`/`.save`/`.assert` globs (`*`, `?`), initial conditions (`.ic`), static inductor flux offsets (`FLUX=<Phi0>`), topological $\beta_L$ superconducting loop auditor (`.check_loops`, `--check-loops`), lossy transmission lines (`DB=`, `LOSS=`, `ATTEN=`, `ALPHA=`), OpenMP-parallelized model/circuit `.iv` + RF Shapiro steps + 1D/2D `.squid` flux modulation, and native 2-/3-/4-terminal electrothermal superconducting nanowire / cryotron (`nTron` / `hTron` / `SNSPD`) elements (`N...`).
-  11. **In-Memory Python/C API (`pyjosim` / `libjosim_c`) & 4-Layer SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`):** Zero-copy NumPy views and persistent AST sessions (`pyjosim.JoSIMSession`), plus lockstep Norton/Thevenin and windowed Branin co-simulation across **`ngspice`** (`josim_cosim.cm` XSPICE code model), **ADI `LTspice`** (`BraninWaveWindowCoordinator` & `run_ltspice_pwl_cosim`), and **Cadence Spectre 25.1** (`libjosim_spectre_dpi.so` + `josim_cosim_port.va` `-cds_va_dpi` + multiplexed `josim-cosim-server`), achieving **$3.4\times\text{–}40.8\times$ speedup in `ngspice`** and **$6.53\times$ transient CPU speedup in Cadence Spectre 25.1** over monolithic Verilog-A (`seeqc_jj3.va`). See [**`docs/cosimulation.md`**](docs/cosimulation.md).
+  11. **In-Memory Python/C API (`pyjosim` / `libjosim_c`) & Hybrid SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`):** Zero-copy NumPy views and persistent AST sessions (`pyjosim.JoSIMSession`), plus lockstep Norton/Thevenin and windowed Branin co-simulation across **`ngspice`** (`josim_cosim.cm` XSPICE code model), **ADI `LTspice`** (`BraninWaveWindowCoordinator` & `run_ltspice_pwl_cosim`), and **Cadence Spectre 25.1** (`libjosim_spectre_dpi.so` + `josim_cosim_port.va` `-cds_va_dpi` + multiplexed `josim-cosim-server`), achieving **$3.4\times\text{–}40.8\times$ speedup in `ngspice`** and **$6.53\times$ transient CPU speedup in Cadence Spectre 25.1** over monolithic Verilog-A (`seeqc_jj3.va`). See [**`docs/cosimulation.md`**](docs/cosimulation.md).
 
 ---
 
@@ -106,7 +192,7 @@ For the complete CLI and `.option` reference tables and full benchmark suites ac
 - **Automated Critical Operating Margin Finder (`-M` / `.margins`), Golden Event Verifier (`--verify-events`), & Batched OAAT Sensitivity / Margin Centering (`--sens` / `.sens`):** Single-batch critical margin discovery across categories or individual devices (`@DEVICES`), exact temporal SFQ event verification, and OAAT sensitivity / centering.
 - **Digital Pattern (`PAT`) & $\Phi_0$-Quantized (`SFQ`) Sources, Vector Assertions (`.assert` / `-A`), SPICE `.meas` (`--meas`), & Jitter/BER Analyzer (`.jitter` / `-J`):** Built-in digital bitstream/pulse sources, self-checking event assertions, `.meas` with native `SFQ=k` triggers, and sub-timestep latency/jitter/BER analysis.
 - **Expanded SPICE Syntax, Device Physics & Characterization:** Parameterized `.subckt`s, 30+ `.param` math functions, inline `{...}` expressions, wildcard `.print` globs, initial conditions (`.ic`), static inductor flux offsets (`FLUX=`), topological $\beta_L$ loop auditor (`.check_loops` / `--check-loops`), lossy transmission lines (`DB=`, `LOSS=`, `ATTEN=`, `ALPHA=`), OpenMP model/circuit `.iv` + RF Shapiro steps + 1D/2D `.squid` flux modulation, and electrothermal superconducting nanowire / cryotron (`nTron` / `hTron` / `SNSPD`) devices (`N...`).
-- **In-Memory Python/C API (`pyjosim` / `libjosim_c`) & 4-Layer SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`):** Zero-copy NumPy views, persistent AST sessions, multiplexed `josim-cosim-server` daemon, `ngspice` XSPICE code model (`josim_cosim.cm`), Cadence Spectre `CDS_VA_DPI` adapter (`libjosim_spectre_dpi.so` + `josim_cosim_port.va`), and `scripts/josim_cosim.py` multi-window Branin/PWL/Spectre coordinators.
+- **In-Memory Python/C API (`pyjosim` / `libjosim_c`) & Hybrid SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`):** Zero-copy NumPy views, persistent AST sessions, multiplexed `josim-cosim-server` daemon, `ngspice` XSPICE code model (`josim_cosim.cm`), Cadence Spectre `CDS_VA_DPI` adapter (`libjosim_spectre_dpi.so` + `josim_cosim_port.va`), and `scripts/josim_cosim.py` multi-window Branin/PWL/Spectre coordinators.
 - **Zero-Allocation Streaming Binary Output** (`.npy`, `.bin`, `.rawb`), **Built-In SFQ Switching Event & Pulse Metric Extractor** (`-e`, `-E`, `.option events`, `.option eventmetrics`), and Python loader [`scripts/josim_io.py`](scripts/josim_io.py).
 - **Single-Core, Memory & Local Rollback Optimizations:** $O(1)$ hash-map lookups (`deviceMap`, `csMap`), in-place CSR updates + `klu_l_refactor`, self-contained PTL circular ring buffers (`hist_`), in-loop `PRSTART`/`PRSTEP` decimation, homogeneous device arrays, cached `PWL`/`PWS` segments, pre-computed `CUS` splines, and in-memory rolling checkpoints for local step-halving rollback (`.option rollback[=1|2|window|stay]`, `.option norollback`).
 - **New Controls:** `.savestate` / `.loadstate` checkpointing, `.option txinterp` fractional PTL delay interpolation, `.option kcutoff=<val>`, `-c` implicit JJ predictor-corrector, and `-f` / `.option fixedstep` / `.option warnstep`.

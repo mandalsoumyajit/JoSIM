@@ -12,7 +12,6 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <poll.h>
 #include <string>
 #include <vector>
 
@@ -22,6 +21,7 @@ int main() {
     return 1;
 }
 #else
+#include <poll.h>
 
 namespace {
 

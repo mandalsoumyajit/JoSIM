@@ -86,7 +86,7 @@ def _resolve_openvaf_bin() -> Path | None:
 
 
 BUILD_DIR = _resolve_build_dir()
-DPI_SO_PATH = BUILD_DIR / "libjosim_spectre_dpi.so"
+DPI_SO_PATH = Path(os.environ.get("JOSIM_SPECTRE_DPI_LIB") or (BUILD_DIR / "libjosim_spectre_dpi.so"))
 CM_PATH = BUILD_DIR / "josim_cosim.cm"
 SERVER_BIN = BUILD_DIR / "josim-cosim-server"
 SEEQC_REPO = _resolve_seeqc_repo()
@@ -520,8 +520,8 @@ def run_tier1_ngspice_scaling_benchmark() -> dict:
       - 2-port `josim_cosim.cm` returning `jtl_N` to ngspice (`Rload jtl_N 0 5.0` on the ngspice side)
         and checking arrival error vs monolithic JoSIM at 0.025p
     """
-    if OPENVAF_BIN is None or not OPENVAF_BIN.exists() or not SEEQC_VA.exists():
-        return {"passed": True, "skipped": True, "reason": "OpenVAF or seeqc_jj3.va not available"}
+    if OPENVAF_BIN is None or not OPENVAF_BIN.exists() or not SEEQC_VA.exists() or not CM_PATH.exists():
+        return {"passed": True, "skipped": True, "reason": "OpenVAF, seeqc_jj3.va, or josim_cosim.cm not available"}
 
     tmp_dir = Path("/tmp") / f"josim_cmp1_{os.getpid()}"
     tmp_dir.mkdir(parents=True, exist_ok=True)

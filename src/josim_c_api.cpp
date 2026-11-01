@@ -742,6 +742,8 @@ JOSIM_API const double* josim_measurement_trial_values(const josim_session_t* s,
     return vec.empty() ? nullptr : vec.data();
 }
 
+} // extern "C"
+
 namespace {
 
 std::string normalize_node_name(const char* raw) {
@@ -978,6 +980,8 @@ double compute_single_step_port_jacobian(josim_session* s, const CosimPortEntry&
 }
 
 } // namespace
+
+extern "C" {
 
 JOSIM_API int32_t josim_cosim_add_port(
     josim_session_t* s, const char* pos_node, const char* neg_node, int32_t mode, double z0) {

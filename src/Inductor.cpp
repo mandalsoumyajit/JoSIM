@@ -36,10 +36,23 @@ Inductor::Inductor(const std::pair<tokens_t, string_o>& s,
                    Input&                               iObj,
                    Spread&                              spread,
                    int64_t&                             bi) {
-    double spr = 1.0;
-    for (auto i : s.first) {
-        if (i.find("SPREAD=") != std::string::npos) {
-            spr = parse_param(i.substr(i.find("SPREAD=") + 7), iObj.parameters, s.second);
+    double                spr     = 1.0;
+    std::optional<double> fluxVal = std::nullopt;
+    std::optional<double> phiVal  = std::nullopt;
+    for (size_t idx = 4; idx < s.first.size(); ++idx) {
+        const auto& i = s.first.at(idx);
+        if (i.rfind("SPREAD=", 0) == 0) {
+            spr = parse_param(i.substr(7), iObj.parameters, s.second);
+        } else if (i.rfind("FLUX=", 0) == 0) {
+            fluxVal = parse_param(i.substr(5), iObj.parameters, s.second);
+        } else if (i.rfind("PHI0=", 0) == 0) {
+            fluxVal = parse_param(i.substr(5), iObj.parameters, s.second);
+        } else if (i.rfind("PHI=", 0) == 0) {
+            phiVal = parse_param(i.substr(4), iObj.parameters, s.second);
+        } else if (i.rfind("PHIOFF=", 0) == 0) {
+            phiVal = parse_param(i.substr(7), iObj.parameters, s.second);
+        } else if (i.rfind("IC=", 0) == 0) {
+            icCurrent_ = parse_param(i.substr(3), iObj.parameters, s.second);
         }
     }
     at_  = iObj.argAnal;
@@ -57,6 +70,20 @@ Inductor::Inductor(const std::pair<tokens_t, string_o>& s,
     nominalValue_      = parse_param(s.first.at(3), iObj.parameters, s.second);
     spread_            = spr;
     netlistInfo.value_ = spread.spread_value(nominalValue_, Spread::IND, spread_);
+    if (fluxVal.has_value()) {
+        phiOffset_ = 2.0 * Constants::PI * fluxVal.value();
+    } else if (phiVal.has_value()) {
+        phiOffset_ = phiVal.value();
+    }
+    if (icCurrent_.has_value()) {
+        In2_ = In3_ = In4_ = icCurrent_.value();
+        if (!fluxVal.has_value() && !phiVal.has_value() && at_ == AnalysisType::Phase) {
+            phiOffset_ = -(netlistInfo.value_ / Constants::SIGMA) * icCurrent_.value();
+        }
+    } else if (phiOffset_ != 0.0 && netlistInfo.value_ != 0.0 && at_ == AnalysisType::Voltage) {
+        icCurrent_ = -(Constants::SIGMA / netlistInfo.value_) * phiOffset_;
+        In2_ = In3_ = In4_ = icCurrent_.value();
+    }
     // Set the node configuration type
     indexInfo.nodeConfig_   = ncon;
     // Set current index and increment it

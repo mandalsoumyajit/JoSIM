@@ -7,6 +7,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -16,6 +17,7 @@ class LineInput {
   public:
     virtual std::string_view line() = 0;
     virtual bool             next() = 0;
+    virtual ~LineInput()            = default;
 };
 
 class ConsoleInput : public LineInput {
@@ -46,6 +48,18 @@ class FileInput : public LineInput {
     bool             next() override { return bool(std::getline(file_, buffer_)); }
 
     FileInput(const std::string& file) { open(file); }
+};
+
+class StringInput : public LineInput {
+    std::string        buffer_;
+    std::istringstream stream_;
+
+  public:
+    std::string_view line() override { return buffer_; }
+
+    bool             next() override { return bool(std::getline(stream_, buffer_)); }
+
+    explicit StringInput(const std::string& text) : stream_(text) {}
 };
 
 } // namespace JoSIM

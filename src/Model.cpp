@@ -20,8 +20,15 @@ void Model::parse_model(const std::pair<tokens_t, string_o>& s,
     Model temp;
     // The second token is the model label
     temp.modelName(s.first.at(1));
+    // Nanowire / cryotron (.model <name> ntron/htron/snspd/nanowire/cryotron(...)) models are parsed directly by Nanowire
+    const std::string& mtype = s.first.at(2);
+    if (mtype.compare(0, 5, "NTRON") == 0 || mtype.compare(0, 5, "HTRON") == 0 || mtype.compare(0, 5, "SNSPD") == 0 ||
+        mtype.compare(0, 8, "NANOWIRE") == 0 || mtype.compare(0, 8, "CRYOTRON") == 0 ||
+        mtype.compare(0, 4, "CRYO") == 0) {
+        return;
+    }
     // The third token needs to start with "JJ" for this to be valid
-    if (s.first.at(2).compare(0, 2, "JJ") != 0) {
+    if (mtype.compare(0, 2, "JJ") != 0) {
         Errors::model_errors(ModelErrors::UNKNOWN_MODEL_TYPE, Misc::vector_to_string(s.first));
     }
     // Create a temporary tokens variable containing the model parameters

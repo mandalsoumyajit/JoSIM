@@ -52,11 +52,46 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
                 swChar = 'E';
             } else if (swLower.rfind("sweep", 0) == 0) {
                 swChar = 'S';
+            } else if (swLower.rfind("marginfile", 0) == 0 || swLower.rfind("marginsfile", 0) == 0) {
+                swChar = 'F';
+            } else if (swLower.rfind("margintol", 0) == 0 || swLower.rfind("marginstol", 0) == 0) {
+                swChar = 'T';
+            } else if (swLower.rfind("margin", 0) == 0) {
+                swChar = 'M';
+            } else if (swLower.rfind("verifyevent", 0) == 0) {
+                swChar = 'Y';
+            } else if (swLower.rfind("assert", 0) == 0) {
+                swChar = 'A';
+            } else if (swLower.rfind("measfile", 0) == 0 || swLower.rfind("measurefile", 0) == 0) {
+                swChar = 'W';
+            } else if (swLower.rfind("meas", 0) == 0) {
+                swChar = 'Q';
+            } else if (swLower == "ic" || swLower.rfind("initcond", 0) == 0) {
+                swChar = 'I';
+            } else if (swLower.rfind("checkloop", 0) == 0 || swLower.rfind("loopaudit", 0) == 0
+                       || swLower.rfind("loops", 0) == 0) {
+                swChar = 'L';
+            } else if (swLower.rfind("jitterfile", 0) == 0) {
+                swChar = 'K';
+            } else if (swLower.rfind("jitter", 0) == 0) {
+                swChar = 'J';
+            } else if (swLower == "iv") {
+                swChar = 'U';
+            } else if (swLower.rfind("squid", 0) == 0) {
+                swChar = 'Z';
+            } else if (swLower.rfind("sensfile", 0) == 0 || swLower.rfind("sensitivityfile", 0) == 0) {
+                swChar = 'D';
+            } else if (swLower.rfind("sens", 0) == 0) {
+                swChar = 'X';
             }
             ap.emplace_back(std::make_pair(swChar, val));
         } else {
             if (!ap.empty() && !ap.back().second) {
-                if (t.at(0) == '=' && t.size() > 1) {
+                const char prevSw = ap.back().first.value_or('\0');
+                const bool takesNoArg = (prevSw == 'p' || prevSw == 'h' || prevSw == 'v' || prevSw == 'i');
+                if (takesNoArg) {
+                    ap.emplace_back(std::make_pair(std::nullopt, t));
+                } else if (t.at(0) == '=' && t.size() > 1) {
                     ap.back().second = t.substr(1);
                 } else {
                     ap.back().second = t;
@@ -66,7 +101,7 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
             }
         }
     }
-    // Sanity check: if no positional input file was found and the last switch swallowed the input filename
+    // Sanity check: if no positional input file was found and a switch with optional arg swallowed the input filename
     bool hasInput = false;
     for (const auto& kv : ap) {
         if (!kv.first || kv.first.value() == 'i') {
@@ -74,13 +109,35 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
             break;
         }
     }
-    if (!hasInput && !ap.empty() && ap.back().first && ap.back().second) {
-        const char sw = ap.back().first.value();
-        if (sw == 'p' || sw == 'g' || sw == 'n' || sw == 'f' || sw == 'w' || sw == 'm' || sw == 'e' || sw == 'E'
-            || ap.size() == 1) {
-            ap.emplace_back(std::make_pair(std::nullopt, ap.back().second));
-            ap.at(ap.size() - 2).second = std::nullopt;
+    auto looks_like_cir_file = [](const std::string& s) -> bool {
+        if (s.empty() || s.front() == '@') { return false; }
+        std::string ext = std::filesystem::path(s).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".cir" || ext == ".js" || ext == ".inp" || ext == ".sp" || ext == ".net" || ext == ".ckt") {
+            return true;
         }
+        return false;
+    };
+    if (!hasInput) {
+        for (size_t idx = ap.size(); idx > 0; --idx) {
+            auto& kv = ap[idx - 1];
+            if (!kv.first || !kv.second) { continue; }
+            const char sw = kv.first.value();
+            if (sw == 'p' || sw == 'g' || sw == 'n' || sw == 'f' || sw == 'w' || sw == 'm' || sw == 'e' || sw == 'E'
+                || sw == 'M' || sw == 'L' || sw == 'J' || sw == 'X') {
+                if (idx == ap.size() || looks_like_cir_file(kv.second.value())) {
+                    const std::string cirName = kv.second.value();
+                    kv.second                 = std::nullopt;
+                    ap.emplace_back(std::make_pair(std::nullopt, cirName));
+                    hasInput = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!hasInput && ap.size() == 1 && ap.back().first && ap.back().second) {
+        ap.emplace_back(std::make_pair(std::nullopt, ap.back().second));
+        ap.at(ap.size() - 2).second = std::nullopt;
     }
     return ap;
 }
@@ -174,7 +231,109 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                     break;
                     // Enable Schur-complement nodal admittance solver
                 case 'n':
-                    out.nodal = (i.second.value_or("1") != "0");
+                    out.nodal         = (i.second.value_or("1") != "0");
+                    out.explicitNodal = true;
+                    break;
+                    // Automated Critical Margin Finder
+                case 'M':
+                    out.margins = true;
+                    if (i.second && !i.second.value().empty()) {
+                        const std::string& mval = i.second.value();
+                        std::string        ext  = std::filesystem::path(mval).extension().string();
+                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                        if ((ext == ".csv" || ext == ".txt" || ext == ".npy") && mval.find(':') == std::string::npos
+                            && mval.front() != '@') {
+                            out.margin_file = mval;
+                        } else {
+                            out.margin_specs.push_back(mval);
+                        }
+                    }
+                    break;
+                    // Margin report output CSV file
+                case 'F':
+                    out.margins = true;
+                    if (i.second && !i.second.value().empty()) { out.margin_file = i.second.value(); }
+                    break;
+                    // Margin / event verification timing tolerance (in seconds)
+                case 'T':
+                    if (i.second && !i.second.value().empty()) {
+                        std::string s = i.second.value();
+                        std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+                        const double v = Misc::modifier(s);
+                        if (std::isfinite(v) && v >= 0.0) { out.margin_tol = v; }
+                    }
+                    break;
+                    // Verify simulation SFQ events against a golden .events.csv / .events.npy file
+                case 'Y':
+                    if (i.second && !i.second.value().empty()) { out.verify_events_file = i.second.value(); }
+                    break;
+                    // Digital vector / SFQ event assertion
+                case 'A':
+                    if (i.second && !i.second.value().empty()) { out.assertions.push_back(i.second.value()); }
+                    break;
+                    // SPICE .meas / .measure directive from CLI
+                case 'Q':
+                    if (i.second && !i.second.value().empty()) { out.measurements.push_back(i.second.value()); }
+                    break;
+                    // Measurement report CSV file
+                case 'W':
+                    if (i.second && !i.second.value().empty()) { out.meas_file = i.second.value(); }
+                    break;
+                    // Initial condition (.ic) from CLI
+                case 'I':
+                    if (i.second && !i.second.value().empty()) { out.initial_conditions.push_back(i.second.value()); }
+                    break;
+                    // Topological beta_L superconducting loop auditor
+                case 'L':
+                    out.check_loops = true;
+                    if (i.second && !i.second.value().empty() && i.second.value() != "1"
+                        && i.second.value() != "true" && i.second.value() != "TRUE") {
+                        if (i.second.value() == "0" || i.second.value() == "false" || i.second.value() == "FALSE") {
+                            out.check_loops = false;
+                        } else {
+                            out.loop_file = i.second.value();
+                        }
+                    }
+                    break;
+                    // Timing jitter, skew & BER analyzer (-J / --jitter)
+                case 'J':
+                    if (i.second && !i.second.value().empty()) {
+                        out.jitter_specs.push_back(i.second.value());
+                    } else {
+                        out.jitter_specs.push_back("B*");
+                    }
+                    break;
+                    // Jitter report CSV file (--jitter-file)
+                case 'K':
+                    if (i.second && !i.second.value().empty()) { out.jitter_file = i.second.value(); }
+                    break;
+                    // I-V / Shapiro curve spec (--iv)
+                case 'U':
+                    if (i.second && !i.second.value().empty()) { out.iv_specs.push_back(i.second.value()); }
+                    break;
+                    // SQUID 1D/2D flux modulation spec (--squid)
+                case 'Z':
+                    if (i.second && !i.second.value().empty()) { out.squid_specs.push_back(i.second.value()); }
+                    break;
+                    // Batched OAAT Sensitivity & Automated Margin Centering (--sens)
+                case 'X':
+                    out.sens = true;
+                    if (i.second && !i.second.value().empty()) {
+                        const std::string& sval = i.second.value();
+                        std::string        ext  = std::filesystem::path(sval).extension().string();
+                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                        if ((ext == ".csv" || ext == ".json" || ext == ".txt") && sval.find(':') == std::string::npos
+                            && sval.find('=') == std::string::npos && sval.front() != '@') {
+                            out.sens_file = sval;
+                        } else {
+                            out.sens_specs.push_back(sval);
+                        }
+                    }
+                    break;
+                    // Sensitivity report output CSV/JSON file (--sens-file)
+                case 'D':
+                    out.sens = true;
+                    if (i.second && !i.second.value().empty()) { out.sens_file = i.second.value(); }
                     break;
                     // Show help menu
                 case 'h':
@@ -404,6 +563,21 @@ void CliOptions::display_help() {
               << "Specifies a deterministic parameter or margin sweep (1D or 2D Cartesian)." << std::endl;
     std::cout << std::setw(16) << std::left << "--sweep=" << std::setw(3) << std::left << "|"
               << "Examples: -S @BIAS:MARGIN:0.3:21, -S @BIAS:0.7:1.3:0.05, -S Scaling:0.8:1.2:9." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // Automated Critical Margin Finder & Event Verifier
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "-M" << std::setw(3) << std::left << "|"
+              << "Runs one-shot batched critical operating margin analysis across multiple targets." << std::endl;
+    std::cout << std::setw(16) << std::left << "--margins=" << std::setw(3) << std::left << "|"
+              << "Default targets: @BIAS,@JJ,@IND,@RES (+/-50%, 21 pts). Use @DEVICES or @DEVICES|X0" << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
+              << "to rank every device individually (e.g. -M @DEVICES:0.4:21, --margin-file=margins.csv)." << std::endl;
+    std::cout << std::setw(16) << std::left << "--margin-tol=" << std::setw(3) << std::left << "|"
+              << "Timing tolerance for exact SFQ event-sequence verification (default: 50p)." << std::endl;
+    std::cout << std::setw(16) << std::left << "--verify-events=" << std::setw(3) << std::left << "|"
+              << "Verifies simulated SFQ event sequence & timestamps against a golden .csv/.npy file." << std::endl;
+    std::cout << std::setw(16) << std::left << "-A / --assert=" << std::setw(3) << std::left << "|"
+              << "Verifies digital SFQ event assertions (e.g. -A \"B2|X0:BITS=0101:TD=10p:PER=20p\")." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Verbose switch
     // ---------------------------------------------------------------------------

@@ -1,0 +1,28 @@
+// Cadence Spectre + JoSIM Co-Simulation Example 2:
+// Superconducting nTron Electrothermal Nanowire Driving a 4K Cryo-CMOS LNA
+simulator lang=spectre
+global 0
+
+ahdl_include "libjosim_spectre_dpi.so" -cds_va_dpi
+ahdl_include "josim_cosim_port.va"
+
+model nch_4k bsim4 type=n vth0=0.22 u0=0.085 tox=1.8e-9
+model pch_4k bsim4 type=p vth0=-0.22 u0=0.045 tox=1.8e-9
+
+Vdd (vdd 0) vsource dc=1.0
+
+// 1-Port JoSIM nTron Subsystem (Channel node "nd" exposed to Spectre)
+Xntron (nd 0) josim_cosim_port_norton \
+    netlist="ntron_driver.cir" port_nodes="nd" port_modes="0"
+
+// AC-Coupled 4K Cryo-CMOS Common-Source LNA
+Ccouple (nd vg)    capacitor c=500f
+Rbias1  (vdd vg)   resistor  r=60k
+Rbias2  (vg 0)     resistor  r=22k
+Mn_lna  (vout vg 0 0) nch_4k w=32u l=65n
+Rload   (vdd vout) resistor  r=400
+Cload   (vout 0)   capacitor c=10f
+
+dcOp dc
+tran1 tran stop=120p step=0.5p maxstep=0.5p errpreset=conservative
+save nd vg vout

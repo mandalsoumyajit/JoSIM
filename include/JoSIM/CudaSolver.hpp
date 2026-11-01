@@ -128,6 +128,7 @@ struct GpuTxHistEntry {
 
 struct GpuTxLine {
     double  z0          = 0.0;
+    double  atten       = 1.0;
     int64_t k           = 1;
     double  fracDelay   = 0.0;
     int64_t loadedSteps = 0;

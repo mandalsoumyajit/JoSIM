@@ -37,10 +37,10 @@ int main(int argc, const char** argv) {
         iObj.netlist.expand_subcircuits();
         // Expand main design using expanded subcircuits
         iObj.netlist.expand_maindesign();
-        // Simulate IV curves if need be
-        IV ivObj(iObj);
         // Identify the simulation parameters
         Transient::identify_simulation(iObj.controls, iObj.transSim, iObj.parameters);
+        // Simulate IV and SQUID curves if need be
+        IV ivObj(iObj);
         // Create matrix object
         Matrix mObj;
         // Create the matrix in csr format

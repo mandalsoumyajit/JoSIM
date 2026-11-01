@@ -1,0 +1,33 @@
+* Test PAT() digital pattern source (RZ + hex pattern) with LSmitll_DCSFQ and .assert
+.tran 0.25p 220p 0 0.25p 0 UIC
+I1 0 1 pat(0 600u 10p 2p 2p 1p 20p 0xB4)
+R1 2 0 2
+X1 1 2 LSmitll_DCSFQ
+.subckt LSmitll_DCSFQ IN OUT
+B0 3 4 15 jjmit area=2.25
+B1 5 10 16 jjmit area=2.25
+B2 6 12 17 jjmit area=2.5
+I0 0 7 pwl(0 0 5p 275u)
+I1 0 8 pwl(0 0 5p 175u)
+L0 7 4 0.2p
+L1 8 6 0.2p
+L2 IN 9 1p
+L3 9 3 0.6p
+L4 4 5 1.1p
+L5 5 6 4.5p
+L6 6 OUT 2p
+L7 9 0 3.9p
+L8 14 4 1p
+L9 10 0 0.2p
+L10 11 0 1p
+L11 12 0 0.2p
+L12 13 0 1p
+R0 5 11 3.048846408
+R1 6 13 2.743961767
+R2 3 14 3.048846408
+.ends LSmitll_DCSFQ
+.model jjmit jj(rtype=1, vg=2.6mV, cap=0.07pF, r0=160, rn=16, icrit=0.1mA)
+* 0xB4 = 10110100
+.assert B2|X1 td=10p per=20p bits=10110100
+.assert B2|X1 count=4
+.end

@@ -9,10 +9,85 @@
 #include "JoSIM/Misc.hpp"
 #include "JoSIM/ProgressBar.hpp"
 
+#include <algorithm>
 #include <cstring> // for strcmp
 #include <thread>
 
 using namespace JoSIM;
+
+namespace {
+
+tokens_t normalize_subckt_call_tokens(const tokens_t& raw) {
+    if (raw.empty()) { return {}; }
+    tokens_t balanced;
+    balanced.push_back(raw.front());
+    for (size_t i = 1; i < raw.size(); ++i) {
+        if (raw[i] == "PARAMS:" || raw[i] == "PARAM:") { continue; }
+        std::string cur   = raw[i];
+        int         depth = 0;
+        for (char c : cur) {
+            if (c == '(' || c == '{' || c == '[') {
+                ++depth;
+            } else if (c == ')' || c == '}' || c == ']') {
+                --depth;
+            }
+        }
+        while (depth > 0 && i + 1 < raw.size()) {
+            ++i;
+            cur += raw[i];
+            for (char c : raw[i]) {
+                if (c == '(' || c == '{' || c == '[') {
+                    ++depth;
+                } else if (c == ')' || c == '}' || c == ']') {
+                    --depth;
+                }
+            }
+        }
+        balanced.push_back(std::move(cur));
+    }
+
+    tokens_t merged;
+    merged.push_back(balanced.front());
+    for (size_t i = 1; i < balanced.size(); ++i) {
+        if (balanced[i] == "=" && merged.size() > 1 && i + 1 < balanced.size()) {
+            merged.back() += "=" + balanced[i + 1];
+            ++i;
+        } else if (merged.size() > 1 && merged.back().back() == '=') {
+            merged.back() += balanced[i];
+        } else if (!balanced[i].empty() && balanced[i].front() == '=' && merged.size() > 1) {
+            merged.back() += balanced[i];
+        } else {
+            merged.push_back(balanced[i]);
+        }
+    }
+    return merged;
+}
+
+std::string strip_outer_braces_str(std::string s) {
+    while (s.size() >= 2 && s.front() == '{' && s.back() == '}') {
+        int  depth       = 0;
+        bool closesAtEnd = true;
+        for (size_t i = 0; i + 1 < s.size(); ++i) {
+            if (s[i] == '{') {
+                ++depth;
+            } else if (s[i] == '}') {
+                --depth;
+                if (depth == 0) {
+                    closesAtEnd = false;
+                    break;
+                }
+            }
+        }
+        if (closesAtEnd) {
+            s = s.substr(1, s.size() - 2);
+        } else {
+            break;
+        }
+    }
+    return s;
+}
+
+} // namespace
 
 void Netlist::id_io_subc_label(const tokens_t&                                    lineTokens,
                                tokens_t&                                          io,
@@ -20,24 +95,22 @@ void Netlist::id_io_subc_label(const tokens_t&                                  
                                std::string&                                       subcktName,
                                std::string&                                       label,
                                const std::unordered_map<std::string, Subcircuit>& subcircuits) {
-    // Id the label
-    label      = lineTokens.front();
-    // Found flag
-    bool found = false;
-    // Check the convention
-    // At this point in the program all subcircuits should have been identified
-    // Thus we can determine the convention from code
-    for (auto i = 1; i < lineTokens.size(); ++i) {
-        if (subcircuits.count(lineTokens.at(i)) != 0) {
+    const tokens_t normTokens = normalize_subckt_call_tokens(lineTokens);
+    label                     = normTokens.front();
+    bool found                = false;
+    for (size_t i = 1; i < normTokens.size(); ++i) {
+        if (normTokens.at(i).find('=') != std::string::npos) {
+            const size_t eqPos = normTokens.at(i).find('=');
+            std::string  param = normTokens.at(i).substr(0, eqPos);
+            std::string  value = normTokens.at(i).substr(eqPos + 1);
+            if (!param.empty() && !value.empty()) {
+                params[param] = value;
+            }
+        } else if (subcircuits.count(normTokens.at(i)) != 0) {
             found      = true;
-            subcktName = lineTokens.at(i);
-        } else if (lineTokens.at(i).find('=') != std::string::npos) {
-            std::string param, value;
-            param         = lineTokens.at(i).substr(0, lineTokens.at(i).find('='));
-            value         = lineTokens.at(i).substr(lineTokens.at(i).find('=') + 1);
-            params[param] = value;
+            subcktName = normTokens.at(i);
         } else {
-            io.emplace_back(lineTokens.at(i));
+            io.emplace_back(normTokens.at(i));
         }
     }
     if (!found) { Errors::input_errors(InputErrors::UNKNOWN_SUBCKT, Misc::vector_to_string(lineTokens)); }
@@ -58,13 +131,93 @@ bool Netlist::rename_io_nodes(std::string& node, const tokens_t& subIO, const to
     return false;
 }
 
-void Netlist::expand_io(Subcircuit& subc, s_map& params, const tokens_t& io, const std::string& label) {
+void Netlist::expand_io(Subcircuit&        subc,
+                        s_map&             params,
+                        const tokens_t&    io,
+                        const std::string& label,
+                        const std::string& subcktName,
+                        const string_o&    callerScope) {
     // Sanity check
     if (io.size() != subc.io.size()) { Errors::input_errors(InputErrors::IO_MISMATCH, label); }
+
+    bool createInstScope = false;
+    if (parametersPtr != nullptr && !subcktName.empty()) {
+        if (!params.empty()) {
+            createInstScope = true;
+        } else if (callerScope.has_value()) {
+            for (const auto& kv : *parametersPtr) {
+                if (kv.first.subcircuit() == callerScope) {
+                    createInstScope = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (createInstScope) {
+        hasInstScopes = true;
+        std::vector<std::string> origScopes;
+        for (const auto& line : subc.lines) {
+            const std::string sc = line.second.value_or(subcktName);
+            if (std::find(origScopes.begin(), origScopes.end(), sc) == origScopes.end()) {
+                origScopes.push_back(sc);
+            }
+        }
+        std::vector<std::pair<ParameterName, Parameter>> existingParams(parametersPtr->begin(), parametersPtr->end());
+        for (const auto& origScope : origScopes) {
+            const std::string newScope = origScope + "|" + label;
+            if (callerScope.has_value()) {
+                for (const auto& kv : existingParams) {
+                    if (kv.first.subcircuit() == callerScope) {
+                        Parameter p = kv.second;
+                        p.reset_value();
+                        (*parametersPtr)[ParameterName(kv.first.name(), newScope)] = p;
+                    }
+                }
+            }
+            for (const auto& kv : existingParams) {
+                if (kv.first.subcircuit() && kv.first.subcircuit().value() == subcktName) {
+                    Parameter p = kv.second;
+                    p.reset_value();
+                    (*parametersPtr)[ParameterName(kv.first.name(), newScope)] = p;
+                }
+            }
+            if (origScope != subcktName) {
+                for (const auto& kv : existingParams) {
+                    if (kv.first.subcircuit() && kv.first.subcircuit().value() == origScope) {
+                        Parameter p = kv.second;
+                        p.reset_value();
+                        (*parametersPtr)[ParameterName(kv.first.name(), newScope)] = p;
+                    }
+                }
+            }
+            for (const auto& pkv : params) {
+                const std::string cleanExpr = strip_outer_braces_str(pkv.second);
+                Parameter         p;
+                if (!callerScope.has_value()) {
+                    const double v = parse_param(cleanExpr, *parametersPtr, std::nullopt, false);
+                    if (!std::isnan(v)) {
+                        p.set_expression(Misc::precise_to_string(v));
+                        p.set_value(v);
+                    } else {
+                        p.set_expression(cleanExpr);
+                    }
+                } else {
+                    p.set_expression(cleanExpr);
+                }
+                (*parametersPtr)[ParameterName(pkv.first, newScope)] = p;
+            }
+        }
+    }
+
     // Loop through the identified subcircuit
     for (auto k = 0; k < subc.lines.size(); ++k) {
         // Set shorthand for long variable name
         tokens_t& tokens = subc.lines.at(k).first;
+        if (createInstScope) {
+            const std::string origScope = subc.lines.at(k).second.value_or(subcktName);
+            subc.lines.at(k).second     = origScope + "|" + label;
+        }
         // Check for value parameterization
         if (!params.empty() && params.count(tokens.front()) != 0) { insert_parameter(tokens, params); }
         // Append the label of the parent to the subcircuit label in-place
@@ -76,6 +229,25 @@ void Netlist::expand_io(Subcircuit& subc, s_map& params, const tokens_t& io, con
         int64_t    nodeCount = (devType == 'E' || devType == 'F' || devType == 'G' || devType == 'H' || devType == 'T')
                                        ? 4
                                        : 2;
+        if (devType == 'N') {
+            nodeCount = 2;
+            for (size_t m = 3; m < tokens.size() && nodeCount < 4; ++m) {
+                if (Nanowire::is_node_token(tokens.at(m), *this, subc.lines.at(k).second)) {
+                    ++nodeCount;
+                } else {
+                    break;
+                }
+            }
+            for (size_t m = 1; m < tokens.size(); ++m) {
+                for (const char* pfx : {"GATE=", "GATE_IND=", "GATEDEV="}) {
+                    const size_t pfxLen = std::strlen(pfx);
+                    if (tokens.at(m).compare(0, pfxLen, pfx) == 0 && tokens.at(m).size() > pfxLen) {
+                        tokens.at(m).push_back('|');
+                        tokens.at(m).append(label);
+                    }
+                }
+            }
+        }
         // Loop through all the nodes changing where necessary
         for (int64_t n = 1; n < nodeCount + 1; ++n) {
             // Ensure nodes don't identify as ground
@@ -105,12 +277,14 @@ void Netlist::insert_parameter(tokens_t& t, s_map& params) {
         } else {
             t.at(5) = params.at(t.front());
         }
-    } else if (t.front().front() == 'B') {
+    } else if (t.front().front() == 'B' || t.front().front() == 'N') {
         for (auto& i : t) {
             if (i.find("AREA=") != std::string::npos) {
                 i = "AREA=" + params.at(t.front());
             } else if (i.find("IC=") != std::string::npos) {
                 i = "IC=" + params.at(t.front());
+            } else if (i.find("ISW=") != std::string::npos) {
+                i = "ISW=" + params.at(t.front());
             }
         }
     }
@@ -176,7 +350,7 @@ void Netlist::expand_subcircuits() {
                     if (!targetSubc.containsSubckt) {
                         Subcircuit subc = targetSubc;
                         // Expand the IO nodes of the subcircuit for this instance
-                        expand_io(subc, params, io, label);
+                        expand_io(subc, params, io, label, subcktName, i.first);
                         // Append the expanded lines in O(1) amortized time
                         newLines.insert(newLines.end(),
                                         std::make_move_iterator(subc.lines.begin()),
@@ -254,7 +428,7 @@ void Netlist::expand_maindesign() {
             // Copy of subcircuit for this instance
             Subcircuit subc = subcircuits.at(subcktName);
             // Expand the appropriate IO nodes of the subcircuit for this instance
-            expand_io(subc, params, io, label);
+            expand_io(subc, params, io, label, subcktName, std::nullopt);
             // Add the expanded subcircuit lines to the expanded netlist
             expNetlist.insert(expNetlist.end(),
                               std::make_move_iterator(subc.lines.begin()),
@@ -264,6 +438,9 @@ void Netlist::expand_maindesign() {
             // Add the line tokens to the expanded netlist
             expNetlist.push_back(std::make_pair(maindesign.at(i), std::nullopt));
         }
+    }
+    if (hasInstScopes && parametersPtr != nullptr && !parametersPtr->empty()) {
+        parse_parameters(*parametersPtr);
     }
     // Let the user know main design expansion is complete
     if (!argMin) {

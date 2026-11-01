@@ -62,9 +62,29 @@ JJ::JJ(const std::pair<tokens_t, string_o>& s,
             nominalArea_ = parse_param(ti.substr(5), iObj.parameters, s.second);
         } else if (ti.rfind("IC=", 0) == 0) {
             nominalIc_ = parse_param(ti.substr(3), iObj.parameters, s.second);
+        } else if (ti.rfind("PHI0=", 0) == 0) {
+            icPhase_ = parse_param(ti.substr(5), iObj.parameters, s.second);
+        } else if (ti.rfind("IC_PHI=", 0) == 0) {
+            icPhase_ = parse_param(ti.substr(7), iObj.parameters, s.second);
+        } else if (ti.rfind("PHI=", 0) == 0) {
+            icPhase_ = parse_param(ti.substr(4), iObj.parameters, s.second);
+        } else if (ti.rfind("FLUX0=", 0) == 0) {
+            icPhase_ = 2.0 * Constants::PI * parse_param(ti.substr(6), iObj.parameters, s.second);
+        } else if (ti.rfind("IC_V=", 0) == 0) {
+            icVoltage_ = parse_param(ti.substr(5), iObj.parameters, s.second);
+        } else if (ti.rfind("V0=", 0) == 0) {
+            icVoltage_ = parse_param(ti.substr(3), iObj.parameters, s.second);
+        } else if (ti.rfind("PHIOFF=", 0) == 0) {
+            instPhiOff_ = parse_param(ti.substr(7), iObj.parameters, s.second);
         } else {
             t.emplace_back(ti);
         }
+    }
+    if (icPhase_.has_value()) {
+        pn1_ = pn2_ = pn3_ = pn4_ = phi0_ = icPhase_.value();
+    }
+    if (icVoltage_.has_value()) {
+        vn1_ = vn2_ = vn3_ = vn4_ = vn5_ = vn6_ = icVoltage_.value();
     }
     spread_ = spr;
     if (nominalIc_) {
@@ -188,7 +208,9 @@ void JJ::set_model(const tokens_t& t, const vector_pair_t<Model, string_o>& mode
         // If the model name matches that of an identified model
         if (i.first.modelName() == t.back()) {
             // If both models belong to a subcircuit and the subcircuit names match
-            if ((i.second && subc) && (subc.value() == i.second.value())) {
+            if ((i.second && subc)
+                && (subc.value() == i.second.value()
+                    || subc.value().substr(0, subc.value().find('|')) == i.second.value())) {
                 // Set the model to the exact identified model
                 model_ = i.first;
                 found  = true;
@@ -206,6 +228,9 @@ void JJ::set_model(const tokens_t& t, const vector_pair_t<Model, string_o>& mode
     if (!found) {
         // Complain about it
         Errors::invalid_component_errors(ComponentErrors::MODEL_NOT_DEFINED, Misc::vector_to_string(t));
+    }
+    if (instPhiOff_.has_value()) {
+        model_.phiOff(instPhiOff_.value());
     }
     baseModel_ = model_;
     // Change the area if ic was defined

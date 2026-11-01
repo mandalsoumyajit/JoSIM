@@ -1,0 +1,52 @@
+* Integration Test for Batched OAAT Sensitivity & Automated Margin Centering (.sens)
+.model jmitll jj(rtype=1, vg=2.8mV, cap=0.07pF, r0=160, rn=16, icrit=0.1mA)
+
+.param IBIAS1=175u
+.param IBIAS2=115u
+
+* Input SFQ pulse source
+VIN 1 0 sfq(20p 25p 2p 111)
+R01 1 2 2.0
+
+* Stage 1
+L01 2 3 1.0p
+IB1 0 3 pwl(0 0 5p {IBIAS1})
+B01 3 0 jmitll area=2.5
+
+* Coupling inductance and Stage 2 (deliberately under-biased at 115uA)
+L02 3 4 7.0p
+IB2 0 4 pwl(0 0 5p {IBIAS2})
+B02 4 0 jmitll area=2.5
+
+* Load
+L03 4 5 2.0p
+R02 5 0 2.0
+
+.tran 0.1p 120p
+
+* Measure propagation delay from B01 to B02
+.meas tran T_PROP TRIG P(B01) SFQ=1 TARG P(B02) SFQ=1
+
+* Run batched OAAT sensitivity (+/-5% central difference) + operating margin centering
+.sens @DEVICES DELTA=0.05 CENTER MIN=0.4 MAX=1.8 STEP=0.05
+
+* Verify physical signs of sensitivities:
+* 1. Increasing bias current IB1 or IB2 speeds up switching (dT_PROP/ds < 0)
+.meas tran S_IB1 PARAM='SENS_IB1' MAX=-0.1p
+.meas tran S_IB2 PARAM='SENS_IB2' MAX=-0.1p
+.meas tran SN_IB2 PARAM='SENS_NORM_IB2' MAX=-0.05
+
+* 2. Increasing junction area B02 or coupling inductance L02 slows switching (dT_PROP/ds > 0)
+.meas tran S_B02 PARAM='SENS_B02' MIN=0.1p
+.meas tran S_L02 PARAM='SENS_L02' MIN=0.1p
+
+* 3. Total variance weight sums to 100%
+.meas tran W_SUM PARAM='SENS_WEIGHT_IB1 + SENS_WEIGHT_IB2 + SENS_WEIGHT_B01 + SENS_WEIGHT_B02 + SENS_WEIGHT_L01 + SENS_WEIGHT_L02 + SENS_WEIGHT_L03 + SENS_WEIGHT_R01 + SENS_WEIGHT_R02' VAL=100.0 TOL=0.01
+
+* 4. Margin centering recommends reducing over-sized B02 (25% -> 42.5%) and increasing under-biased IB2 (60% -> 70%)
+.meas tran C_SCALE_B02 PARAM='CENTER_SCALE_B02' MIN=0.70 MAX=0.95
+.meas tran C_GAIN_B02  PARAM='MARGIN_CENTERED_PCT_B02 - MARGIN_CRIT_PCT_B02' MIN=10.0
+.meas tran C_SCALE_IB2 PARAM='CENTER_SCALE_IB2' MIN=1.05 MAX=1.60
+.meas tran C_GAIN_IB2  PARAM='MARGIN_CENTERED_PCT_IB2 - MARGIN_CRIT_PCT_IB2' MIN=5.0
+
+.end

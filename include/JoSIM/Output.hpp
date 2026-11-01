@@ -26,11 +26,20 @@ class Trace {
 
 class Output {
   public:
-    std::vector<Trace>  traces;
-    std::vector<double> timesteps;
+    std::vector<Trace>                           traces;
+    std::vector<double>                          timesteps;
+    std::vector<std::pair<std::string, double>>  measResults;
+    std::vector<std::vector<double>>             measTrialValues;
     Output() {};
     Output(Input& iObj, Matrix& mObj, Simulation& sObj);
     void write_events(const Input& iObj, Matrix& mObj, Simulation& sObj);
+    void write_margins(const Input& iObj, Matrix& mObj, Simulation& sObj);
+    void verify_golden_events(const Input& iObj, Matrix& mObj, Simulation& sObj);
+    void verify_assertions(const Input& iObj, Matrix& mObj, Simulation& sObj);
+    void write_loop_audit(const Input& iObj, Matrix& mObj, Simulation& sObj);
+    void evaluate_jitter(const Input& iObj, Matrix& mObj, Simulation& sObj);
+    void write_sensitivity(const Input& iObj, Matrix& mObj, Simulation& sObj);
+    void evaluate_measurements(const Input& iObj, Matrix& mObj, Simulation& sObj);
     void write_output(const Input& iObj, Matrix& mObj, Simulation& sObj);
 
     void format_csv_or_dat(const std::string& filename, const char& delimiter, bool argmin = true, int64_t fIndex = -1);

@@ -1,0 +1,60 @@
+* Test Built-In Timing Jitter, Skew & Bit-Error-Rate (BER) Analyzer (.jitter / -J)
+.model jmitll jj(rtype=1, vg=2.8mV, cap=0.07pF, r0=160, rN=16, icrit=0.1mA)
+
+* Clean 2-stage MIT-LL JTL driven by a 4-pulse periodic SFQ train (TD=20ps, PER=25ps -> pulses at 20p, 45p, 70p, 95p)
+B01   3  7  jmitll area=2.16
+B02   6  8  jmitll area=2.16
+IB01  0  1  pwl(0 0 5p 280u)
+L01   4  3  2p
+L02   3  2  2.425p
+L03   2  6  2.425p
+L04   6  5  2.031p
+LP01  0  7  0.086p
+LP02  0  8  0.096p
+LPR01 2  1  0.278p
+LRB01 7  9  0.086p
+LRB02 8  10 0.086p
+RB01  9  3  5.23
+RB02  10 6  5.23
+ROUT  5  0  2
+VIN   4  0  sfq(20p 25p 2p 1111)
+
+* Second branch with a dropped 3rd pulse (1101 instead of 1111 -> 1 missed pulse out of 4 -> BER = 0.25)
+B11   13 17 jmitll area=2.16
+IB11  0  11 pwl(0 0 5p 140u)
+L11   14 13 2p
+L12   13 15 2.031p
+LP11  0  17 0.086p
+LPR11 13 11 0.278p
+LRB11 17 19 0.086p
+RB11  19 13 5.23
+ROUT2 15 0  2
+VIN2  14 0  sfq(20p 25p 2p 1101)
+
+.tran 0.25p 130p
+.print DEVP B01 B02 B11
+
+* 1. Reference-trace mode: B02 relative to B01 (~1.83ps latency, sub-50fs deterministic jitter, 0 errors)
+.jitter J_PROP B02 REF=B01 MAX_RMS=0.2p MAX_BER=0 STRICT
+
+* 2. Clock-grid mode with periodic pulse train: B01 against 25ps clock (4 pulses, 0 errors)
+.jitter J_CLK  B01 PER=25p COUNT=4 MAX_RMS=0.2p MAX_ERRORS=0 STRICT
+
+* 3. Clock-grid mode with digital bit-stream pattern (1111 over 4 slots starting at 20ps):
+.jitter J_BITS B02 TD=20p PER=25p BITS=1111 MAX_BER=0 STRICT
+
+* 4. Self-period mode on B01 (extracts mean period ~25ps and period jitter)
+.jitter J_SELF B01
+
+* 5. BER detection on B11 against B01 (3 matched, 1 missed -> BER = 0.25)
+.jitter J_LOSS B11 REF=B01 MAX_BER=0.30 MAX_ERRORS=1 STRICT
+
+* Verify exported parameters via .meas
+.meas tran LAT_PROP_PS PARAM='LATENCY_J_PROP * 1e12' MIN=1.0 MAX=3.0
+.meas tran RMS_PROP_PS PARAM='JITTER_RMS_J_PROP * 1e12' MAX=0.2
+.meas tran SELF_PER_PS PARAM='LATENCY_J_SELF * 1e12' VAL=25.0 TOL=0.02
+.meas tran BER_PROP    PARAM='BER_J_PROP' VAL=0.0 TOL=1e-6
+.meas tran BER_LOSS    PARAM='BER_J_LOSS' VAL=0.25 TOL=0.01
+.meas tran ERR_LOSS    PARAM='ERRORS_J_LOSS' VAL=1 TOL=0.01
+
+.end

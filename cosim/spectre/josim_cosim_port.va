@@ -1,0 +1,213 @@
+// Copyright (c) 2026 JoSIM Developers
+// This file is part of JoSIM. Details are in the LICENSE file.
+//
+// Layer 3A: Cadence Spectre Verilog-A Co-Simulation Boundary Port Modules.
+//
+// Usage in a Cadence Spectre (.scs) netlist:
+//   ahdl_include "libjosim_spectre_dpi.so" -cds_va_dpi
+//   ahdl_include "josim_cosim_port.va"
+//
+//   Xsfq (v_boundary 0) josim_cosim_port_norton \
+//       netlist="sfq_subcircuit.cir" port_nodes="b4" port_modes="0" endpoint="unix:/tmp/josim.sock"
+//
+// Why `i_hist` and `g_eq` are returned separately from C:
+//   In Verilog-A automatic differentiation (AD), any external C function has zero symbolic
+//   derivative (`d/dV = 0`). Returning `i_hist = I_port(V) - G_eq * V` and `g_eq = G_eq` from C
+//   and stamping `I(p, n) <+ i_hist + g_eq * V(p, n);` guarantees:
+//     1. Total branch current: i_hist + g_eq * V(p, n) == I_port(V(p, n))
+//     2. Exact MNA Jacobian entry stamped into Spectre: dI(p, n)/dV(p, n) == g_eq
+
+`include "disciplines.vams"
+`include "constants.vams"
+
+`ifdef INCA
+  `define JOSIM_DPI_IMPORT "DPI-C"
+`else
+  `define JOSIM_DPI_IMPORT "CDS_VA_DPI"
+`endif
+
+// -----------------------------------------------------------------------------
+// 1. Single-Port Norton / Branin Wave Boundary (SPICE applies V(p,n), JoSIM returns I & G_eq)
+// -----------------------------------------------------------------------------
+module josim_cosim_port_norton(p, n);
+  inout p, n;
+  electrical p, n;
+
+  parameter string netlist      = "";
+  parameter string port_nodes   = "1";
+  parameter string port_modes   = "0";   // "0" for Norton, "2:50.0" for Branin Wave with Z0=50 ohm
+  parameter string endpoint     = "";    // "" = inproc or $JOSIM_COSIM_ENDPOINT; "unix:/path" or "tcp:host:port"
+  parameter real   maxstep_mult = 0.0;   // If > 0, bounds Spectre step to maxstep_mult * josim_tstep
+  parameter real   gmin_dc      = 1e-12; // Minimum DC shunt conductance for initial OP conditioning
+
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
+    input string netlist_path,
+    input string port_nodes_csv,
+    input string port_modes_csv,
+    input string ep
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
+    input integer h
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_eval_ihist(
+    input integer h,
+    input real    t_s,
+    input real    v_pn
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_eval_g(
+    input integer h,
+    input real    t_s,
+    input real    v_pn
+  );
+
+  integer h;
+  real    dt_j, i_hist, g_eq;
+
+  analog begin
+    @(initial_step) begin
+      h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      dt_j = josim_dpi_tstep(h);
+    end
+
+    i_hist = josim_dpi_eval_ihist(h, $abstime, V(p, n));
+    g_eq   = josim_dpi_eval_g(h, $abstime, V(p, n));
+
+    if (analysis("dc") || $abstime <= 0.0) begin
+      I(p, n) <+ i_hist + (g_eq + gmin_dc) * V(p, n);
+    end else begin
+      I(p, n) <+ i_hist + g_eq * V(p, n);
+    end
+
+    if (maxstep_mult > 0.0 && dt_j > 0.0) begin
+      $bound_step(maxstep_mult * dt_j);
+    end
+  end
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// 2. Single-Port Thevenin Boundary (SPICE applies I(p,n), JoSIM returns V & R_eq)
+// -----------------------------------------------------------------------------
+module josim_cosim_port_thevenin(p, n);
+  inout p, n;
+  electrical p, n;
+
+  parameter string netlist      = "";
+  parameter string port_nodes   = "1";
+  parameter string port_modes   = "1";
+  parameter string endpoint     = "";
+  parameter real   maxstep_mult = 0.0;
+
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
+    input string netlist_path,
+    input string port_nodes_csv,
+    input string port_modes_csv,
+    input string ep
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
+    input integer h
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_eval_vhist(
+    input integer h,
+    input real    t_s,
+    input real    i_pn
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_eval_r(
+    input integer h,
+    input real    t_s,
+    input real    i_pn
+  );
+
+  integer h;
+  real    dt_j, v_hist, r_eq;
+
+  analog begin
+    @(initial_step) begin
+      h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      dt_j = josim_dpi_tstep(h);
+    end
+
+    v_hist = josim_dpi_eval_vhist(h, $abstime, I(p, n));
+    r_eq   = josim_dpi_eval_r(h, $abstime, I(p, n));
+    V(p, n) <+ v_hist + r_eq * I(p, n);
+
+    if (maxstep_mult > 0.0 && dt_j > 0.0) begin
+      $bound_step(maxstep_mult * dt_j);
+    end
+  end
+endmodule
+
+
+// -----------------------------------------------------------------------------
+// 3. Two-Port Norton / Branin Wave Boundary (for Duplex Links, SFQ Latches, or TX/RX pairs)
+// -----------------------------------------------------------------------------
+module josim_cosim_port_2p(p0, n0, p1, n1);
+  inout p0, n0, p1, n1;
+  electrical p0, n0, p1, n1;
+
+  parameter string netlist      = "";
+  parameter string port_nodes   = "1,2";
+  parameter string port_modes   = "0,0";
+  parameter string endpoint     = "";
+  parameter real   maxstep_mult = 0.0;
+  parameter real   gmin_dc      = 1e-12;
+
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_open(
+    input string netlist_path,
+    input string port_nodes_csv,
+    input string port_modes_csv,
+    input string ep
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_tstep(
+    input integer h
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_set_input(
+    input integer h,
+    input integer port_idx,
+    input real    val
+  );
+  import `JOSIM_DPI_IMPORT function integer josim_dpi_eval(
+    input integer h,
+    input real    t_s
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_hist(
+    input integer h,
+    input integer port_idx
+  );
+  import `JOSIM_DPI_IMPORT function real josim_dpi_get_jacobian(
+    input integer h,
+    input integer port_idx
+  );
+
+  integer h, rc;
+  real    dt_j;
+  real    ihist0, g0, ihist1, g1;
+
+  analog begin
+    @(initial_step) begin
+      h    = josim_dpi_open(netlist, port_nodes, port_modes, endpoint);
+      dt_j = josim_dpi_tstep(h);
+    end
+
+    rc = josim_dpi_set_input(h, 0, V(p0, n0));
+    rc = josim_dpi_set_input(h, 1, V(p1, n1));
+    rc = josim_dpi_eval(h, $abstime);
+
+    ihist0 = josim_dpi_get_hist(h, 0);
+    g0     = josim_dpi_get_jacobian(h, 0);
+    ihist1 = josim_dpi_get_hist(h, 1);
+    g1     = josim_dpi_get_jacobian(h, 1);
+
+    if (analysis("dc") || $abstime <= 0.0) begin
+      I(p0, n0) <+ ihist0 + (g0 + gmin_dc) * V(p0, n0);
+      I(p1, n1) <+ ihist1 + (g1 + gmin_dc) * V(p1, n1);
+    end else begin
+      I(p0, n0) <+ ihist0 + g0 * V(p0, n0);
+      I(p1, n1) <+ ihist1 + g1 * V(p1, n1);
+    end
+
+    if (maxstep_mult > 0.0 && dt_j > 0.0) begin
+      $bound_step(maxstep_mult * dt_j);
+    end
+  end
+endmodule

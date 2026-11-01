@@ -49,7 +49,8 @@ class RelevantTrace {
     int_o       index2;
     int_o       sourceIndex;
     int_o       variableIndex;
-    int64_t     fIndex = -1;
+    int64_t     fIndex             = -1;
+    bool        autoAddedForEvents = false;
 
     RelevantTrace() : device(false) {};
 }; // class RelevantTrace

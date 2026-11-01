@@ -48,7 +48,12 @@ class Netlist {
                           std::string&                                       label,
                           const std::unordered_map<std::string, Subcircuit>& subcircuits);
     bool rename_io_nodes(std::string& node, const tokens_t& subIO, const tokens_t& parentIO);
-    void expand_io(Subcircuit& subc, s_map& params, const tokens_t& io, const std::string& label);
+    void expand_io(Subcircuit&        subc,
+                   s_map&             params,
+                   const tokens_t&    io,
+                   const std::string& label,
+                   const std::string& subcktName  = "",
+                   const string_o&    callerScope = std::nullopt);
     void insert_parameter(tokens_t& t, s_map& params);
 
     std::unordered_map<std::string, std::unordered_map<std::string, int32_t>> subcktNodeCounts;
@@ -69,6 +74,8 @@ class Netlist {
     tokens_t                                                                  subckts;
     std::vector<std::pair<tokens_t, string_o>>                                expNetlist;
     std::vector<std::pair<tokens_t, string_o>>                                rawExpNetlist;
+    param_map*                                                                parametersPtr  = nullptr;
+    bool                                                                      hasInstScopes  = false;
     int64_t jjCount, compCount, subcktCounter, nestedSubcktCount, subcktTotal = 0;
     bool    containsSubckt, argMin = false;
     Netlist() : jjCount(0), compCount(0), subcktCounter(0), nestedSubcktCount(0), containsSubckt(false) {};

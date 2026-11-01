@@ -365,6 +365,7 @@ struct TrialDeviceScales {
     std::vector<double>                       resScale;
     std::vector<double>                       capScale;
     std::vector<double>                       jjScale;
+    std::vector<double>                       nwScale;
     std::vector<double>                       vsScale;
     std::vector<double>                       psScale;
     std::vector<double>                       csScale;
@@ -403,6 +404,14 @@ struct MnaIndState {
     double In2 = 0.0, In3 = 0.0, In4 = 0.0;
 };
 
+struct MnaNanowireState {
+    int64_t state     = 0;
+    double  w         = 0.0, rCh = 0.0;
+    double  phiRn1    = 0.0, phiRn2 = 0.0, prevRhs = 0.0;
+    double  In2       = 0.0, In3 = 0.0, In4 = 0.0;
+    double  curNzBack = 0.0;
+};
+
 struct TxScalarState {
     double n1_1 = 0.0, n2_1 = 0.0, n1_2 = 0.0, n2_2 = 0.0;
     double nk_1 = 0.0, nk_2 = 0.0, nk1_1 = 0.0, nk1_2 = 0.0, nk2_1 = 0.0, nk2_2 = 0.0;
@@ -434,6 +443,7 @@ struct RollingCheckpoint {
     std::vector<MnaP4State>         mnaVSs;
     std::vector<MnaP4State>         mnaCCVSs;
     std::vector<MnaP4State>         mnaVCCSs;
+    std::vector<MnaNanowireState>   mnaNanowires;
     std::vector<TxScalarState>                 txScalars;
     std::vector<TransmissionLine::TxHistEntry> txHistFlat;
     std::vector<InLoopEventTracker>            eventTrackers;
@@ -455,6 +465,7 @@ class Simulation {
     bool                bypass_                  = false;
     double              bypassTol_               = 1e-6;
     bool                fixedStep_               = false;
+    bool                cosimMode_               = false;
     bool                warnStep_                = false;
     int64_t             rollbackMode_            = 1;
     int64_t             verb_                    = 0;
@@ -467,6 +478,8 @@ class Simulation {
     std::optional<std::string>                                   loadStateFile_;
     bool                hasJJThermalNoise_       = false;
     bool                hasResistorThermalNoise_ = false;
+    bool                hasIndFluxOffset_        = false;
+    bool                hasInitialConditions_    = false;
     bool                needsLU_;
     bool                needsTR_ = true;
     bool                startup_;
@@ -491,6 +504,7 @@ class Simulation {
     std::vector<PhaseSource>      psources_;
     std::vector<CCVS>             ccvss_;
     std::vector<VCCS>             vccss_;
+    std::vector<Nanowire>         nanowires_;
 #ifdef SLU
     LUSolve lu;
 #else
@@ -554,6 +568,7 @@ class Simulation {
 #endif
 
     void setup(Input& iObj, Matrix& mObj);
+    void apply_initial_conditions(Matrix& mObj);
     void save_nodal_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx);
     void restore_nodal_checkpoint(const RollingCheckpoint& ckpt);
     void rescale_nodal_timestep(double oldH, double newH, bool hasPrevStep);
@@ -578,6 +593,7 @@ class Simulation {
     void solve_lu(Matrix& mObj);
     void free_lu();
     void trans_sim(Matrix& mObj);
+    void expand_margin_targets(Input& iObj, const Matrix& mObj);
     void compute_trial_scales(Matrix& mObj, std::vector<TrialDeviceScales>& outScales);
     void trans_sim_mc(Matrix& mObj);
     void trans_sim_mc_nodal(Matrix& mObj);
@@ -604,6 +620,7 @@ class Simulation {
     void handle_ccvs(Matrix& mObj);
     void handle_vccs(Matrix& mObj);
     void handle_tx(Matrix& mObj, const int64_t& i, double& step, double factor = 1);
+    void handle_nanowires(Matrix& mObj, int64_t& i, double& step, double factor = 1);
 
   public:
     Results                                      results;
@@ -613,7 +630,33 @@ class Simulation {
     std::vector<InLoopEventTracker>              eventTrackers_;
     std::vector<std::vector<InLoopEventTracker>> mcEventTrackers_;
 
+    const std::vector<JJ>&            get_jjs() const noexcept { return jjs_; }
+    const std::vector<Inductor>&      get_inductors() const noexcept { return inductors_; }
+    const std::vector<Nanowire>&      get_nanowires() const noexcept { return nanowires_; }
+    const std::vector<VoltageSource>& get_vsources() const noexcept { return vsources_; }
+
+    Simulation() = default;
     Simulation(Input& iObj, Matrix& mObj);
+    ~Simulation() { free_lu(); }
+
+    void         cosim_initialize(Input& iObj, Matrix& mObj);
+    void         cosim_step_one(Matrix& mObj, int64_t stepIdx, double stepTime);
+    void         cosim_record_step(const Matrix& mObj, int64_t stepIdx, double stepTime);
+    void         cosim_save_ckpt(RollingCheckpoint& ckpt, int64_t stepIdx) { save_mna_checkpoint(ckpt, stepIdx); }
+    void         cosim_restore_ckpt(Matrix& mObj, const RollingCheckpoint& ckpt);
+    double       cosim_solve_unit_rhs(Matrix& mObj,
+                                      int64_t rhsRow1,
+                                      double  rhsVal1,
+                                      int64_t rhsRow2,
+                                      double  rhsVal2,
+                                      int64_t outRow1,
+                                      int64_t outRow2);
+    double       cosim_read_x(int64_t row) const noexcept {
+        return (row >= 0 && static_cast<size_t>(row) < x_.size()) ? x_[static_cast<size_t>(row)] : 0.0;
+    }
+    double       cosim_step_size() const noexcept { return stepSize_; }
+    AnalysisType cosim_analysis_type() const noexcept { return atyp_; }
+    void         cosim_finish(Matrix& mObj);
 };
 } // namespace JoSIM
 #endif // JOSIM_SIMULATION_HPP

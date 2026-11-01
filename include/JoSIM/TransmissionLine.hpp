@@ -61,6 +61,7 @@ class TransmissionLine : public BasicComponent {
     double     nk_1_ = 0.0, nk_2_ = 0.0, nk1_1_ = 0.0, nk1_2_ = 0.0, nk2_1_ = 0.0, nk2_2_ = 0.0;
     int64_t    timestepDelay_ = 0;
     double     fracDelay_     = 0.0;
+    double     atten_         = 1.0;
 
     struct TxHistEntry {
         double v1 = 0.0;

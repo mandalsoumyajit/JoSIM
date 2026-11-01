@@ -1,0 +1,48 @@
+* Test Item #8: Batched Model/Circuit .iv, Shapiro-Step Extractor, and 2D SQUID V(Phi) / Ic(Phi) Analyzer
+* Circuit: Symmetric 2-JJ shunted dc-SQUID (Ic0 = 100uA per JJ -> 2*Ic0 = 200uA at Phi=0, L_loop = 2*5pH = 10pH)
+
+.model j_under jj(rtype=1, vg=2.8mV, cap=0.05pF, r0=100, rn=10, icrit=0.1mA)
+.model j_squid jj(rtype=0, vg=2.8mV, cap=0.02pF, r0=2.0, rn=2.0, icrit=0.1mA)
+
+* Bias current source into SQUID port node 3
+IB   0 3 pwl(0 0 10p 220u 250p 220u)
+
+* Symmetric loop arms: node 3 -> L1 -> node 1 -> B1 -> 0, and node 3 -> L2 -> node 2 -> B2 -> 0
+L1   3 1 5.0p
+L2   3 2 5.0p
+B1   1 0 j_squid area=1.0
+B2   2 0 j_squid area=1.0
+
+.tran 0.1p 250p 0 0.1p
+
+* 1. Model-level hysteretic I-V on underdamped junction (Ic+ ~ 100uA, Ir+ < 60uA, R_N ~ 10 Ohm above Vg/Rn=280uA)
+.iv j_under 400u STEP=10u NAME=JJ_MOD
+
+* 2. Microwave RF Shapiro-step I-V on overdamped junction (f_RF = 20 GHz -> V_1 = 41.357 uV)
+.iv j_squid 260u MIN=0 STEP=2.5u RSHUNT=2.0 RF_AMP=120u RF_FREQ=20G TSTOP=400p TSTEP=0.05p NAME=JJ_SHAP
+
+* 3. Circuit-level I-V on the 2-JJ dc-SQUID at zero external flux (Ic+ ~ 200uA, R_N ~ 1.0 Ohm)
+.iv IB 300u MIN=0 STEP=10u VNODE=3 NAME=SQ_IV
+
+* 4. 2D SQUID V(Ib, Phi) & Ic(Phi) lobe characterization across Phi in [0, 1.0 Phi0]
+.squid IB L1 IMAX=240u IMIN=80u ISTEP=10u FMIN=0.0 FMAX=1.0 FSTEP=0.1 VNODE=3 NAME=SQ2D
+
+* Verify all extracted metrics via .meas with strict pass/fail bounds
+.meas TRAN ic_mod_uA      PARAM='IV_IC_POS_JJ_MOD * 1e6'     MIN=95    MAX=110
+.meas TRAN ir_mod_uA      PARAM='IV_IR_POS_JJ_MOD * 1e6'     MIN=5     MAX=65
+.meas TRAN rn_mod_ohm     PARAM='IV_RN_JJ_MOD'               MIN=9.0   MAX=11.0
+
+.meas TRAN shap_v1_uV     PARAM='SHAPIRO_V1_JJ_SHAP * 1e6'   VAL=41.3567 TOL=0.05
+.meas TRAN shap_di1_uA    PARAM='SHAPIRO_DI1_JJ_SHAP * 1e6'  MIN=10.0  MAX=120.0
+.meas TRAN shap_di2_uA    PARAM='SHAPIRO_DI2_JJ_SHAP * 1e6'  MIN=5.0   MAX=100.0
+
+.meas TRAN sq_ic0_uA      PARAM='IV_IC_POS_SQ_IV * 1e6'      MIN=190   MAX=215
+.meas TRAN sq_rn_ohm      PARAM='IV_RN_SQ_IV'                MIN=0.85  MAX=1.15
+
+.meas TRAN sq_ic_max_uA   PARAM='SQUID_IC_MAX_SQ2D * 1e6'    MIN=190   MAX=215
+.meas TRAN sq_ic_min_uA   PARAM='SQUID_IC_MIN_SQ2D * 1e6'    MIN=80    MAX=155
+.meas TRAN sq_ic_mod_pct  PARAM='SQUID_IC_MOD_SQ2D * 100'    MIN=25    MAX=60
+.meas TRAN sq_dv_uV       PARAM='SQUID_DV_SQ2D * 1e6'        MIN=20    MAX=200
+.meas TRAN sq_dvdphi_uV   PARAM='SQUID_DV_DPHI_MAX_SQ2D*1e6' MIN=80    MAX=800
+
+.end

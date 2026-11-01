@@ -41,10 +41,12 @@ class Inductor : public BasicComponent {
     JoSIM::AnalysisType at_;
 
   public:
-    double          In2_ = 0.0, In3_ = 0.0, In4_ = 0.0;
-    double          nominalValue_ = 0.0;
-    double          spread_       = 1.0;
-    mutualinductors mutualInductances_;
+    double                In2_ = 0.0, In3_ = 0.0, In4_ = 0.0;
+    double                nominalValue_ = 0.0;
+    double                spread_       = 1.0;
+    double                phiOffset_    = 0.0;
+    std::optional<double> icCurrent_;
+    mutualinductors       mutualInductances_;
 
     Inductor(const std::pair<tokens_t, string_o>& s,
              const NodeConfig&                    ncon,

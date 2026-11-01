@@ -1,0 +1,38 @@
+* Test parameterized .subckt, extended math functions, and wildcard .print / .assert globs
+.param base_ib = 350u   raw_neg = -350u
+.param abs_ib = abs(raw_neg)  clamped_ib = limit(abs_ib, 200u, 400u)
+.param chosen_ib = if(1, min(base_ib, clamped_ib), max(base_ib, 500u))
+.param log_check = log10(1000)  round_check = round(2.7) + floor(1.9) - ceil(0.1) + sgn(5)
+.param pwr_check = pow(2, 3) - hypot(3, 4)
+
+.subckt JTL_STAGE in out PARAMS: scale=1.0 area_mult=1.0 ib_nom=chosen_ib l_mult=1.0
+.param ib_val = ib_nom * scale
+.param l_val = 2.0p * l_mult
+.model jj1 jj(rtype=1, vg=2.8m, cap=0.07p, r0=160, rn=16, icrit=0.25m)
+Ib 0 1 {ib_val}
+L1 in 1 {l_val}
+B1 1 0 jj1 area={area_mult}
+L2 1 2 {l_val}
+B2 2 0 jj1 area={area_mult}
+Lout 2 out 1.0p
+.ends JTL_STAGE
+
+Vin1 10 0 sfq(20p 30p 2p 1011)
+X1 10 11 JTL_STAGE scale=1.0
+Rl1 11 0 2.0
+
+Vin2 20 0 sfq(20p 30p 2p 1011)
+X2 20 21 JTL_STAGE scale={max(0.8, min(1.2, 1.05))} l_mult=0.95
+Rl2 21 0 2.0
+
+.tran 0.25p 150p
+.print P(B*|X*)
+.print V(*|X1)
+.print I(B?|X?)
+
+* Wildcard assertion across all 4 JJs (B1|X1, B2|X1, B1|X2, B2|X2)
+.assert B*|X* count=3
+.assert B*|X* td=20p per=30p bits=1011
+* Verify that X2 (scale=1.05, l_mult=0.95) switches slightly earlier than X1 (scale=1.0, l_mult=1.0)
+.assert B2|X2 after B2|X1 delay=-0.15p tol=0.1p
+.end

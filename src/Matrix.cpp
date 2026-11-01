@@ -55,10 +55,11 @@ void Matrix::create_matrix(Input& iObj) {
                 const bool         sameRef = (is_gnd_node(n1Neg) && is_gnd_node(n2Neg)) || (n1Neg == n2Neg);
                 if (!sameRef || n1Pos == n2Pos) { continue; }
 
-                double rawTd = 0.0;
-                double z0    = 0.0;
-                bool   hasTd = false;
-                bool   hasZ0 = false;
+                double rawTd   = 0.0;
+                double z0      = 0.0;
+                bool   hasTd   = false;
+                bool   hasZ0   = false;
+                bool   hasLoss = false;
                 for (size_t k = 5; k < line.first.size(); ++k) {
                     const std::string& tok = line.first.at(k);
                     if (tok.size() >= 4 && ::memcmp(tok.c_str(), "Z0=", 3) == 0) {
@@ -67,9 +68,16 @@ void Matrix::create_matrix(Input& iObj) {
                     } else if (tok.size() >= 4 && ::memcmp(tok.c_str(), "TD=", 3) == 0) {
                         rawTd = parse_param(tok.substr(3), iObj.parameters, line.second);
                         hasTd = true;
+                    } else if (tok.rfind("DB=", 0) == 0 || tok.rfind("LOSS_DB=", 0) == 0
+                               || tok.rfind("ATTEN_DB=", 0) == 0 || tok.rfind("LOSS=", 0) == 0
+                               || tok.rfind("ALPHA=", 0) == 0 || tok.rfind("ATTEN=", 0) == 0
+                               || tok.rfind("GAMMA=", 0) == 0 || tok.rfind("GAIN=", 0) == 0) {
+                        hasLoss = true;
                     }
                 }
-                if (hasTd && hasZ0 && z0 > 0.0 && rawTd > 0.0 && rawTd < minTd) {
+                const double subStepMinTd = iObj.argTxInterp ? (h0 * (1.0 - 1e-12)) : (0.5 * h0);
+                const double effMinTd     = hasLoss ? subStepMinTd : minTd;
+                if (hasTd && hasZ0 && z0 > 0.0 && rawTd > 0.0 && rawTd < effMinTd) {
                     const double lEq   = z0 * rawTd;
                     const double cPort = rawTd / (2.0 * z0);
                     const std::string origLabel = tLabel;
@@ -100,6 +108,54 @@ void Matrix::create_matrix(Input& iObj) {
                 std::cout << "JoSIM: Replaced " << lumpedCount << " sub-timestep transmission line(s) (TD < " << minTd
                           << " s) with lumped L-C pi equivalents\n";
             }
+        }
+    }
+    if (!iObj.nanowireGateExpanded) {
+        iObj.nanowireGateExpanded = true;
+        std::vector<std::pair<tokens_t, string_o>> extraGateDevs;
+        for (auto& line : iObj.netlist.expNetlist) {
+            if (line.first.empty() || line.first.front().empty() || line.first.front().at(0) != 'N') { continue; }
+            expand_inline_parameters(line, iObj.parameters);
+            int64_t nodeCount = 2;
+            for (size_t m = 3; m < line.first.size() && nodeCount < 4; ++m) {
+                if (Nanowire::is_node_token(line.first.at(m), iObj.netlist, line.second)) {
+                    ++nodeCount;
+                } else {
+                    break;
+                }
+            }
+            if (nodeCount >= 3) {
+                const std::string gp = line.first.at(3);
+                const std::string gn = (nodeCount == 4) ? line.first.at(4) : line.first.at(2);
+                line.first.erase(line.first.begin() + 3, line.first.begin() + 1 + nodeCount);
+                double lg  = 2.0e-12;
+                double rg  = 0.0;
+                double spr = 1.0;
+                Nanowire::extract_gate_params(line, iObj, lg, rg, spr);
+                const std::string& nLabel = line.first.front();
+                const std::string  sprTok = "SPREAD=" + Misc::precise_to_string(spr);
+                if (rg > 0.0 && lg > 0.0) {
+                    const std::string gmid = "N$GMID$" + nLabel;
+                    extraGateDevs.emplace_back(
+                            tokens_t{"L$GATE$" + nLabel, gp, gmid, Misc::precise_to_string(lg), sprTok}, line.second);
+                    extraGateDevs.emplace_back(
+                            tokens_t{"R$GATE$" + nLabel, gmid, gn, Misc::precise_to_string(rg), sprTok}, line.second);
+                    line.first.push_back("GATE=L$GATE$" + nLabel);
+                } else if (rg > 0.0) {
+                    extraGateDevs.emplace_back(
+                            tokens_t{"R$GATE$" + nLabel, gp, gn, Misc::precise_to_string(rg), sprTok}, line.second);
+                    line.first.push_back("GATE=R$GATE$" + nLabel);
+                } else {
+                    if (lg <= 0.0) { lg = 2.0e-12; }
+                    extraGateDevs.emplace_back(
+                            tokens_t{"L$GATE$" + nLabel, gp, gn, Misc::precise_to_string(lg), sprTok}, line.second);
+                    line.first.push_back("GATE=L$GATE$" + nLabel);
+                }
+            }
+        }
+        if (!extraGateDevs.empty()) {
+            iObj.netlist.expNetlist.insert(
+                    iObj.netlist.expNetlist.end(), extraGateDevs.begin(), extraGateDevs.end());
         }
     }
     iObj.netlist.rawExpNetlist = iObj.netlist.expNetlist;
@@ -362,6 +418,12 @@ void Matrix::create_components(Input& iObj) {
                 // Store the ccvs component list index for reference
                 components.ccvsIndices.emplace_back(components.devices.size() - 1);
                 break;
+                // Superconducting nanowire / cryotron (nTron / hTron / SNSPD)
+            case 'N':
+                components.devices.emplace_back(
+                        Nanowire(i, nodeConfig.at(cc), nm, lm, nc, iObj, spread, branchIndex));
+                components.nanowireIndices.emplace_back(components.devices.size() - 1);
+                break;
                 // This is an error. This means that the component was unidentified.
             default: Errors::invalid_component_errors(ComponentErrors::UNKNOWN_DEVICE_TYPE, i.first.front());
         }
@@ -494,7 +556,8 @@ void Matrix::create_nz() {
                 [&](auto& device) {
                     const auto& nonZeros = device.matrixInfo.nonZeros_;
                     nz.insert(nz.end(), nonZeros.begin(), nonZeros.end());
-                    if constexpr (std::is_same_v<std::decay_t<decltype(device)>, JJ>) {
+                    if constexpr (std::is_same_v<std::decay_t<decltype(device)>, JJ> ||
+                                  std::is_same_v<std::decay_t<decltype(device)>, Nanowire>) {
                         device.nzBackIndex_ = static_cast<int64_t>(nz.size()) - 1;
                     }
                 },

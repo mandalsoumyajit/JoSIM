@@ -90,8 +90,8 @@ __global__ void precompute_tx_remote_kernel(int32_t               numTxLines,
         const double v2k         = fetch_delayed_val(d_txHist, tx, i, 1);
         const double i1k         = fetch_delayed_val(d_txHist, tx, i, 2);
         const double i2k         = fetch_delayed_val(d_txHist, tx, i, 3);
-        d_txRemote1[tIdx * w + s] = Z0 * i2k + v2k;
-        d_txRemote2[tIdx * w + s] = Z0 * i1k + v1k;
+        d_txRemote1[tIdx * w + s] = tx.atten * (Z0 * i2k + v2k);
+        d_txRemote2[tIdx * w + s] = tx.atten * (Z0 * i1k + v1k);
     } else {
         const double c2          = (2.0 * stepSize * Z0) / (3.0 * Constants::SIGMA);
         const double p1k         = fetch_delayed_val(d_txHist, tx, i, 0);
@@ -102,8 +102,8 @@ __global__ void precompute_tx_remote_kernel(int32_t               numTxLines,
         const double p2k2        = fetch_delayed_val(d_txHist, tx, i - 2, 1);
         const double i1k         = fetch_delayed_val(d_txHist, tx, i, 2);
         const double i2k         = fetch_delayed_val(d_txHist, tx, i, 3);
-        d_txRemote1[tIdx * w + s] = c2 * i2k + p2k - (4.0 / 3.0) * p2k1 + (1.0 / 3.0) * p2k2;
-        d_txRemote2[tIdx * w + s] = c2 * i1k + p1k - (4.0 / 3.0) * p1k1 + (1.0 / 3.0) * p1k2;
+        d_txRemote1[tIdx * w + s] = tx.atten * (c2 * i2k + p2k - (4.0 / 3.0) * p2k1 + (1.0 / 3.0) * p2k2);
+        d_txRemote2[tIdx * w + s] = tx.atten * (c2 * i1k + p1k - (4.0 / 3.0) * p1k1 + (1.0 / 3.0) * p1k2);
     }
 }
 

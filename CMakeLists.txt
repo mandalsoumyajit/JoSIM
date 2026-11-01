@@ -64,6 +64,7 @@ add_library(
   src/Matrix.cpp
   src/Misc.cpp
   src/Model.cpp
+  src/Nanowire.cpp
   src/Netlist.cpp
   src/Output.cpp
   src/Parameters.cpp
@@ -137,6 +138,72 @@ target_link_libraries(josim-cli PRIVATE cblas)
 make_target_static(josim-cli)
 target_add_warnings(josim-cli)
 
+# JoSIM C / Python shared library (pyjosim)
+# -----------------------------------------
+
+add_library(josim_c SHARED src/josim_c_api.cpp)
+target_link_libraries(josim_c PRIVATE josim suitesparse::klu superlu cblas Threads::Threads)
+if(NOT MSVC AND NOT APPLE)
+  target_link_libraries(josim_c PRIVATE stdc++fs)
+endif()
+if(USING_OPENMP)
+  target_link_libraries(josim_c PRIVATE OpenMP::OpenMP_CXX)
+endif()
+target_add_warnings(josim_c)
+
+# JoSIM Co-Simulation IPC Socket Server (Layer 2)
+# -----------------------------------------------
+
+add_executable(josim-cosim-server src/josim_cosim_server.cpp)
+target_include_directories(josim-cosim-server PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(josim-cosim-server PRIVATE josim_c Threads::Threads)
+if(WIN32)
+  target_link_libraries(josim-cosim-server PRIVATE ws2_32)
+endif()
+target_add_warnings(josim-cosim-server)
+
+# Cadence Spectre / SystemVerilog DPI-C Co-Simulation Library (Layer 3A)
+# ----------------------------------------------------------------------
+
+enable_language(C)
+add_library(josim_spectre_dpi SHARED cosim/spectre/josim_cosim_dpi.c)
+target_include_directories(josim_spectre_dpi PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(josim_spectre_dpi PRIVATE josim_c m)
+if(WIN32)
+  target_link_libraries(josim_spectre_dpi PRIVATE ws2_32)
+endif()
+set_target_properties(
+  josim_spectre_dpi PROPERTIES
+  BUILD_RPATH "$<TARGET_FILE_DIR:josim_c>")
+target_add_warnings(josim_spectre_dpi)
+
+# Optional ngspice XSPICE Co-Simulation Code Model (josim_cosim.cm)
+# -----------------------------------------------------------------
+
+set(NGSPICE_SRC_DIR "/home/supertjhok/ngspice-45.2" CACHE PATH "Path to ngspice source tree for XSPICE code model build")
+if(EXISTS "${NGSPICE_SRC_DIR}/src/include/ngspice/cm.h")
+  enable_language(C)
+  add_library(
+    josim_cosim_cm SHARED
+    cosim/ngspice/josim_xspice.c
+    ${NGSPICE_SRC_DIR}/src/xspice/icm/dlmain.c
+    ${NGSPICE_SRC_DIR}/src/misc/dstring.c)
+  target_include_directories(
+    josim_cosim_cm PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/cosim/ngspice
+    ${NGSPICE_SRC_DIR}/src/include)
+  target_compile_definitions(josim_cosim_cm PRIVATE HAVE_CONFIG_H)
+  target_compile_options(josim_cosim_cm PRIVATE -UVERSION -fvisibility=hidden)
+  target_link_libraries(josim_cosim_cm PRIVATE josim_c m)
+  set_target_properties(
+    josim_cosim_cm PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "josim_cosim"
+    SUFFIX ".cm"
+    BUILD_RPATH "$<TARGET_FILE_DIR:josim_c>")
+endif()
+
 # Testing
 # -------
 
@@ -164,7 +231,7 @@ install(FILES LICENSE README.md DESTINATION .)
 
 # Install targets
 install(
-  TARGETS josim josim-cli
+  TARGETS josim josim_c josim-cli
   EXPORT josim-targets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

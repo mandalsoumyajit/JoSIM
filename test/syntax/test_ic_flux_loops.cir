@@ -1,0 +1,66 @@
+* Integration test for Item #5:
+* 1) Static Inductor Flux Offsets (FLUX= / PHI0= / PHI=) on dc-SQUIDs
+* 2) Initial Conditions (.ic P(node)=..., PHI0=...)
+* 3) Topological beta_L Superconducting Loop Auditor (.check_loops)
+
+.model jjmod jj(rtype=1, vg=2.8mV, cap=0.07pF, r0=160, rn=16, icrit=0.25mA)
+
+* --- 1. Unfrustrated dc-SQUID (FLUX = 0.0 Phi0) ---
+* Total Ic_max = 0.50 mA; biased at 0.42 mA -> remains in zero-voltage state (0 SFQ pulses)
+Ib1 0 2 pwl(0 0 5p 0.42m 60p 0.42m)
+L1a 2 1 2p FLUX=0.0
+L1b 2 3 2p FLUX=0.0
+B1a 1 0 jjmod area=1.0
+R1a 1 0 2.0
+B1b 3 0 jjmod area=1.0
+R1b 3 0 2.0
+
+* --- 2. Frustrated dc-SQUID (FLUX = 0.5 Phi0 total) ---
+* Half-flux-quantum frustration suppresses Ic_max well below 0.42 mA -> switches into voltage state!
+Ib2 0 5 pwl(0 0 5p 0.42m 60p 0.42m)
+L2a 5 4 2p FLUX=0.25
+L2b 5 6 2p FLUX=-0.25
+B2a 4 0 jjmod area=1.0
+R2a 4 0 2.0
+B2b 6 0 jjmod area=1.0
+R2b 6 0 2.0
+
+* --- 3. Initial Condition (.ic) Triggered Phase Slip ---
+* B3 initialized at P(7) = 2.8 rad with a brief sub-threshold bias; B4 starts at 0 rad with identical bias
+.ic P(7)=2.8
+Ib3 0 7 pwl(0 0.18m 15p 0.18m 20p 0)
+B3  7 0 jjmod area=1.0
+R3  7 0 2.0
+
+Ib4 0 8 pwl(0 0.18m 15p 0.18m 20p 0)
+B4  8 0 jjmod area=1.0
+R4  8 0 2.0
+
+* --- 4. Storage Quantizing Loop (L_loop = 8 pH, beta_L ~ 6.08 > pi) ---
+L5  9 10 8p
+B5a 9 0  jjmod area=1.0
+R5a 9 0  2.0
+B5b 10 0 jjmod area=1.0
+R5b 10 0 2.0
+
+.tran 0.25p 60p 0 0.25p
+.check_loops
+
+* Verify dc-SQUID flux modulation (SQUID 1 silent, SQUID 2 oscillates)
+.meas TRAN cnt_squid0 COUNT B1a VAL=0
+.meas TRAN cnt_squid_half COUNT B2a MIN=3
+
+* Verify .ic phase initialization causes B3 to switch while B4 does not
+.meas TRAN cnt_ic_set COUNT B3 VAL=1
+.meas TRAN cnt_ic_zero COUNT B4 VAL=0
+
+* Verify topological beta_L loop audit parameters
+.meas TRAN n_loops     PARAM='LOOP_COUNT' VAL=3
+.meas TRAN n_storage   PARAM='LOOP_STORAGE_COUNT' VAL=1
+.meas TRAN n_degen     PARAM='LOOP_DEGENERATE_COUNT' VAL=0
+.meas TRAN beta_squid1 PARAM='BETA_L_B1A' MIN=2.9 MAX=3.14
+.meas TRAN flux_squid2 PARAM='FLUX_LOOP_B2A' MIN=0.49 MAX=0.51
+.meas TRAN beta_stor   PARAM='BETA_L_B5A' MIN=5.8 MAX=6.3
+
+.print PHASE B1a B2a B3 B4
+.end

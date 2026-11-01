@@ -8,6 +8,7 @@
 #include "JoSIM/Misc.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring> // for memcmp
 #include <functional>
 #include <iostream>
@@ -73,35 +74,71 @@ TransmissionLine::TransmissionLine(const std::pair<tokens_t, string_o>& s,
     bool   useInterp = txInterp;
     double rawTd     = 0.0;
     bool   hasTd     = false;
-    // Find the parts that contain the impedance and time delay
+    bool   hasAlpha  = false;
+    double alphaVal  = 0.0;
+    bool   hasLen    = false;
+    double lenVal    = 0.0;
+    // Find the parts that contain the impedance, time delay, and optional attenuation
     for (auto i = 5; i < s.first.size(); ++i) {
+        const std::string& tok = s.first.at(i);
         // Impedance
-        if (::memcmp(s.first.at(i).c_str(), "Z0=", 3) == 0) {
-            // If impedance keyword is specified but no value given
-            if (s.first.at(i).length() < 4) {
-                // Complain
+        if (tok.size() >= 3 && ::memcmp(tok.c_str(), "Z0=", 3) == 0) {
+            if (tok.length() < 4) {
                 Errors::invalid_component_errors(ComponentErrors::INVALID_TX_DEFINED, Misc::vector_to_string(s.first));
             }
-            // Set the value (Z0), this should be a value
-            netlistInfo.value_ = parse_param(s.first.at(i).substr(3), pm, s.second);
+            netlistInfo.value_ = parse_param(tok.substr(3), pm, s.second);
         }
         // Time Delay
-        if (::memcmp(s.first.at(i).c_str(), "TD=", 3) == 0) {
-            // If impedance keyword is specified but no value given
-            if (s.first.at(i).length() < 4) {
-                // Complain
+        if (tok.size() >= 3 && ::memcmp(tok.c_str(), "TD=", 3) == 0) {
+            if (tok.length() < 4) {
                 Errors::invalid_component_errors(ComponentErrors::INVALID_TX_DEFINED, Misc::vector_to_string(s.first));
             }
-            // Set the time delay (TD), this should be a value
-            rawTd = parse_param(s.first.at(i).substr(3), pm, s.second);
+            rawTd = parse_param(tok.substr(3), pm, s.second);
             hasTd = true;
         }
-        if (s.first.at(i) == "INTERP=1" || s.first.at(i) == "INTERP=TRUE") {
+        // Attenuation / Loss keywords
+        if (tok.size() > 3 && ::memcmp(tok.c_str(), "DB=", 3) == 0) {
+            const double db = std::abs(parse_param(tok.substr(3), pm, s.second));
+            atten_ *= std::pow(10.0, -db / 20.0);
+        } else if (tok.size() > 8 && ::memcmp(tok.c_str(), "LOSS_DB=", 8) == 0) {
+            const double db = std::abs(parse_param(tok.substr(8), pm, s.second));
+            atten_ *= std::pow(10.0, -db / 20.0);
+        } else if (tok.size() > 9 && ::memcmp(tok.c_str(), "ATTEN_DB=", 9) == 0) {
+            const double db = std::abs(parse_param(tok.substr(9), pm, s.second));
+            atten_ *= std::pow(10.0, -db / 20.0);
+        } else if (tok.size() > 5 && ::memcmp(tok.c_str(), "LOSS=", 5) == 0) {
+            const double lossFrac = parse_param(tok.substr(5), pm, s.second);
+            atten_ *= std::clamp(1.0 - lossFrac, 0.0, 1.0);
+        } else if (tok.size() > 6 && ::memcmp(tok.c_str(), "ATTEN=", 6) == 0) {
+            const double g = parse_param(tok.substr(6), pm, s.second);
+            atten_ *= std::clamp(g, 0.0, 1.0);
+        } else if (tok.size() > 6 && ::memcmp(tok.c_str(), "GAMMA=", 6) == 0) {
+            const double g = parse_param(tok.substr(6), pm, s.second);
+            atten_ *= std::clamp(g, 0.0, 1.0);
+        } else if (tok.size() > 5 && ::memcmp(tok.c_str(), "GAIN=", 5) == 0) {
+            const double g = parse_param(tok.substr(5), pm, s.second);
+            atten_ *= std::clamp(g, 0.0, 1.0);
+        } else if (tok.size() > 6 && ::memcmp(tok.c_str(), "ALPHA=", 6) == 0) {
+            alphaVal = parse_param(tok.substr(6), pm, s.second);
+            hasAlpha = true;
+        } else if (tok.size() > 4 && ::memcmp(tok.c_str(), "LEN=", 4) == 0) {
+            lenVal = parse_param(tok.substr(4), pm, s.second);
+            hasLen = true;
+        } else if (tok.size() > 3 && ::memcmp(tok.c_str(), "NL=", 3) == 0) {
+            lenVal = parse_param(tok.substr(3), pm, s.second);
+            hasLen = true;
+        }
+        if (tok == "INTERP=1" || tok == "INTERP=TRUE") {
             useInterp = true;
-        } else if (s.first.at(i) == "INTERP=0" || s.first.at(i) == "INTERP=FALSE") {
+        } else if (tok == "INTERP=0" || tok == "INTERP=FALSE") {
             useInterp = false;
         }
     }
+    if (hasAlpha) {
+        const double effDist = hasLen ? std::abs(lenVal) : std::abs(rawTd);
+        atten_ *= std::exp(-std::abs(alphaVal) * effDist);
+    }
+    atten_ = std::clamp(atten_, 0.0, 1.0);
     if (hasTd) {
         if (useInterp) {
             const double exactSteps = rawTd / h;

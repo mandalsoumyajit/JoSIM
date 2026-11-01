@@ -250,3 +250,290 @@ Combining Batched Nodal reduction (`Simulation::trans_sim_mc_nodal`, `-p -n`) wi
 On the 30k-JJ / 89,922-equation macro deck (`r12p15`, `1,982,000` timesteps, 8-point `.sweep @BIAS` on 8 threads), batched Nodal with `.option sweepall -o out.npy` completes in **`1,370.8 s` (`10.1 GB` RSS)** and batched Events-Only mode (`-p -n -e out.events.npy`) completes in **`1,325.4 s` using only `0.46 GB` (`468.7 MB`) total RSS** (`13.4x` less RAM than 8 concurrent single-thread `-n` runs at `8 × 0.77 GB = 6.14 GB`, with `0.001–0.007 fs` worst event shift).
 
 
+
+---
+
+### E. Automated Critical Operating Margin Finder (`-M` / `.margins`) & Golden Event Verifier (`--verify-events`)
+
+Instead of running dozens of separate 1D sweeps or relying on net end-of-simulation $2\pi$ winding counts (which miss intermediate extra+dropped pulse pairs, swapped pulse ordering, or cycle timing violations), **`-M` / `.margins`** packs a shared nominal reference (`Trial 0`) and all target perturbations into a single batched Nodal OpenMP pass (`-p -n` in zero-allocation Events-Only mode) and verifies the exact ordered `(polarity, time)` SFQ event sequence across every Josephson junction in the circuit within $\pm\tau_{\text{tol}}$ (default `50 ps`, with local-shift-aware alignment and finite-horizon $t_{\text{stop}}$ awareness):
+
+```bash
+# Global category critical margins (@BIAS, @JJ, @IND, @RES)
+josim-cli -M test/ex_ksa4bit.cir
+
+# Subcircuit-scoped category or per-device critical margins on DUT cell X0 + CSV export
+josim-cli -M "@DEFAULT|X0" test/ex_mitll_dff_wr.cir
+josim-cli -M "@DEVICES|X0" --margin-file=dff_margins.csv test/ex_mitll_dff_wr.cir
+
+# Export golden SFQ events and verify against golden reference (.csv or .npy)
+josim-cli -e dff_golden.events.npy test/ex_mitll_dff_wr.cir
+josim-cli --verify-events=dff_golden.events.npy --margin-tol=10p test/ex_mitll_dff_wr.cir
+```
+
+Example output on the 74-device MIT-LL DFF cell (`josim-cli -M "@DEVICES|X0" test/ex_mitll_dff_wr.cir`, **1,481 batched trials completed in `< 0.20 s`**):
+
+```text
+========================================================================================================
+JoSIM Critical Operating Margin Report (74 target(s), 1481 batched trials, 21 JJs, 173 nominal SFQ events, tol = +/-50.0 ps)
+========================================================================================================
+Rank Target            Cat          Lower     Upper   Window [Scale]    Center   Crit(%)  Limiting Failure Mode (Root Cause)
+--------------------------------------------------------------------------------------------------------
+1    IB01RX1|X0        BIAS        -20.0%     +5.0%     [0.80, 1.05]     -7.5%      5.0%  [+]: EXTRA_PULSE P(B02RX1|X0) #1 @ 19.6ps
+2    IB1|X0            BIAS        -25.0%     +5.0%     [0.75, 1.05]    -10.0%      5.0%  [+]: EXTRA_PULSE P(B2|X0) #1 @ 17.5ps
+3    B2|X0             JJ           -5.0%    +35.0%     [0.95, 1.35]    +15.0%      5.0%  [-]: EXTRA_PULSE P(B2|X0) #1 @ 16.9ps
+4    IB01RX2|X0        BIAS        -20.0%    +10.0%     [0.80, 1.10]     -5.0%     10.0%  [+]: EXTRA_PULSE P(B02RX2|X0) #2 @ 67.3ps
+5    B01RX1|X0         JJ          -10.0%   >+50.0%     [0.90, 1.50]    +20.0%     10.0%  [-]: EXTRA_PULSE P(B02RX1|X0) #1 @ 19.2ps
+...
+--------------------------------------------------------------------------------------------------------
+  Critical Bottleneck : IB01RX1|X0 (BIAS) -> 5.0% on UPPER boundary ([+]: EXTRA_PULSE P(B02RX1|X0) #1 @ 19.6ps)
+  Centering Advisory  : IB01RX1|X0 is off-center by -7.5% (scale 0.925x, value 2.312e-04); recentering improves critical margin from 5.0% -> +/-12.5%.
+========================================================================================================
+```
+
+---
+
+### F. Bit-Stream / SFQ Pulse-Train Sources (`PAT`, `SFQ`) & Digital Vector Assertions (`.assert`, `-A`)
+
+Instead of hand-calculating $V_{\text{peak}} = \Phi_0 / w$ and writing multi-line `PWL(...)` coordinate tables to drive DC/SFQ converters or JTL inputs, JoSIM provides two native digital/SFQ source functions and built-in self-checking digital assertions:
+
+1. **`PAT(v0 v1 td tr tf [pw] per <pattern> [RZ|NRZ] [R=repeat] [RB=start_bit])`:**
+   - Generates RZ (when `pw < per` or `RZ` is specified) or NRZ (`NRZ` or `pw` omitted) digital bitstreams from binary/ternary strings (`10110100`, `10-1`), `B1011...`, or hex (`0xB4`, `HEX:A5`).
+2. **`SFQ([td [per [fwhm [pattern_or_count]]]] [TIMES=t1,t2,...] [AMP=val] [PHI0=mult] [R=repeat])`:**
+   - **On Voltage Sources (`V...`):** Generates raised-cosine ($\sin^2$) voltage pulses of duration $2w$ (`w = fwhm`) with exact flux-quantum area $\int_0^{2w} V(\tau)\,d\tau = \Phi_0$ ($V_{\text{peak}} = \Phi_0 / w \approx 1.0339\,\text{mV}$ for $w = 2\,\text{ps}$), directly driving JTLs or SFQ logic gates without a DC/SFQ converter.
+   - **On Phase Sources (`P...`):** Generates $C^2$-smooth $2\pi$ phase steps over duration $2w$.
+   - **On Current Sources (`I...`):** Generates smooth raised-cosine current pulses (default $500\,\mu\text{A}$ or `AMP=<val>`).
+3. **Digital Vector Assertions (`.assert` / `.vec` / `-A <spec>` / `--assert=<spec>`):**
+   - **Windowed Bitstream (`BITS=`):** `.assert B2|X5 td=55p per=20p bits=01100110 [win=20p] [tol=2p]` (supports `1`, `0`, `-`, `X` don't-care, or hex `0x66`).
+   - **Pulse Count (`COUNT=`):** `.assert B02 count=4 [from=10p] [to=200p]`
+   - **Pulse Arrival Times (`TIMES=`):** `.assert B02 times=24.65p,74.65p,99.65p,149.65p tol=0.5p`
+   - **Relative Propagation Delay (`AFTER`):** `.assert B02 after B01 delay=1.83p tol=0.5p`
+
+```spice
+* Drive a 2-stage JTL directly with a Phi0-quantized SFQ voltage source and verify with .assert
+VIN 4 0 sfq(20p 25p 2p 101101)
+.assert B01 td=20p per=25p bits=101101
+.assert B02 td=20p per=25p bits=101101
+.assert B02 count=4
+.assert B02 after B01 delay=1.83p tol=0.5p
+```
+
+```bash
+# CLI assertions (-A / --assert) combined with Margin Finder (-M)
+josim-cli -A "B2|X3:COUNT=2" -A "B2|X3:TD=100p PER=20p BITS=100000010000" test/ex_mitll_dff_wr.cir
+```
+
+---
+
+### G. Standard SPICE Parameterized `.subckt`s, Extended Math Functions, & Wildcard `.print` / `.assert` Globs
+
+1. **Parameterized `.subckt` Definitions & Per-Instance Overrides:**
+   - `.subckt NAME n1 n2 ... [PARAMS:] [p1=def1 p2=def2 ...]` defines default subcircuit parameters.
+   - `X1 n1 n2 ... NAME [PARAMS:] [p1=val1 p2={expr} ...]` instantiates `NAME` in an isolated parameter scope (`NAME|X1`) and automatically recomputes all dependent `.param` expressions inside the subcircuit (such as MIT-LL cell `Scaling` parameters) for that specific instance.
+2. **Extended `.param` Math Library & Multi-Parameter Lines:**
+   - Multiple `NAME=EXPR` definitions per `.param` card (e.g. `.param a=10u b=2*a c=min(a,b)`).
+   - **1-arg functions:** `abs`/`fabs`, `sgn`/`sign`, `floor`, `ceil`, `round`/`nint`, `trunc`/`int`, `frac`, `step`/`u`, `uramp`, `sqrt`, `cbrt`, `exp`, `exp2`, `ln`/`log`, `log10`, `log2`, `erf`, `erfc`, `db`, and all trigonometric/hyperbolic functions (`sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`).
+   - **2-arg & variadic functions:** `min(a, b, ...)`, `max(a, b, ...)`, `pow(x, y)` / `pwr(x, y)` / `pwrs(x, y)`, `atan2(y, x)`, `hypot(x, y)`, `mod(x, y)` / `fmod(x, y)`.
+   - **3-arg functions:** `if(cond, tVal, fVal)` / `ternary(cond, tVal, fVal)`, `limit(x, lo, hi)` / `clamp(x, lo, hi)`.
+3. **Wildcard Globbing (`*`, `?`) in `.print` / `.save` and `.assert`:**
+   - Use `*` and `?` in `.print`, `.plot`, `.save`, and `.assert` / `-A` to match devices or nodes across hierarchies:
+     ```spice
+     .print P(B*|X0) V(*|X0) I(IB?|X*)
+     .assert B*|X* count=3
+     ```
+
+---
+
+### H. SPICE `.meas` / `.measure` Engine with Native SFQ Event Triggers (`--meas`, `--meas-file`)
+
+1. **Propagation Delays (`TRIG ... TARG ...`):**
+   - **Native SFQ Event Triggers:** `.meas tran t_prop TRIG P(B01) SFQ=1 TARG P(B02) SFQ=1` (supports `SFQ=k` or `SFQ=LAST`, optional `TD=<time>`, and `POL=+|-`).
+   - **Standard SPICE Threshold Crossings:** `.meas tran t_d TRIG V(1) VAL=0.1m RISE=1 TARG V(2) VAL=0.1m RISE=1` (`RISE=`, `FALL=`, `CROSS=`, `LAST`, `TD=`).
+2. **Conditional & Point Lookups (`WHEN`, `FIND ... AT=...`, `FIND ... WHEN ...`, `DERIV`):**
+   - `.meas tran t_last WHEN P(B02) SFQ=LAST`
+   - `.meas tran phi_end FIND P(B02) AT=170p`
+   - `.meas tran ib_sw FIND I(IB1) WHEN P(B01) SFQ=1`
+3. **Waveform Window & SFQ Event Reductions (`AVG`, `RMS`, `MIN`, `MAX`, `MIN_AT`, `MAX_AT`, `PP`, `INTEG`, `COUNT`, `FREQ`, `VPEAK`, `FWHM`, `DT_PI`, `AREA`, `PARAM=`):**
+   - `.meas tran flux_p1 INTEG V(B01) FROM=15p TO=35p` (automatically reports $\Phi_0$ ratio)
+   - `.meas tran vpk_1 VPEAK P(B02) SFQ=1` and `.meas tran fwhm_1 FWHM P(B02) SFQ=1`
+   - `.meas tran delay_ps PARAM='t_prop * 1e12'` (references any earlier `.meas` or `.param` name)
+   - Inline pass/fail goals (`VAL=<v>`, `MIN=<v>`, `MAX=<v>`, `TOL=<v>`) can be attached to any `.meas` statement for self-checking verification.
+   - In batched Monte Carlo (`-b`) or `.sweep` (`-S`) runs, JoSIM automatically computes ensemble `Mean`, `StdDev`, `Min`, `Max`, and `Valid` counts across all trials and exports to CSV via `--meas-file=<file>` or `.option measfile=<file>`.
+
+---
+
+### I. Initial Conditions (`.ic`), Static Inductor Flux Offsets (`FLUX=`), & $\beta_L$ Loop Auditor (`--check-loops`)
+
+1. **Static Inductor Flux Offsets (`FLUX=`, `PHI0=`, `PHI=`, `IC=`):**
+   - Apply a static external magnetic flux bias (in units of $\Phi_0$ via `FLUX=<f>` / `PHI0=<f>`, or in radians via `PHI=<rad>`) directly to any inductor card without extra coupled flux-bias current sources:
+     ```spice
+     L2a 5 4 2p FLUX=0.25
+     L2b 5 6 2p FLUX=-0.25
+     ```
+2. **Initial Conditions (`.ic`, `--ic`, and Component `PHI0=`, `IC_V=`, `IC=`):**
+   - Set initial node voltages/phases or device states at $t = 0$:
+     ```spice
+     .ic P(7)=2.8 V(1)=0.5m I(L1)=0.1m
+     B3 7 0 jjmod area=1.0 PHI0=2.8 PHIOFF=0.0
+     C1 1 0 1p IC=0.5m
+     ```
+3. **Topological $\beta_L$ Superconducting Loop Auditor (`.check_loops` / `.option checkloops` / `--check-loops[=<file>]`):**
+   - Automatically discovers all fundamental superconducting loops in the `L + B` graph, reports $L_{\text{loop}}$, $I_{c,\min}$, $\beta_L = \frac{2\pi L_{\text{loop}} I_{c,\min}}{\Phi_0}$, net flux offset $|\Phi_{\text{offset}}|/\Phi_0$, and loop classification (`DEGENERATE_0L`, `SUB_CRITICAL`, `NON_STORAGE`, `STORAGE_QUANT`, `MULTI_FLUX_TRAP`), and populates `LOOP_COUNT`, `LOOP_STORAGE_COUNT`, `LOOP_DEGENERATE_COUNT`, `BETA_L_<JJ>`, `L_LOOP_<JJ>`, and `FLUX_LOOP_<JJ>` for `.meas` verification:
+     ```spice
+     .check_loops
+     .meas TRAN beta_squid1 PARAM='BETA_L_B1A' MIN=2.9 MAX=3.14
+     .meas TRAN flux_squid2 PARAM='FLUX_LOOP_B2A' MIN=0.49 MAX=0.51
+     ```
+
+---
+
+### J. Lossy Transmission Line Attenuation (`DB=`, `LOSS=`, `ATTEN=`, `ALPHA=`)
+
+Transmission line (`T`) elements support distortionless one-way wave attenuation $\gamma \in [0, 1]$ in both Phase and Voltage analysis modes across all solver paths (standard MNA, fractional-delay `INTERP=1`, reduced Nodal, OpenMP PTL-windowed, batched Monte Carlo, and GPU):
+
+- **`DB=<val>` / `LOSS_DB=<val>` / `ATTEN_DB=<val>`:** One-way attenuation in decibels ($\gamma = 10^{-|\text{val}|/20}$).
+- **`LOSS=<frac>`:** Fractional one-way amplitude loss ($\gamma = 1 - \text{frac}$).
+- **`ATTEN=<val>` / `GAMMA=<val>` / `GAIN=<val>`:** Direct one-way wave transmission factor ($\gamma = \text{val}$).
+- **`ALPHA=<val>` [with optional `LEN=<L>` / `NL=<L>`]:** Exponential attenuation factor ($\gamma = e^{-|\alpha| L}$ if `LEN=`/`NL=` is provided, or $\gamma = e^{-|\alpha| T_d}$ in $\text{Np/s}$).
+
+```spice
+T1 p1 0 p2 0 Z0=5.0 TD=20p DB=6.0206
+T2 p3 0 p4 0 Z0=5.0 TD=20.1p DB=3.0 INTERP=1
+T3 p5 0 p6 0 Z0=5.0 TD=20p LOSS=0.25
+T4 p7 0 p8 0 Z0=5.0 TD=20p ALPHA=3.4657359e10
+```
+
+---
+
+### K. Built-In Timing Jitter, Skew & Bit-Error-Rate (BER) Analyzer (`.jitter` / `.ber`, `-J`)
+
+JoSIM includes a built-in SFQ timing jitter, skew, propagation latency, and bit-error-rate (BER) analyzer that operates directly on sub-timestep-interpolated SFQ $2\pi$ switching events (`SfqEvent`) across single runs and batched Monte Carlo (`-b <N>`) ensembles:
+
+1. **Netlist Cards (`.jitter` / `.ber`) & Modes:**
+   - **Reference-Trace Mode (`REF=<trace>`):** Pairs each reference pulse with the target's causal arrival pulse, computing mean propagation delay, RMS jitter ($\sigma_t$), peak-to-peak jitter, cycle-to-cycle jitter, missed pulses, spurious pulses, and BER:
+     ```spice
+     .jitter J_PROP B02 REF=B01 MAX_RMS=1p MAX_BER=0 STRICT
+     ```
+   - **Periodic Clock-Grid & Bit-Slot BER Mode (`PER=<T>` / `FREQ=<f>` [with `TD=`, `N=`, `WIN=`, `BITS=`]):** Measures clock skew/jitter against an ideal grid $t_k = T_d + k \cdot T_{\text{per}}$ and checks expected `0`/`1` bit slots when `BITS=<pattern>` is supplied:
+     ```spice
+     .jitter J_CLK B01 PER=25p TD=20p N=4 MAX_RMS=1p STRICT
+     .ber J_BITS B02 PER=25p TD=10p BITS=01111 MAX_BER=0 STRICT
+     ```
+   - **Self-Period / Ensemble Mode (`ENSEMBLE`):** Without `REF=` or `PER=`, computes self-period and inter-pulse jitter in a single trial (`SELF_PERIOD`) or cross-trial arrival-time jitter and dropout/spurious BER across a `-b <N>` Monte Carlo ensemble (`ENSEMBLE(<N>)`):
+     ```spice
+     .jitter J_SELF B01
+     ```
+
+2. **CLI Options & `.meas` Parameter Export:**
+   - `-J` / `--jitter[=<spec>]`: Run `.jitter` cards, audit all junctions when given with no arguments (`-J`), or add inline CLI specs (`-J "B02 REF=B01 MAX_RMS=0.5p"`).
+   - `--jitter-file=<file>` (or `.option jitterfile=<file>`): Export the jitter/BER table to `.csv` or `.json`.
+   - Named `.jitter <name> ...` cards automatically export `LATENCY_<name>`, `JITTER_RMS_<name>`, `JITTER_PP_<name>`, `JITTER_C2C_<name>`, `BER_<name>`, and `ERRORS_<name>` into `.param` scope for downstream `.meas` expressions.
+
+---
+
+### L. Model/Circuit `.iv`, Shapiro-Step & 2D SQUID $V(\Phi)$ / $I_c(\Phi)$ Extractor (`.iv`, `.squid`)
+
+JoSIM provides an OpenMP-parallelized DC steady-state I-V, microwave Shapiro-step, and 1D/2D SQUID characterization engine via `.iv` / `--iv="<spec>"` and `.squid` / `--squid="<spec>"`:
+
+1. **Model-Level, Circuit-Level & Shapiro-Step `.iv`:**
+   - **Classic / Hysteretic Model `.iv`:**
+     ```spice
+     .iv jmitll 300u iv.csv
+     .iv j_under 400u STEP=10u NAME=JJ_MOD
+     ```
+   - **Microwave RF Shapiro-Step `.iv` (`RF_AMP=`, `RF_FREQ=`):** Superposes an RF drive $I_{\text{RF}} \sin(2\pi f_{\text{RF}} t)$ and averages over an exact integer number of RF cycles $K / f_{\text{RF}}$ to resolve quantized voltage plateaus $V_n = n \Phi_0 f_{\text{RF}}$ and step current widths $\Delta I_0, \Delta I_1, \Delta I_2, \Delta I_3$:
+     ```spice
+     .iv j_squid 260u MIN=0 STEP=2.5u RSHUNT=2.0 RF_AMP=120u RF_FREQ=20G NAME=JJ_SHAP
+     ```
+   - **Whole-Circuit `.iv` (`CIRCUIT` or `<isrc_name>`):** Sweeps a bias source in the expanded circuit and measures Hann-windowed steady-state DC voltage across the port or `VNODE=<node|n1,n2|Bname>`:
+     ```spice
+     .iv IB 300u MIN=0 STEP=10u VNODE=3 NAME=SQ_IV OUT=squid_iv.csv
+     ```
+   - Automatically exports `IV_IC_POS`, `IV_IC_NEG`, `IV_IR_POS`, `IV_IR_NEG`, `IV_RN`, `SHAPIRO_V1`, and `SHAPIRO_DI0..3` (plus `_*_<NAME>` suffixed variants) into `.param` scope for `.meas`.
+
+2. **1D & 2D SQUID Flux Modulation Extractor (`.squid` / `--squid`):**
+   - Sweeps external flux $\Phi_{\text{ext}} \in [\text{FMIN}, \text{FMAX}]$ (in $\Phi_0$ on loop inductor `L=<Lname>` or current on `FSRC=<Iflux>`) at fixed bias (`IB=<val>`) or across a 2D current grid (`IMIN=`, `IMAX=`, `ISTEP=`):
+     ```spice
+     .squid IB L1 IMAX=240u IMIN=80u ISTEP=10u FMIN=0.0 FMAX=1.0 FSTEP=0.1 VNODE=3 NAME=SQ2D OUT=squid2d.csv
+     ```
+   - Automatically extracts and exports `SQUID_VMIN`, `SQUID_VMAX`, `SQUID_DV`, `SQUID_DV_DPHI_MAX`, `SQUID_PHI_OPT`, `SQUID_IB_OPT`, `SQUID_IC_MAX`, `SQUID_IC_MIN`, and `SQUID_IC_MOD` into `.param` scope for `.meas`.
+
+---
+
+### M. In-Memory Python / C Binding (`pyjosim` & `josim_c`)
+
+JoSIM builds a shared C library (`libjosim_c.so` / `josim_c.dll`, header [`include/JoSIM/josim_c_api.h`](../include/JoSIM/josim_c_api.h)) and a zero-dependency `ctypes` + NumPy Python binding ([`scripts/pyjosim.py`](../scripts/pyjosim.py), also re-exported by [`scripts/josim_io.py`](../scripts/josim_io.py)) for zero-copy in-memory simulation and rapid parameter optimization loops:
+
+1. **One-Shot In-Memory Simulation (Zero-Copy NumPy Views):**
+   ```python
+   import pyjosim
+
+   res = pyjosim.simulate_file("circuit.cir", params={"IBIAS": 180e-6})
+   # Zero-copy 1D float64 NumPy views directly into C++ std::vector<double>
+   t = res.time
+   v_out = res["V(2)"]
+   # Structured NumPy array of SFQ switching events
+   events = res.events
+   # Evaluated .meas and .param dictionaries (including JITTER_*, SQUID_*, IV_*, LOOP_*)
+   delay = res.meas["T_PROP"]
+   ```
+
+2. **Persistent Session with Pre-Parsed AST Re-Run (`JoSIMSession`):**
+   ```python
+   with pyjosim.JoSIMSession() as sim:
+       sim.load_string(netlist_str)
+       for ib in [140e-6, 175e-6, 200e-6]:
+           res = sim.run(params={"IBIAS": f"{ib:.6e}"})
+           print(ib, res.meas["T_PROP"], len(res.events))
+   ```
+   - `sim.load_file()` / `sim.load_string()` parses and caches the raw netlist AST once (`baseInput`), so subsequent `sim.run(params=...)` calls clone the pre-lexed AST in memory and re-evaluate parameters without re-reading files or spawning subprocesses.
+
+---
+
+### N. Batched One-At-A-Time (OAAT) Sensitivity & Automated Margin Centering (`.sens`)
+
+JoSIM provides a single-batch OAAT central-difference sensitivity and operating-margin centering engine via `.sens` / `.sensitivity`, `--sens[=<spec>]`, and `--sens-file=<file>`:
+
+1. **Fast 3-Point OAAT Sensitivity ($B = 2D + 1$ Batched Trials):**
+   ```spice
+   .meas tran T_PROP TRIG P(B01) SFQ=1 TARG P(B02) SFQ=1
+   .sens @DEVICES DELTA=0.05 METRIC=T_PROP
+   ```
+   - Perturbs each target $k \in \{1, \dots, D\}$ by $1 \pm \delta$ around the shared nominal trial $0$, computing relative sensitivity $g_k = \frac{\partial M}{\partial s_k}$, dimensionless normalized sensitivity $S_k = \frac{p_{k,0}}{M_0}\frac{\partial M}{\partial p_k}$, curvature $\frac{\partial^2 M}{\partial s_k^2}$, SFQ switching latency sensitivity $\frac{\partial t_{\text{SFQ}}}{\partial s_k}$, and RSS variance contribution percentage $W_k = g_k^2 / \sum_j g_j^2 \times 100\%$.
+
+2. **Full Operating-Band & Goal-Newton Margin Centering (`CENTER`, `GOAL=`):**
+   ```spice
+   .sens @DEVICES DELTA=0.05 CENTER MIN=0.4 MAX=1.8 STEP=0.05
+   ```
+   - Evaluates both the $\pm \delta$ sensitivity Jacobian and the full pass/fail operating margin bracket $[s_{\min,k}, s_{\max,k}]$ in one batched pass, recommending centered component values $p_{k,\text{center}} = \frac{s_{\min,k} + s_{\max,k}}{2} p_{k,0}$ (or 1-step Newton updates toward `GOAL=<val>`), and exporting `SENS_<TGT>`, `SENS_NORM_<TGT>`, `SENS_WEIGHT_<TGT>`, `CENTER_SCALE_<TGT>`, `CENTER_VAL_<TGT>`, `MARGIN_CRIT_PCT_<TGT>`, and `MARGIN_CENTERED_PCT_<TGT>` into `.param` scope for `.meas`.
+
+
+
+
+
+
+
+
+---
+
+### O. Compact Superconducting Nanowire / Cryotron (`nTron` / `hTron` / `SNSPD`) Device Element (`N`)
+
+JoSIM includes a native electrothermal superconducting nanowire / cryotron component (`N...`) supporting 2-terminal nanowires/SNSPDs, 3-terminal `nTron`s (gate return to ground), and 4-terminal isolated-gate `hTron`s / cryotrons:
+
+1. **Model & Device Syntax:**
+   ```spice
+   .model NTRON_MOD ntron(ic=100u ig=20u ir=15u rn=500 l=40p lg=5p tau=15p tau_hs=2p alpha=1.0)
+   .model SNSPD_MOD snspd(ic=50u ir=12u rn=800 l=50p tau=12p tau_hs=1.5p)
+
+   * 3-terminal nTron (drain, source, gate; gate return is ground 0)
+   N1 drain 0 gate NTRON_MOD
+
+   * 4-terminal cryotron / hTron (drain, source, gate+, gate-) with inline parameter overrides
+   N2 d s gp gm NTRON_MOD IC=120u IG=20u IR=25u RN=400 L=25p LG=6p RG=2 TAU=8p
+
+   * 2-terminal nanowire / SNSPD (or externally gated via GATE=<branch_or_isrc>)
+   N3 n2 0 SNSPD_MOD
+   ```
+2. **Electrothermal Physics & Probing:**
+   - **Gate-Suppressed Switching Current:** $I_{\text{sw}}(I_g) = I_{c0} \cdot \max\bigl(0,\, 1 - (|I_g| / I_{g,\text{sw}})^\alpha\bigr)$.
+   - **Hotspot Nucleation & Thermal Recovery:** When $|I_{\text{ch}}| > I_{\text{sw}}(I_g)$, the normalized hotspot fraction $w(t) \in [0, 1]$ grows toward $1$ with overdrive-accelerated time constant $\tau_{\text{eff}} = \tau_{\text{hs}} / \max(1, (|I_{\text{ch}}| - I_{\text{sw}}) / (0.25 I_{c0}))$, ramping the channel resistance $R_{\text{ch}}(t) = R_n w(t)$ and diverting channel current into the load. Once $|I_{\text{ch}}| \le I_r$ (and $|I_{\text{ch}}| \le I_{\text{sw}}(I_g)$), the hotspot cools exponentially with thermal recovery time constant $\tau_{\text{th}}$ back to the lossless superconducting state ($R_{\text{ch}} = 0\,\Omega$).
+   - **Waveform & `.meas` Probing:** Supports `V(N1)`, `I(N1)`, `P(N1)` on the channel and `I(N1|G)` / `I(N1|GATE)` on the synthesized gate branch, as well as `.margins` and `.sens` perturbations (`N1` or `@JJS` / `@DEVICES`).

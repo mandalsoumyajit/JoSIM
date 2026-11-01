@@ -10,7 +10,18 @@
 
 namespace JoSIM {
 
-enum class FunctionType { PWL = 0, PULSE = 1, SINUSOID = 2, CUS = 3, NOISE = 4, PWS = 5, DC = 6, EXP = 7 };
+enum class FunctionType {
+    PWL      = 0,
+    PULSE    = 1,
+    SINUSOID = 2,
+    CUS      = 3,
+    NOISE    = 4,
+    PWS      = 5,
+    DC       = 6,
+    EXP      = 7,
+    PAT      = 8,
+    SFQ      = 9
+};
 
 class Function {
   private:
@@ -27,6 +38,8 @@ class Function {
     void                parse_noise(const tokens_t& t, const Input& iObj, const string_o& s);
     void                parse_dc(const tokens_t& t, const Input& iObj, const string_o& s);
     void                parse_exp(const tokens_t& t, const Input& iObj, const string_o& s);
+    void                parse_pat(const tokens_t& t, const Input& iObj, const string_o& s);
+    void                parse_sfq(const tokens_t& t, const Input& iObj, const string_o& s, char devPrefix);
     double              return_pwl(double& x);
     double              return_pulse(double& x);
     double              return_sin(double& x);
@@ -35,6 +48,8 @@ class Function {
     double              return_pws(double& x);
     double              return_dc();
     double              return_exp(double& x);
+    double              return_pat(double& x);
+    double              return_sfq(double& x);
 
   public:
     Function() {};
@@ -80,7 +95,7 @@ class Function {
     bool                       is_bias_like() const noexcept { return bias_rule() != nullptr; }
 
     void                       clearMisc() {
-        miscValues_.clear();
+        if (fType_ == FunctionType::NOISE) { miscValues_.clear(); }
         lastIdx_ = 0;
     }
 

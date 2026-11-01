@@ -1,0 +1,71 @@
+* Test Lossy Transmission Line Attenuation (DB=, LOSS=, ATTEN=, ALPHA=)
+.model jjmod jj(rtype=1, vg=2.8mV, cap=0.07pF, r0=160ohm, rn=16ohm, icrit=0.1mA)
+
+* Common step-pulse voltage source: 1 mV starting at t=5ps
+VDRV n_drv 0 PWL(0 0 4p 0 5p 1m 100p 1m)
+
+* 1. Lossless matched 5-ohm line (TD=20ps, gamma=1.0 -> V(p2_0db) = 0.5 mV)
+R1S n_drv p1_0db 5.0
+T1  p1_0db 0 p2_0db 0 Z0=5.0 TD=20p
+R1L p2_0db 0 5.0
+
+* 2. 6.0206 dB lossy matched line (TD=20ps, gamma=0.5 -> V(p2_6db) = 0.25 mV)
+R2S n_drv p1_6db 5.0
+T2  p1_6db 0 p2_6db 0 Z0=5.0 TD=20p DB=6.0206
+R2L p2_6db 0 5.0
+
+* 3. LOSS=0.25 matched line (TD=20ps, gamma=0.75 -> V(p2_loss) = 0.375 mV)
+R3S n_drv p1_loss 5.0
+T3  p1_loss 0 p2_loss 0 Z0=5.0 TD=20p LOSS=0.25
+R3L p2_loss 0 5.0
+
+* 4. ATTEN=0.75 matched line (TD=20ps, gamma=0.75 -> V(p2_atten) = 0.375 mV)
+R4S n_drv p1_atten 5.0
+T4  p1_atten 0 p2_atten 0 Z0=5.0 TD=20p ATTEN=0.75
+R4L p2_atten 0 5.0
+
+* 5. ALPHA=ln(2)/20ps matched line (TD=20ps, gamma=0.5 -> V(p2_alpha) = 0.25 mV)
+R5S n_drv p1_alpha 5.0
+T5  p1_alpha 0 p2_alpha 0 Z0=5.0 TD=20p ALPHA=3.4657359e10
+R5L p2_alpha 0 5.0
+
+* 5b. Fractional-delay interpolated lossy line (TD=20.1ps, INTERP=1, DB=6.0206 -> V(p2_interp) = 0.25 mV)
+R6S n_drv p1_interp 5.0
+T6  p1_interp 0 p2_interp 0 Z0=5.0 TD=20.1p DB=6.0206 INTERP=1
+R6L p2_interp 0 5.0
+
+* 6. SFQ PTL Receiver Link: low loss (1.5 dB) switches receiver, high loss (12 dB) suppresses switching
+VSFQ n_sfq 0 SFQ(10p 1.0)
+* Low-loss PTL link (DB=1.5)
+RSFQ1 n_sfq p1_sfq_ok 2.0
+TSFQ1 p1_sfq_ok 0 p2_sfq_ok 0 Z0=2.0 TD=15p DB=1.5
+IB1   0 p2_sfq_ok PWL(0 0 2p 160u 100p 160u)
+BRX_OK p2_sfq_ok 0 jjmod area=2.0
+
+* High-loss PTL link (DB=12.0)
+RSFQ2 n_sfq p1_sfq_lossy 2.0
+TSFQ2 p1_sfq_lossy 0 p2_sfq_lossy 0 Z0=2.0 TD=15p DB=12.0
+IB2   0 p2_sfq_lossy PWL(0 0 2p 160u 100p 160u)
+BRX_DEAD p2_sfq_lossy 0 jjmod area=2.0
+
+.tran 0.25p 80p
+
+.print DEVV T1
+.print NODEV p2_0db p2_6db p2_loss p2_atten p2_alpha p2_interp
+.print DEVP BRX_OK BRX_DEAD
+
+* Verify exact attenuated voltages at t=50ps
+.meas tran V_0DB    FIND V(p2_0db)    AT=50p VAL=0.5m   TOL=0.01
+.meas tran V_6DB    FIND V(p2_6db)    AT=50p VAL=0.25m  TOL=0.01
+.meas tran V_LOSS   FIND V(p2_loss)   AT=50p VAL=0.375m TOL=0.01
+.meas tran V_ATTEN  FIND V(p2_atten)  AT=50p VAL=0.375m TOL=0.01
+.meas tran V_ALPHA  FIND V(p2_alpha)  AT=50p VAL=0.25m  TOL=0.01
+.meas tran V_INTERP FIND V(p2_interp) AT=50p VAL=0.25m  TOL=0.01
+.meas tran RATIO_6DB PARAM='V_6DB / V_0DB' VAL=0.5 TOL=0.01
+.meas tran RX_OK_PULSES   NPULSES P(BRX_OK)   VAL=1 TOL=0.01
+.meas tran RX_DEAD_PULSES NPULSES P(BRX_DEAD) VAL=0 TOL=0.01
+
+.assert BRX_OK   NPULSES 1
+.assert BRX_DEAD NPULSES 0
+
+.end

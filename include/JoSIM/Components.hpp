@@ -13,6 +13,7 @@
 #include "JoSIM/Input.hpp"
 #include "JoSIM/JJ.hpp"
 #include "JoSIM/Misc.hpp"
+#include "JoSIM/Nanowire.hpp"
 #include "JoSIM/Parameters.hpp"
 #include "JoSIM/PhaseSource.hpp"
 #include "JoSIM/Resistor.hpp"
@@ -37,15 +38,16 @@ class Components {
                              VCCS,
                              CCCS,
                              VCVS,
-                             CCVS>>
+                             CCVS,
+                             Nanowire>>
                                devices;
     std::vector<CurrentSource> currentsources;
     std::vector<int64_t> junctionIndices, resistorIndices, inductorIndices, capacitorIndices, vsIndices, psIndices,
-            txIndices, vccsIndices, cccsIndices, vcvsIndices, ccvsIndices;
+            txIndices, vccsIndices, cccsIndices, vcvsIndices, ccvsIndices, nanowireIndices;
     std::vector<std::pair<tokens_t, string_o>> mutualinductances;
     std::unordered_map<std::string, int64_t>   deviceMap;
     std::unordered_map<std::string, int64_t>   csMap;
 }; // class Components
 
 } // namespace JoSIM
-#endif // JOSIM_COMPONENTS_HPP
+#endif

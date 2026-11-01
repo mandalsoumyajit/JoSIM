@@ -153,3 +153,11 @@ def load_josim_events(
         by_trace.setdefault(name, []).append(signed_t)
     return {k: np.asarray(v, dtype=np.float64) for k, v in by_trace.items()}
 
+
+from pyjosim import (  # noqa: E402, F401
+    SFQ_EVENT_DTYPE,
+    Session,
+    SimulationResult,
+    simulate_file,
+    simulate_netlist,
+)

@@ -1,0 +1,34 @@
+// Cadence Spectre + JoSIM Co-Simulation Example 1:
+// 4K Cryo-CMOS Clock/Data Driver coupled to a 2-Port JoSIM RSFQ D-Flip-Flop (DRO)
+simulator lang=spectre
+global 0
+
+ahdl_include "libjosim_spectre_dpi.so" -cds_va_dpi
+ahdl_include "josim_cosim_port.va"
+
+// 4K Cryo-CMOS MOSFET models (EKV/BSIM4 low-temperature parameters)
+model nch_4k bsim4 type=n vth0=0.22 u0=0.085 tox=1.8e-9
+model pch_4k bsim4 type=p vth0=-0.22 u0=0.045 tox=1.8e-9
+
+Vdd (vdd 0) vsource dc=0.8
+
+// Input data pulse (at t = 25 ps) and readout clock pulse (at t = 65 ps)
+Vdin (din_in 0) vsource type=pwl wave=[0 0.8 22p 0.8 25p 0.0 33p 0.0 36p 0.8 100p 0.8]
+Vclk (clk_in 0) vsource type=pwl wave=[0 0.8 62p 0.8 65p 0.0 73p 0.0 76p 0.8 100p 0.8]
+
+// Cryo-CMOS Inverter Drivers + Resistive Attenuators into Superconducting SFQ Ports
+Mp_d (drv_d din_in vdd vdd) pch_4k w=8u l=65n
+Mn_d (drv_d din_in 0   0)   nch_4k w=4u l=65n
+Ratt_d (drv_d sfq_set) resistor r=1600
+
+Mp_c (drv_c clk_in vdd vdd) pch_4k w=8u l=65n
+Mn_c (drv_c clk_in 0   0)   nch_4k w=4u l=65n
+Ratt_c (drv_c sfq_ro)  resistor r=1600
+
+// 2-Port JoSIM Superconducting RSFQ DFF Subsystem
+Xsfq_dff (sfq_set 0 sfq_ro 0) josim_cosim_port_2p \
+    netlist="sfq_dff.cir" port_nodes="n_set,n_ro" port_modes="0,0"
+
+dcOp dc
+tran1 tran stop=100p step=0.5p maxstep=0.5p errpreset=conservative
+save drv_d drv_c sfq_set sfq_ro

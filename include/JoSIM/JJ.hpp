@@ -59,6 +59,7 @@ class JJ : public BasicComponent {
     double                  nominalArea_   = 1.0;
     double                  spread_        = 1.0;
     std::optional<double>   Ic_, nominalIc_, temp_, neb_, spAmp_;
+    std::optional<double>   icPhase_, icVoltage_, instPhiOff_;
     Model                   model_;
     Model                   baseModel_;
     double                  phaseConst_ = 0.0;

@@ -3,56 +3,177 @@
 
 #include "JoSIM/Function.hpp"
 
+#include "JoSIM/Constants.hpp"
 #include "JoSIM/Misc.hpp"
 #include "JoSIM/Parameters.hpp"
 #include "spline.h"
 
+#include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 
 using namespace JoSIM;
 
+namespace {
+
+bool decode_bit_pattern(const std::string& rawIn, std::vector<double>& outBits) {
+    outBits.clear();
+    std::string s = rawIn;
+    for (const char* pfx : {"PATTERN=", "PAT=", "BITS=", "VEC="}) {
+        if (s.rfind(pfx, 0) == 0) {
+            s = s.substr(std::strlen(pfx));
+            break;
+        }
+    }
+    if (s.empty()) { return false; }
+
+    if (s.rfind("0X", 0) == 0 || s.rfind("HEX:", 0) == 0) {
+        const size_t start = (s.rfind("0X", 0) == 0) ? 2 : 4;
+        if (start >= s.size()) { return false; }
+        for (size_t i = start; i < s.size(); ++i) {
+            const char c = s[i];
+            if (c == '_') { continue; }
+            int nib = -1;
+            if (c >= '0' && c <= '9') {
+                nib = c - '0';
+            } else if (c >= 'A' && c <= 'F') {
+                nib = 10 + (c - 'A');
+            } else {
+                return false;
+            }
+            outBits.push_back(((nib >> 3) & 1) ? 1.0 : 0.0);
+            outBits.push_back(((nib >> 2) & 1) ? 1.0 : 0.0);
+            outBits.push_back(((nib >> 1) & 1) ? 1.0 : 0.0);
+            outBits.push_back((nib & 1) ? 1.0 : 0.0);
+        }
+        return !outBits.empty();
+    }
+
+    if (s.size() >= 2 && s[0] == 'B') { s = s.substr(1); }
+    for (char c : s) {
+        if (c == '_') {
+            continue;
+        } else if (c == '1' || c == '+' || c == 'H') {
+            outBits.push_back(1.0);
+        } else if (c == '0' || c == 'L') {
+            outBits.push_back(0.0);
+        } else if (c == '-' || c == 'N') {
+            outBits.push_back(-1.0);
+        } else {
+            outBits.clear();
+            return false;
+        }
+    }
+    return !outBits.empty();
+}
+
+bool is_explicit_pattern_token(const std::string& tok) {
+    if (tok.rfind("0X", 0) == 0 || tok.rfind("HEX:", 0) == 0 || tok.rfind("PAT=", 0) == 0
+        || tok.rfind("BITS=", 0) == 0 || tok.rfind("PATTERN=", 0) == 0) {
+        std::vector<double> tmp;
+        return decode_bit_pattern(tok, tmp);
+    }
+    if (tok.size() >= 2 && tok[0] == 'B') {
+        std::vector<double> tmp;
+        return decode_bit_pattern(tok, tmp);
+    }
+    if (tok.size() >= 2 && tok.find('_') != std::string::npos) {
+        std::vector<double> tmp;
+        return decode_bit_pattern(tok, tmp);
+    }
+    return false;
+}
+
+bool is_raw_bitstring_token(const std::string& tok) {
+    if (tok.empty()) { return false; }
+    bool hasBitChar = false;
+    for (size_t i = 0; i < tok.size(); ++i) {
+        const char c = tok[i];
+        if (c == '0' || c == '1') {
+            hasBitChar = true;
+        } else if (c == '_' || c == '-' || c == 'N' || c == '+') {
+            // valid ternary / separator
+        } else {
+            return false;
+        }
+    }
+    return hasBitChar;
+}
+
+} // namespace
+
 void Function::parse_function(const std::string& str, const Input& iObj, const string_o& subckt) {
-    auto        first = str.find('(') + 1;
-    auto        last  = str.find(')');
+    const auto openParen  = str.find('(');
+    const auto closeParen = str.rfind(')');
+    std::string fHead;
+    if (openParen != std::string::npos) {
+        size_t endKw = openParen;
+        while (endKw > 0 && std::isspace(static_cast<unsigned char>(str[endKw - 1]))) { --endKw; }
+        size_t startKw = endKw;
+        while (startKw > 0 && !std::isspace(static_cast<unsigned char>(str[startKw - 1]))) { --startKw; }
+        fHead = str.substr(startKw, endKw - startKw);
+    }
+    char devPrefix = 'I';
+    for (char c : str) {
+        if (!std::isspace(static_cast<unsigned char>(c))) {
+            devPrefix = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            break;
+        }
+    }
+
+    const auto  first = (openParen != std::string::npos) ? (openParen + 1) : 0;
+    const auto  last  = (closeParen != std::string::npos && closeParen >= first) ? closeParen : str.size();
     std::string p     = str.substr(first, last - first);
     tokens_t    t     = Misc::tokenize(p, " ,");
+
     /* PWL(0 V0 T1 V1 T2 V2 ... TN VN) */
-    if (str.find("PWL") != std::string::npos) {
+    if (fHead.find("PWL") != std::string::npos || (fHead.empty() && str.find("PWL") != std::string::npos)) {
         fType_ = FunctionType::PWL;
         parse_pwl(t, iObj, subckt);
     }
     /* PULSE(A1 A2 TD[0.0] TR[TSTEP] TF[TSTEP] PW[TSTOP] PER[TSTOP])*/
-    else if (str.find("PULSE") != std::string::npos) {
+    else if (fHead.find("PULSE") != std::string::npos || (fHead.empty() && str.find("PULSE") != std::string::npos)) {
         fType_ = FunctionType::PULSE;
         parse_pulse(t, iObj, subckt);
     }
     /* SIN(VO VA FREQ[1/TSTOP] TD[0.0] THETA[0.0]) */
-    else if (str.find("SIN") != std::string::npos) {
+    else if (fHead.find("SIN") != std::string::npos || (fHead.empty() && str.find("SIN") != std::string::npos)) {
         fType_ = FunctionType::SINUSOID;
         parse_sin(t, iObj, subckt);
     }
     /* CUS(WaveFile.dat TS[TSTEP] SF[1.0] IM[1] TD[0.0] PER[0]) */
-    else if (str.find("CUS") != std::string::npos) {
+    else if (fHead.find("CUS") != std::string::npos || (fHead.empty() && str.find("CUS") != std::string::npos)) {
         fType_ = FunctionType::CUS;
         parse_cus(t, iObj, subckt);
     }
     /* NOISE(VA TD TSTEP) */
-    else if (str.find("NOISE") != std::string::npos) {
+    else if (fHead.find("NOISE") != std::string::npos || (fHead.empty() && str.find("NOISE") != std::string::npos)) {
         fType_ = FunctionType::NOISE;
         parse_noise(t, iObj, subckt);
     }
     /* PWS(0 0 T1 V1 T2 V2 .. TN VN) */
-    else if (str.find("PWS") != std::string::npos) {
+    else if (fHead.find("PWS") != std::string::npos || (fHead.empty() && str.find("PWS") != std::string::npos)) {
         fType_ = FunctionType::PWS;
         parse_pwl(t, iObj, subckt);
     }
     /* EXP(V1 V2 TD1[0.0] TAU1[TSTEP] TD2[TD1+TSTEP] TAU2[TSTEP]) */
-    else if (str.find("EXP") != std::string::npos) {
+    else if (fHead.find("EXP") != std::string::npos || (fHead.empty() && str.find("EXP") != std::string::npos)) {
         fType_ = FunctionType::EXP;
         parse_exp(t, iObj, subckt);
+    }
+    /* PAT(V0 V1 TD TR TF [PW] PER PATTERN [RZ|NRZ] [R=repeat]) */
+    else if (fHead.find("PAT") != std::string::npos) {
+        fType_ = FunctionType::PAT;
+        parse_pat(t, iObj, subckt);
+    }
+    /* SFQ([TD [PER [FWHM [PATTERN_OR_COUNT]]]] [TIMES=t1,t2,...] [AMP=val] [PHI0=mult]) */
+    else if (fHead.find("SFQ") != std::string::npos) {
+        fType_ = FunctionType::SFQ;
+        parse_sfq(t, iObj, subckt, devPrefix);
     }
     /* DC VALUE */
     else if (str.find("DC") != std::string::npos) {
@@ -313,6 +434,327 @@ void Function::parse_exp(const tokens_t& t, const Input& iObj, const string_o& s
     if (t.size() >= 6) { timeValues_.at(3) = parse_param(t.at(5), iObj.parameters, s); }
 }
 
+void Function::parse_pat(const tokens_t& t, const Input& iObj, const string_o& s) {
+    /*
+       Supported forms:
+         1. PAT(V0 V1 TD TR TF PW PER <PATTERN> [RZ|NRZ] [R=repeat])
+         2. PAT(V0 V1 TD TR TF PER <PATTERN> [RZ|NRZ] [RB [R]])
+         3. PAT(V0 V1 TD PER <PATTERN> [RZ|NRZ] [PW=val])
+       <PATTERN> supports binary/ternary ('1', '0', '-', 'N', '_'), 'B1011...', or hex '0xA5' / 'HEX:A5'.
+    */
+    ampValues_.clear();
+    timeValues_.clear();
+    miscValues_.clear();
+
+    const double tstep = (iObj.transSim.tstep() > 0.0) ? iObj.transSim.tstep() : 1e-12;
+    double       v0    = 0.0;
+    double       v1    = 0.0;
+    double       td    = 0.0;
+    double       tr    = tstep;
+    double       tf    = tstep;
+    double       pw    = -1.0;
+    double       per   = 20.0 * tstep;
+    int          rzOpt = -1; // -1 = auto, 0 = NRZ, 1 = RZ
+    double       rep   = 0.0;
+    double       rb    = 0.0;
+
+    bool                hasKwV0 = false, hasKwV1 = false, hasKwTd = false, hasKwTr = false, hasKwTf = false;
+    bool                hasKwPw = false, hasKwPer = false;
+    std::vector<double> bits;
+    tokens_t            posToks;
+
+    for (const auto& tok : t) {
+        if (tok == "RZ" || tok == "RZ=1" || tok == "RZ=TRUE" || tok == "NRZ=0" || tok == "NRZ=FALSE") {
+            rzOpt = 1;
+        } else if (tok == "NRZ" || tok == "NRZ=1" || tok == "NRZ=TRUE" || tok == "RZ=0" || tok == "RZ=FALSE") {
+            rzOpt = 0;
+        } else if (tok == "REPEAT" || tok == "INF" || tok == "R=INF" || tok == "REPEAT=INF") {
+            rep = -1.0;
+        } else if (tok.rfind("PAT=", 0) == 0 || tok.rfind("BITS=", 0) == 0 || tok.rfind("PATTERN=", 0) == 0
+                   || tok.rfind("VEC=", 0) == 0) {
+            decode_bit_pattern(tok, bits);
+        } else if (tok.rfind("V0=", 0) == 0 || tok.rfind("VLO=", 0) == 0 || tok.rfind("ALOW=", 0) == 0) {
+            v0      = parse_param(tok.substr(tok.find('=') + 1), iObj.parameters, s);
+            hasKwV0 = true;
+        } else if (tok.rfind("V1=", 0) == 0 || tok.rfind("VHI=", 0) == 0 || tok.rfind("AHIGH=", 0) == 0) {
+            v1      = parse_param(tok.substr(tok.find('=') + 1), iObj.parameters, s);
+            hasKwV1 = true;
+        } else if (tok.rfind("TD=", 0) == 0) {
+            td      = parse_param(tok.substr(3), iObj.parameters, s);
+            hasKwTd = true;
+        } else if (tok.rfind("TR=", 0) == 0) {
+            tr      = parse_param(tok.substr(3), iObj.parameters, s);
+            hasKwTr = true;
+        } else if (tok.rfind("TF=", 0) == 0) {
+            tf      = parse_param(tok.substr(3), iObj.parameters, s);
+            hasKwTf = true;
+        } else if (tok.rfind("PW=", 0) == 0) {
+            pw      = parse_param(tok.substr(3), iObj.parameters, s);
+            hasKwPw = true;
+        } else if (tok.rfind("PER=", 0) == 0 || tok.rfind("TBIT=", 0) == 0 || tok.rfind("TSAMPLE=", 0) == 0) {
+            per      = parse_param(tok.substr(tok.find('=') + 1), iObj.parameters, s);
+            hasKwPer = true;
+        } else if (tok.rfind("R=", 0) == 0 || tok.rfind("REPEAT=", 0) == 0) {
+            const std::string rv = tok.substr(tok.find('=') + 1);
+            rep                  = (rv == "INF" || rv == "-1") ? -1.0 : parse_param(rv, iObj.parameters, s);
+        } else if (tok.rfind("RB=", 0) == 0) {
+            rb = std::max(0.0, parse_param(tok.substr(3), iObj.parameters, s));
+        } else {
+            posToks.push_back(tok);
+        }
+    }
+
+    size_t patPosIdx = SIZE_MAX;
+    if (bits.empty()) {
+        for (size_t i = 0; i < posToks.size(); ++i) {
+            if (is_explicit_pattern_token(posToks[i])) {
+                decode_bit_pattern(posToks[i], bits);
+                patPosIdx = i;
+                break;
+            }
+        }
+    }
+    if (bits.empty() && !posToks.empty()) {
+        for (size_t idx = posToks.size(); idx > 0; --idx) {
+            const size_t i = idx - 1;
+            if (i >= 2 && is_raw_bitstring_token(posToks[i])) {
+                decode_bit_pattern(posToks[i], bits);
+                patPosIdx = i;
+                break;
+            }
+        }
+    }
+
+    tokens_t numToks;
+    for (size_t i = 0; i < posToks.size(); ++i) {
+        if (i == patPosIdx) {
+            if (i + 1 < posToks.size()) { rb = std::max(0.0, parse_param(posToks[i + 1], iObj.parameters, s)); }
+            if (i + 2 < posToks.size()) { rep = parse_param(posToks[i + 2], iObj.parameters, s); }
+            break;
+        }
+        numToks.push_back(posToks[i]);
+    }
+
+    if (numToks.size() >= 1 && !hasKwV0) { v0 = parse_param(numToks[0], iObj.parameters, s); }
+    if (numToks.size() >= 2 && !hasKwV1) { v1 = parse_param(numToks[1], iObj.parameters, s); }
+    if (numToks.size() >= 3 && !hasKwTd) { td = parse_param(numToks[2], iObj.parameters, s); }
+
+    if (numToks.size() >= 7) {
+        if (!hasKwTr) { tr = parse_param(numToks[3], iObj.parameters, s); }
+        if (!hasKwTf) { tf = parse_param(numToks[4], iObj.parameters, s); }
+        if (!hasKwPw) { pw = parse_param(numToks[5], iObj.parameters, s); }
+        if (!hasKwPer) { per = parse_param(numToks[6], iObj.parameters, s); }
+    } else if (numToks.size() == 6) {
+        if (!hasKwTr) { tr = parse_param(numToks[3], iObj.parameters, s); }
+        if (!hasKwTf) { tf = parse_param(numToks[4], iObj.parameters, s); }
+        if (!hasKwPer) { per = parse_param(numToks[5], iObj.parameters, s); }
+    } else if (numToks.size() == 5) {
+        if (!hasKwTr) { tr = parse_param(numToks[3], iObj.parameters, s); }
+        if (!hasKwTf) { tf = tr; }
+        if (!hasKwPer) { per = parse_param(numToks[4], iObj.parameters, s); }
+    } else if (numToks.size() == 4) {
+        if (!hasKwPer) { per = parse_param(numToks[3], iObj.parameters, s); }
+    }
+
+    bool isNrz = true;
+    if (rzOpt == 1) {
+        isNrz = false;
+    } else if (rzOpt == 0) {
+        isNrz = true;
+    } else if (pw > 0.0 && pw < per) {
+        isNrz = false;
+    }
+
+    if (!isNrz && pw <= 0.0) {
+        pw = std::max(tstep, 0.5 * per - tr - tf);
+    } else if (pw <= 0.0) {
+        pw = per;
+    }
+
+    if (bits.empty()) {
+        Errors::function_errors(FunctionErrors::PULSE_TOO_FEW_ARGUMENTS, "PAT requires a bit pattern");
+        bits.push_back(0.0);
+    }
+
+    ampValues_  = {v0, v1};
+    timeValues_ = {td, std::max(0.0, tr), std::max(0.0, tf), std::max(0.0, pw), std::max(tstep, per), isNrz ? 1.0 : 0.0, rep, rb};
+    miscValues_ = std::move(bits);
+}
+
+void Function::parse_sfq(const tokens_t& t, const Input& iObj, const string_o& s, char devPrefix) {
+    /*
+       SFQ([TD [PER [FWHM [PATTERN_OR_COUNT]]]])
+       Keyword overrides: TD=, PER=, FWHM=/W=, AMP=/VA=/I=, PHI0=/NPHI0=, PAT=/BITS=, COUNT=/N=, TIMES=/AT=, R=/REPEAT=, MODE=V|P|I
+    */
+    ampValues_.clear();
+    timeValues_.clear();
+    miscValues_.clear();
+
+    const double tstop    = (iObj.transSim.tstop() > 0.0) ? iObj.transSim.tstop() : 100e-12;
+    double       td       = 5e-12;
+    double       per      = 20e-12;
+    double       fwhm     = 2e-12;
+    double       phi0Mult = 1.0;
+    double       userAmp  = -1.0;
+    int64_t      count    = -1;
+    double       rep      = 0.0;
+    char         modeChar = devPrefix;
+
+    bool                hasKwTd = false, hasKwPer = false, hasKwFwhm = false;
+    std::vector<double> bits;
+    std::vector<double> explicitTimes;
+    std::vector<double> explicitSigns;
+    tokens_t            posToks;
+
+    auto parse_times_list = [&](const std::string& listStr) {
+        size_t pos = 0;
+        while (pos < listStr.size()) {
+            size_t next = listStr.find_first_of(",;:", pos);
+            if (next == std::string::npos) { next = listStr.size(); }
+            if (next > pos) {
+                std::string item = listStr.substr(pos, next - pos);
+                double      sign = 1.0;
+                if (!item.empty() && item[0] == '-') {
+                    sign = -1.0;
+                    item = item.substr(1);
+                } else if (!item.empty() && item[0] == '+') {
+                    item = item.substr(1);
+                }
+                const double tv = parse_param(item, iObj.parameters, s);
+                if (std::isfinite(tv) && tv >= 0.0) {
+                    explicitTimes.push_back(tv);
+                    explicitSigns.push_back(sign);
+                }
+            }
+            pos = next + 1;
+        }
+    };
+
+    for (const auto& tok : t) {
+        if (tok.rfind("TD=", 0) == 0) {
+            td      = parse_param(tok.substr(3), iObj.parameters, s);
+            hasKwTd = true;
+        } else if (tok.rfind("PER=", 0) == 0 || tok.rfind("TBIT=", 0) == 0) {
+            per      = parse_param(tok.substr(tok.find('=') + 1), iObj.parameters, s);
+            hasKwPer = true;
+        } else if (tok.rfind("FWHM=", 0) == 0 || tok.rfind("W=", 0) == 0 || tok.rfind("PW=", 0) == 0
+                   || tok.rfind("WIDTH=", 0) == 0) {
+            fwhm      = parse_param(tok.substr(tok.find('=') + 1), iObj.parameters, s);
+            hasKwFwhm = true;
+        } else if (tok.rfind("AMP=", 0) == 0 || tok.rfind("VA=", 0) == 0 || tok.rfind("I=", 0) == 0
+                   || tok.rfind("IPEAK=", 0) == 0 || tok.rfind("VPEAK=", 0) == 0) {
+            userAmp = parse_param(tok.substr(tok.find('=') + 1), iObj.parameters, s);
+        } else if (tok.rfind("PHI0=", 0) == 0 || tok.rfind("NPHI0=", 0) == 0 || tok.rfind("FLUX=", 0) == 0) {
+            phi0Mult = parse_param(tok.substr(tok.find('=') + 1), iObj.parameters, s);
+        } else if (tok.rfind("COUNT=", 0) == 0 || tok.rfind("N=", 0) == 0 || tok.rfind("NPULSES=", 0) == 0) {
+            count = static_cast<int64_t>(std::round(parse_param(tok.substr(tok.find('=') + 1), iObj.parameters, s)));
+        } else if (tok.rfind("PAT=", 0) == 0 || tok.rfind("BITS=", 0) == 0 || tok.rfind("PATTERN=", 0) == 0) {
+            decode_bit_pattern(tok, bits);
+        } else if (tok.rfind("TIMES=", 0) == 0 || tok.rfind("AT=", 0) == 0) {
+            parse_times_list(tok.substr(tok.find('=') + 1));
+        } else if (tok.rfind("R=", 0) == 0 || tok.rfind("REPEAT=", 0) == 0) {
+            const std::string rv = tok.substr(tok.find('=') + 1);
+            rep                  = (rv == "INF" || rv == "-1") ? -1.0 : parse_param(rv, iObj.parameters, s);
+        } else if (tok.rfind("MODE=", 0) == 0) {
+            const std::string mv = tok.substr(5);
+            if (!mv.empty()) { modeChar = mv[0]; }
+        } else {
+            posToks.push_back(tok);
+        }
+    }
+
+    size_t patPosIdx = SIZE_MAX;
+    if (bits.empty()) {
+        for (size_t i = 0; i < posToks.size(); ++i) {
+            if (is_explicit_pattern_token(posToks[i])) {
+                decode_bit_pattern(posToks[i], bits);
+                patPosIdx = i;
+                break;
+            }
+        }
+    }
+
+    tokens_t numToks;
+    for (size_t i = 0; i < posToks.size(); ++i) {
+        if (i == patPosIdx) { continue; }
+        numToks.push_back(posToks[i]);
+    }
+
+    if (bits.empty() && numToks.size() >= 4 && is_raw_bitstring_token(numToks.back()) && numToks.back().size() >= 2) {
+        decode_bit_pattern(numToks.back(), bits);
+        numToks.pop_back();
+    } else if (bits.empty() && count < 0 && numToks.size() >= 4) {
+        count = static_cast<int64_t>(std::round(parse_param(numToks.back(), iObj.parameters, s)));
+        numToks.pop_back();
+    }
+
+    if (numToks.size() >= 1 && !hasKwTd) { td = parse_param(numToks[0], iObj.parameters, s); }
+    if (numToks.size() >= 2 && !hasKwPer) { per = parse_param(numToks[1], iObj.parameters, s); }
+    if (numToks.size() >= 3 && !hasKwFwhm) { fwhm = parse_param(numToks[2], iObj.parameters, s); }
+
+    if (numToks.size() == 1 && !hasKwPer && bits.empty() && count < 0 && explicitTimes.empty()) {
+        count = 1;
+    }
+
+    fwhm                  = std::max(1e-15, std::abs(fwhm));
+    const bool isPhaseSrc = (modeChar == 'P');
+    double     peakAmp    = 0.0;
+    if (userAmp >= 0.0) {
+        peakAmp = userAmp * phi0Mult;
+    } else if (isPhaseSrc) {
+        peakAmp = 2.0 * Constants::PI * phi0Mult;
+    } else if (modeChar == 'I') {
+        peakAmp = 500e-6 * phi0Mult;
+    } else {
+        peakAmp = (Constants::PHI_ZERO / fwhm) * phi0Mult;
+    }
+
+    std::vector<std::pair<double, double>> events;
+    if (!explicitTimes.empty()) {
+        for (size_t i = 0; i < explicitTimes.size(); ++i) {
+            events.emplace_back(explicitTimes[i], explicitSigns[i]);
+        }
+    } else if (!bits.empty()) {
+        const int64_t nBits  = static_cast<int64_t>(bits.size());
+        const int64_t passes = (rep < 0.0) ? std::max<int64_t>(1, static_cast<int64_t>(std::ceil((tstop - td) / std::max(1e-15, per * nBits))) + 1)
+                                           : (1 + std::max<int64_t>(0, static_cast<int64_t>(std::round(rep))));
+        for (int64_t p = 0; p < passes; ++p) {
+            for (int64_t k = 0; k < nBits; ++k) {
+                const double b = bits[static_cast<size_t>(k)];
+                if (std::abs(b) > 0.0) {
+                    const double tk = td + static_cast<double>(p * nBits + k) * per;
+                    if (tk <= tstop + 4.0 * fwhm) { events.emplace_back(tk, b); }
+                }
+            }
+        }
+    } else {
+        if (per <= 0.0 || count == 1) {
+            events.emplace_back(td, 1.0);
+        } else {
+            const int64_t maxCount = (count > 0)
+                                             ? count
+                                             : (static_cast<int64_t>(std::ceil(std::max(0.0, tstop - td) / per)) + 2);
+            for (int64_t k = 0; k < maxCount; ++k) {
+                const double tk = td + static_cast<double>(k) * per;
+                if (count < 0 && tk > tstop + 4.0 * fwhm) { break; }
+                events.emplace_back(tk, 1.0);
+            }
+        }
+    }
+
+    std::sort(events.begin(), events.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    ampValues_ = {peakAmp};
+    timeValues_.reserve(2 + events.size());
+    timeValues_.push_back(fwhm);
+    timeValues_.push_back(isPhaseSrc ? 1.0 : 0.0);
+    miscValues_.reserve(events.size());
+    for (const auto& ev : events) {
+        timeValues_.push_back(ev.first);
+        miscValues_.push_back(ev.second);
+    }
+}
+
 double Function::return_pwl(double& x) {
     // If x larger than the last timestep then assume last amplitude value
     if (x >= timeValues_.back()) {
@@ -343,7 +785,6 @@ double Function::return_pulse(double& x) {
     double& tf    = timeValues_.at(2);
     double& pw    = timeValues_.at(3);
     double& per   = timeValues_.at(4);
-    double& tstop = timeValues_.at(5);
     double& alow  = ampValues_.at(0);
     double& ahigh = ampValues_.at(1);
     auto    val   = alow;
@@ -391,12 +832,10 @@ double Function::return_sin(double& x) {
 }
 
 double Function::return_cus(double& x) {
-    auto&   ts    = miscValues_.at(0);
-    auto&   sf    = miscValues_.at(1);
-    int     im    = static_cast<int>(std::round(miscValues_.at(2)));
-    auto&   td    = miscValues_.at(3);
-    bool    per   = static_cast<bool>(std::round(miscValues_.at(4)));
-    double& tstop = miscValues_.at(5);
+    auto& ts  = miscValues_.at(0);
+    int   im  = static_cast<int>(std::round(miscValues_.at(2)));
+    auto& td  = miscValues_.at(3);
+    bool  per = static_cast<bool>(std::round(miscValues_.at(4)));
     if (x < td) {
         return 0.0;
     } else {
@@ -497,6 +936,103 @@ double Function::return_exp(double& x) {
     return 0.0;
 }
 
+double Function::return_pat(double& x) {
+    if (ampValues_.size() < 2 || timeValues_.size() < 8 || miscValues_.empty()) { return 0.0; }
+    const double  v0      = ampValues_[0];
+    const double  v1      = ampValues_[1];
+    const double  td      = timeValues_[0];
+    const double  tr      = timeValues_[1];
+    const double  tf      = timeValues_[2];
+    const double  pw      = timeValues_[3];
+    const double  per     = timeValues_[4];
+    const bool    isNrz   = (timeValues_[5] > 0.5);
+    const double  rep     = timeValues_[6];
+    const int64_t rb      = std::clamp<int64_t>(static_cast<int64_t>(std::round(timeValues_[7])),
+                                           0,
+                                           static_cast<int64_t>(miscValues_.size()) - 1);
+    const int64_t effBits = static_cast<int64_t>(miscValues_.size()) - rb;
+
+    if (x < td || per <= 0.0 || effBits <= 0) { return v0; }
+
+    auto get_bit = [&](int64_t k) -> double {
+        if (k < 0) { return 0.0; }
+        if (k < effBits) { return miscValues_[static_cast<size_t>(rb + k)]; }
+        if (rep < 0.0) { return miscValues_[static_cast<size_t>(rb + (k % effBits))]; }
+        const int64_t totalPasses = 1 + std::max<int64_t>(0, static_cast<int64_t>(std::round(rep)));
+        if (k < effBits * totalPasses) { return miscValues_[static_cast<size_t>(rb + (k % effBits))]; }
+        return 0.0;
+    };
+
+    const int64_t k      = static_cast<int64_t>(std::floor((x - td) / per));
+    const double  localT = (x - td) - static_cast<double>(k) * per;
+    const double  bitK   = get_bit(k);
+
+    if (!isNrz) {
+        if (std::abs(bitK) <= 0.0) { return v0; }
+        const double vPeak = (bitK > 0.0) ? v1 : (v0 - (v1 - v0));
+        if (localT < tr) {
+            return (tr > 0.0) ? (v0 + (vPeak - v0) * (localT / tr)) : vPeak;
+        } else if (localT < tr + pw) {
+            return vPeak;
+        } else if (localT < tr + pw + tf) {
+            return (tf > 0.0) ? (vPeak + (v0 - vPeak) * ((localT - tr - pw) / tf)) : v0;
+        }
+        return v0;
+    } else {
+        auto level_of = [&](double b) -> double {
+            return (b > 0.0) ? v1 : ((b < 0.0) ? (v0 - (v1 - v0)) : v0);
+        };
+        const double curVal  = level_of(bitK);
+        const double prevVal = (k > 0) ? level_of(get_bit(k - 1)) : v0;
+        if (std::abs(curVal - prevVal) <= 1e-30) { return curVal; }
+        const double tTrans = (curVal > prevVal) ? tr : tf;
+        if (tTrans > 0.0 && localT < tTrans) {
+            return prevVal + (curVal - prevVal) * (localT / tTrans);
+        }
+        return curVal;
+    }
+}
+
+double Function::return_sfq(double& x) {
+    if (ampValues_.empty() || timeValues_.size() < 2 || miscValues_.empty()) { return 0.0; }
+    const double peakAmp = ampValues_[0];
+    const double fwhm    = timeValues_[0];
+    const bool   isPhase = (timeValues_[1] > 0.5);
+    const double dur     = 2.0 * fwhm;
+    const size_t nPulses = miscValues_.size();
+
+    if (!isPhase) {
+        double       sum   = 0.0;
+        const double tMin  = x - dur;
+        const auto   itBeg = std::lower_bound(timeValues_.begin() + 2, timeValues_.end(), tMin);
+        for (auto it = itBeg; it != timeValues_.end(); ++it) {
+            const double t0 = *it;
+            if (t0 > x) { break; }
+            const double tau = x - t0;
+            if (tau >= 0.0 && tau <= dur) {
+                const size_t idx = static_cast<size_t>(std::distance(timeValues_.begin() + 2, it));
+                const double s   = std::sin(Constants::PI * tau / dur);
+                sum             += miscValues_[idx] * peakAmp * (s * s);
+            }
+        }
+        return sum;
+    } else {
+        double sum = 0.0;
+        for (size_t i = 0; i < nPulses; ++i) {
+            const double t0 = timeValues_[2 + i];
+            if (x <= t0) { break; }
+            const double tau = x - t0;
+            if (tau >= dur) {
+                sum += miscValues_[i] * peakAmp;
+            } else {
+                const double u = tau / dur;
+                sum += miscValues_[i] * peakAmp * (u - std::sin(2.0 * Constants::PI * u) / (2.0 * Constants::PI));
+            }
+        }
+        return sum;
+    }
+}
+
 double Function::value(double x) {
     switch (fType_) {
         case FunctionType::PWL: return return_pwl(x);
@@ -507,6 +1043,8 @@ double Function::value(double x) {
         case FunctionType::PWS: return return_pws(x);
         case FunctionType::DC: return return_dc();
         case FunctionType::EXP: return return_exp(x);
+        case FunctionType::PAT: return return_pat(x);
+        case FunctionType::SFQ: return return_sfq(x);
         default: return 0.0;
     }
 }

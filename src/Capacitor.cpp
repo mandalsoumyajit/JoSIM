@@ -40,9 +40,18 @@ Capacitor::Capacitor(const std::pair<tokens_t, string_o>& s,
                      Spread&                              spread,
                      int64_t&                             bi) {
     double spr = 1.0;
-    for (auto i : s.first) {
-        if (i.find("SPREAD=") != std::string::npos) {
-            spr = parse_param(i.substr(i.find("SPREAD=") + 7), iObj.parameters, s.second);
+    for (size_t idx = 4; idx < s.first.size(); ++idx) {
+        const auto& i = s.first.at(idx);
+        if (i.rfind("SPREAD=", 0) == 0) {
+            spr = parse_param(i.substr(7), iObj.parameters, s.second);
+        } else if (i.rfind("IC=", 0) == 0) {
+            icVoltage_ = parse_param(i.substr(3), iObj.parameters, s.second);
+        } else if (i.rfind("V0=", 0) == 0) {
+            icVoltage_ = parse_param(i.substr(3), iObj.parameters, s.second);
+        } else if (i.rfind("PHI0=", 0) == 0) {
+            icPhase_ = parse_param(i.substr(5), iObj.parameters, s.second);
+        } else if (i.rfind("IC_PHI=", 0) == 0) {
+            icPhase_ = parse_param(i.substr(7), iObj.parameters, s.second);
         }
     }
     at_ = iObj.argAnal;

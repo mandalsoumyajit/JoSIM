@@ -1,0 +1,15 @@
+{
+  "mode": "ltspice_pwl",
+  "spice_template_file": "cosim/ltspice/examples/ltspice_pwl_lna.cir",
+  "josim_netlist_file": "cosim/spectre/examples/ntron_driver.cir",
+  "josim_pos_node": "nd",
+  "josim_neg_node": "0",
+  "spice_port_trace": "v(nd)",
+  "pwl_placeholder": "{PWL_TH}",
+  "req_placeholder": "{R_EQ_VAL}",
+  "r_eq": 25.0,
+  "max_iters": 4,
+  "tol_v": 1.0e-4,
+  "damping": 0.75,
+  "transport": "inproc"
+}

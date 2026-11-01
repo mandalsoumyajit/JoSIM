@@ -1,0 +1,29 @@
+{
+  "mode": "branin_window",
+  "simulator": "ltspice",
+  "spice_template_file": "cosim/ltspice/examples/ltspice_branin_transceiver.cir",
+  "josim_netlist_file": "cosim/ltspice/examples/sfq_ntron_duplex.cir",
+  "t_stop": 6.0e-11,
+  "window_size": 1.5e-11,
+  "transport": "inproc",
+  "spice_vectors": ["v(tx_port)", "v(rx_port)", "v(rx_out)"],
+  "josim_trace_names": ["P(B_RX1)", "P(B_RX2)"],
+  "links": [
+    {
+      "josim_pos_node": "n_rx_port",
+      "josim_neg_node": "0",
+      "spice_port_trace": "v(tx_port)",
+      "spice_pwl_placeholder": "{PWL_WIN_TX}",
+      "z0": 50.0,
+      "td": 1.5e-11
+    },
+    {
+      "josim_pos_node": "n_tx_port",
+      "josim_neg_node": "0",
+      "spice_port_trace": "v(rx_port)",
+      "spice_pwl_placeholder": "{PWL_WIN_RX}",
+      "z0": 50.0,
+      "td": 1.5e-11
+    }
+  ]
+}

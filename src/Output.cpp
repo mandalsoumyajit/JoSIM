@@ -388,9 +388,10 @@ Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
             for (size_t i = 1; i < cols.size(); ++i) {
                 if (cols[i].fileIndex == fIndex || fIndex == -1) { tIndices.emplace_back(static_cast<int64_t>(i)); }
             }
-            std::ofstream     outfile(filename, std::ios::out | std::ios::binary);
             std::vector<char> ioBuf(4 * 1024 * 1024);
+            std::ofstream     outfile;
             outfile.rdbuf()->pubsetbuf(ioBuf.data(), static_cast<std::streamsize>(ioBuf.size()));
+            outfile.open(filename, std::ios::out | std::ios::binary);
             if (!outfile.is_open()) {
                 Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
                 return;
@@ -500,6 +501,7 @@ Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
                     outfile.write(reinterpret_cast<const char*>(colBuf.data()), colBytes);
                 }
             }
+            outfile.close();
         };
 
         if (iObj.cli_output_file) {
@@ -1316,9 +1318,10 @@ void Output::format_csv_or_dat(const std::string& filename, const char& delimite
     for (size_t i = 1; i < traces.size(); ++i) {
         if (traces[i].fileIndex == fIndex || fIndex == -1) { tIndices.emplace_back(i); }
     }
-    std::ofstream     outfile(filename);
     std::vector<char> ioBuf(262144);
+    std::ofstream     outfile;
     outfile.rdbuf()->pubsetbuf(ioBuf.data(), static_cast<std::streamsize>(ioBuf.size()));
+    outfile.open(filename);
     outfile << std::setprecision(15);
     if (outfile.is_open()) {
         for (size_t i = 0; i < tIndices.size() - 1; ++i) { outfile << traces[tIndices[i]].name_ << delimiter; }
@@ -1348,6 +1351,7 @@ void Output::format_csv_or_dat(const std::string& filename, const char& delimite
             bar.complete();
             std::cout << "\n\n";
         }
+        outfile.close();
     } else {
         Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, filename);
     }

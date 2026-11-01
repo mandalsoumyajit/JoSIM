@@ -6,23 +6,24 @@ global 0
 ahdl_include "libjosim_spectre_dpi.so" -cds_va_dpi
 ahdl_include "josim_cosim_port.va"
 
-model nch_4k bsim4 type=n vth0=0.22 u0=0.085 tox=1.8e-9
-model pch_4k bsim4 type=p vth0=-0.22 u0=0.045 tox=1.8e-9
+opts options temp=4.2 tnom=4.2 gmin=1e-12
 
-Vdd (vdd 0) vsource dc=1.0
+model nch_4k mos1 type=n vto=0.20 kp=650u gamma=0.08 phi=0.6 lambda=0.02 cbd=0.2f cbs=0.2f cgso=20p cgdo=20p
+
+Vdd    (vdd 0)    vsource dc=1.0
+Vbias  (vbias 0)  vsource dc=0.28
 
 // 1-Port JoSIM nTron Subsystem (Channel node "nd" exposed to Spectre)
 Xntron (nd 0) josim_cosim_port_norton \
     netlist="ntron_driver.cir" port_nodes="nd" port_modes="0"
 
 // AC-Coupled 4K Cryo-CMOS Common-Source LNA
-Ccouple (nd vg)    capacitor c=500f
-Rbias1  (vdd vg)   resistor  r=60k
-Rbias2  (vg 0)     resistor  r=22k
-Mn_lna  (vout vg 0 0) nch_4k w=32u l=65n
-Rload   (vdd vout) resistor  r=400
-Cload   (vout 0)   capacitor c=10f
+Ccouple (nd vg)       capacitor c=2.0p
+Rbias   (vbias vg)    resistor  r=4k
+Mn_lna  (vout vg 0 0) nch_4k    w=24u l=120n
+Rload   (vdd vout)    resistor  r=1.2k
+Cload   (vout 0)      capacitor c=0.5f
 
 dcOp dc
-tran1 tran stop=120p step=0.5p maxstep=0.5p errpreset=conservative
+tran1 tran stop=60p step=0.2p maxstep=0.2p errpreset=conservative
 save nd vg vout

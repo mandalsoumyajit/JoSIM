@@ -1,0 +1,27 @@
+* LTspice Iterative Robin/Thevenin PWL Relaxation Template
+* Used with run_ltspice_pwl_cosim (scripts/josim_cosim.py)
+* Placeholders {PWL_TH} and {R_EQ_VAL} are updated at each waveform-relaxation iteration.
+.model nmos_4k nmos(level=1 vto=0.20 kp=650u gamma=0.08 phi=0.6 lambda=0.02 cbd=0.2f cbs=0.2f cgso=20p cgdo=20p)
+
+* Thevenin Companion Port from JoSIM nTron Driver (R_eq = 25 Ohm)
+V_th  nth 0  PWL file="{PWL_TH}"
+R_th  nth nd {R_EQ_VAL}
+
+* 2-Stage 4K Cryo-CMOS Common-Source + Source-Follower LNA
+Vdd    vdd    0 1.0
+Vbias1 vbias1 0 0.28
+Cc1    nd     g1 2.0p
+Rbias1 vbias1 g1 4k
+M_cs   d1     g1 0 0 nmos_4k w=24u l=0.12u
+Rd1    vdd    d1 1.2k
+Cload1 d1     0  0.5f
+
+Vbias2 vbias2 0 0.55
+Cc2    d1     g2 2.0p
+Rbias2 vbias2 g2 6k
+M_sf   vdd    g2 vout 0 nmos_4k w=32u l=0.12u
+Rsf    vout   0  800
+Cload2 vout   0  1.0f
+
+.tran 0.2p 60p 0 0.2p
+.end

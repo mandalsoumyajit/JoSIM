@@ -193,3 +193,25 @@ JOSIM_SEED=12345 josim-cli -g -b 256 -o ./mc_yield.npy ./ksa4bit_spread.cir
 By default, JoSIM writes 4 ensemble traces per `.print` variable (`<Trace>` mean, `<Trace>_STD` standard deviation, `<Trace>_MIN`, and `<Trace>_MAX`) using Welford's online algorithm and prints a **Monte Carlo Robustness Summary** table to stdout. Add `.option mcall` to the netlist if you also want all individual trial waveforms (`<Trace>_MC0 .. <Trace>_MC{B-1}`).
 
 See [GPU Acceleration Architecture & Benchmarks](gpu_architecture.md) for detailed scaling benchmarks across all four tiers.
+
+
+## SPICE Co-Simulation Examples (`ngspice`, `LTspice`, and Cadence `Spectre`)
+
+Complete runnable example decks coupling 4K Cryo-CMOS circuits in `ngspice`, `LTspice`, and Cadence `Spectre` with superconducting RSFQ and `nTron` subcircuits in JoSIM are located in:
+
+- `cosim/ngspice/examples/` (`cmos_to_sfq_dff.sp`, `ntron_to_cmos_lna.sp`, `multi_instance_transceiver.sp`)
+- `cosim/spectre/examples/` (`cryo_cmos_sfq.scs`, `ntron_lna.scs`, `multi_partition_transceiver.scs`, plus `sfq_dff.cir`, `ntron_driver.cir`, `sfq_tx.cir`, `ntron_rx_2p.cir`)
+- `cosim/ltspice/examples/` (`ltspice_branin_transceiver.cir`, `ltspice_pwl_lna.cir`, `sfq_ntron_duplex.cir`, `branin_duplex_job.json`, `pwl_lna_job.json`)
+
+```bash
+# Run ngspice + JoSIM XSPICE lockstep co-simulation examples
+LD_LIBRARY_PATH=/tmp/josim-build ngspice -b cosim/ngspice/examples/cmos_to_sfq_dff.sp
+LD_LIBRARY_PATH=/tmp/josim-build ngspice -b cosim/ngspice/examples/ntron_to_cmos_lna.sp
+LD_LIBRARY_PATH=/tmp/josim-build ngspice -b cosim/ngspice/examples/multi_instance_transceiver.sp
+
+# Run LTspice + JoSIM multi-window Branin wave relaxation and damped PWL relaxation examples
+python3 scripts/josim_cosim.py --config cosim/ltspice/examples/branin_duplex_job.json
+python3 scripts/josim_cosim.py --config cosim/ltspice/examples/pwl_lna_job.json
+```
+
+See [SPICE Co-Simulation](cosimulation.md) for full listings of all example decks and API reference.

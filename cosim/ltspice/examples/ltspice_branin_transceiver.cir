@@ -1,0 +1,35 @@
+* LTspice Multi-Window Branin Coax Transceiver Template
+* Used with BraninWaveWindowCoordinator (scripts/josim_cosim.py)
+* Placeholders {PWL_WIN_TX} and {PWL_WIN_RX} are populated automatically per causal window W <= Td.
+.model nmos_4k nmos(level=1 vto=0.22 kp=600u gamma=0.1 phi=0.6 lambda=0.02 cbd=0.3f cbs=0.3f cgso=30p cgdo=30p)
+.model pmos_4k pmos(level=1 vto=-0.22 kp=300u gamma=0.1 phi=0.6 lambda=0.02 cbd=0.3f cbs=0.3f cgso=30p cgdo=30p)
+
+Vdd vdd 0 0.8
+
+* 1. Cryo-CMOS TX Driver launching a pulse at t = 6..10 ps into Port 1 (Z0 = 50 Ohm, Td = 15 ps)
+Vin     in_pulse 0   pwl(0 0.8 5.5p 0.8 6p 0.0 10p 0.0 10.5p 0.8 80p 0.8)
+Mp_tx   tx_drv   in_pulse vdd vdd pmos_4k w=24u l=0.12u
+Mn_tx   tx_drv   in_pulse 0   0   nmos_4k w=12u l=0.12u
+R_tx_s  tx_drv   tx_port  35.0
+R_tx_z0 tx_port  tx_win   50.0
+V_tx_w  tx_win   0        PWL file="{PWL_WIN_TX}"
+
+* 2. Cryo-CMOS RX 2-Stage LNA receiving the nTron pulse from Port 2 (Z0 = 50 Ohm, Td = 15 ps)
+V_rx_w  rx_win   0        PWL file="{PWL_WIN_RX}"
+R_rx_z0 rx_port  rx_win   50.0
+Cc_rx   rx_port  rx_g1    2.0p
+Vb_rx1  vb1      0        0.32
+Rb_rx1  vb1      rx_g1    3k
+M_rx1   rx_d1    rx_g1 0 0 nmos_4k w=32u l=0.12u
+Rd_rx1  vdd      rx_d1    900
+Cl_rx1  rx_d1    0        0.5f
+
+Cc_rx2  rx_d1    rx_g2    2.0p
+Vb_rx2  vb2      0        0.32
+Rb_rx2  vb2      rx_g2    3k
+M_rx2   rx_out   rx_g2 0 0 nmos_4k w=32u l=0.12u
+Rd_rx2  vdd      rx_out   900
+Cl_rx2  rx_out   0        1.0f
+
+.tran 0.1p {T_STOP} 0 0.1p
+.end

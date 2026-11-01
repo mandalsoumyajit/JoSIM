@@ -1,0 +1,28 @@
+* JoSIM SFQ-Triggered Electrothermal nTron Nanowire Driver
+* 2-JJ SFQ JTL generates a quantized pulse that triggers gate node "ng" of nTron N1,
+* nucleating a resistive hotspot on channel node "nd" to drive a Cryo-CMOS LNA.
+.model jjmod jj(rtype=1, vg=2.8m, cap=0.07p, r0=160, rn=16, icrit=100u)
+.model nmod nanowire(rsheet=35, wch=120n, lch=600n, wg=45n, d=5n, ic0=420u, ig0=38u, tc=10.5, tsub=4.2, alpha=0.85, hc=1.8e4, cvol=2200, lkin0=18p, tau_th=8p)
+
+* SFQ trigger pulse at t = 12..15 ps
+Itrig   0  n1 pwl(0 0 12p 0 13p 220u 15p 220u 16p 0)
+Ib1     0  n1 pwl(0 0 4p 75u)
+B1      n1 0  jjmod
+Rsh1    n1 0  2.5
+L12     n1 n2 4.0p
+Ib2     0  n2 pwl(0 0 4p 75u)
+B2      n2 0  jjmod
+Rsh2    n2 0  2.5
+
+* Gate coupling network into nTron N1
+Rg      n2 ng 3.5
+Rdump   ng 0  8.0
+
+* Bias current and 3-terminal nTron channel (drain = nd, source = 0, gate = ng)
+Ibias   0  nd pwl(0 0 5p 360u)
+N1      nd 0  ng 0 nmod
+Rload   nd 0  25.0
+
+.tran 0.1p 60p
+.print P(B1) P(B2) V(ND) I(N1)
+.end

@@ -31,6 +31,8 @@ This repository is an enhanced fork branched from upstream **`JoeyDelp/JoSIM` `v
   4. **Tier 3 Fully GPU-Resident `cuSolverRF` Monolithic Solver (`-g 3`, `.option gpu=3`):** Zero-PCIe in-VRAM simulation loop (**`2.45x–4.21x` GPU speedup** on 2D JJ arrays).
   5. **Tier 4 Exact Schur-Complement Nodal Admittance Solver (`-n`, `.option nodal`, `-g 4`, `.option gpu=4`) & Quiescent Bypass (`.option bypass`):** Eliminates internal branch rows to shrink the matrix by **2x–6x** (**`1.47x–2.47x` additional single-thread speedup** on production macros `r5cal`, `r10f1n`, `xadd4` and **`3.36x–4.37x`** on 2D JJ grids; **4.3x–28.8x total speedup over `v2.6.5`**).
   6. **High-Speed Binary I/O & Numerical Controls:** `.npy` (NumPy structured array), `.bin` (`JOSIMBIN` column-major float64), `.rawb`, `.savestate`/`.loadstate` checkpointing, `.option txinterp` fractional PTL interpolation, `.option kcutoff`, `-c` predictor-corrector, and `-f` fixed-step control.
+  7. **Automated Critical Margin Finder (`-M` / `.margins`), OAAT Sensitivity (`--sens` / `.sens`), Digital Sources (`PAT`, `SFQ`), Assertions (`.assert` / `-A`), `.meas` (`--meas`), Jitter/BER (`.jitter` / `-J`), `.ic` / `FLUX=` / `.check_loops`, `.iv` / `.squid`, & `Nanowire` (`N`):** Full verification, characterization, and cryotron device suite.
+  8. **In-Memory Python/C API (`pyjosim` / `libjosim_c`) & 4-Layer SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`):** Zero-copy NumPy views, persistent AST sessions, multiplexed `josim-cosim-server`, `ngspice` XSPICE code model (`josim_cosim.cm`), Cadence Spectre `CDS_VA_DPI` adapter (`libjosim_spectre_dpi.so` + `josim_cosim_port.va`), and `scripts/josim_cosim.py` multi-window Branin/PWL/Spectre coordinators. See [SPICE Co-Simulation & Python API](cosimulation.md).
 
 
 ## Project layout
@@ -140,6 +142,7 @@ bash scripts/build_wsl.sh
 
 For practical guidance on selecting simulation options (`-n` Nodal Admittance, `-p` OpenMP, `-g [1|2|3|4]` CUDA GPU, `-b <N>` Batched Monte Carlo, and `.bin`/`.npy` binary output), see:
 - [Fork Usage, Options & Benchmark Guide](usage_and_benchmarks.md)
+- [SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`) & Python API](cosimulation.md)
 - [Example Usage & Solver Selection Guide](ex_usage.md)
 - [Netlist Syntax & `.option` Control Reference](syntax.md)
 - [GPU & Nodal Solver Architecture & Benchmarks](gpu_architecture.md)

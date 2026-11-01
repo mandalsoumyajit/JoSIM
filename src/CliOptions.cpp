@@ -571,13 +571,42 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "--margins=" << std::setw(3) << std::left << "|"
               << "Default targets: @BIAS,@JJ,@IND,@RES (+/-50%, 21 pts). Use @DEVICES or @DEVICES|X0" << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
-              << "to rank every device individually (e.g. -M @DEVICES:0.4:21, --margin-file=margins.csv)." << std::endl;
-    std::cout << std::setw(16) << std::left << "--margin-tol=" << std::setw(3) << std::left << "|"
+              << "to rank every device individually (e.g. -M @DEVICES:0.4:21)." << std::endl;
+    std::cout << std::setw(16) << std::left << "-F" << std::setw(3) << std::left << "|"
+              << "Exports the critical operating margin report to a CSV file." << std::endl;
+    std::cout << std::setw(16) << std::left << "--margin-file=" << std::setw(3) << std::left << "|" << std::endl;
+    std::cout << std::setw(16) << std::left << "-T" << std::setw(3) << std::left << "|"
               << "Timing tolerance for exact SFQ event-sequence verification (default: 50p)." << std::endl;
+    std::cout << std::setw(16) << std::left << "--margin-tol=" << std::setw(3) << std::left << "|" << std::endl;
     std::cout << std::setw(16) << std::left << "--verify-events=" << std::setw(3) << std::left << "|"
               << "Verifies simulated SFQ event sequence & timestamps against a golden .csv/.npy file." << std::endl;
     std::cout << std::setw(16) << std::left << "-A / --assert=" << std::setw(3) << std::left << "|"
               << "Verifies digital SFQ event assertions (e.g. -A \"B2|X0:BITS=0101:TD=10p:PER=20p\")." << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
+    // Measurements, Initial Conditions, Loop Audit, Jitter/BER, I-V/SQUID, Sensitivity
+    // ---------------------------------------------------------------------------
+    std::cout << std::setw(16) << std::left << "--meas=" << std::setw(3) << std::left << "|"
+              << "Evaluates a SPICE .meas expression (supports native SFQ=k triggers, AVG/RMS/INTEG)." << std::endl;
+    std::cout << std::setw(16) << std::left << "--meas-file=" << std::setw(3) << std::left << "|"
+              << "Exports evaluated .meas results (and batched ensemble statistics) to a CSV file." << std::endl;
+    std::cout << std::setw(16) << std::left << "--ic=" << std::setw(3) << std::left << "|"
+              << "Sets initial conditions at t=0 (e.g. --ic=\"P(7)=2.8 V(1)=0.5m I(L1)=0.1m\")." << std::endl;
+    std::cout << std::setw(16) << std::left << "--check-loops" << std::setw(3) << std::left << "|"
+              << "Audits superconducting B+L loops for beta_L, trapped flux, and 0-L degeneracy" << std::endl;
+    std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
+              << "(optionally specify output CSV/JSON path: --check-loops=loops.csv)." << std::endl;
+    std::cout << std::setw(16) << std::left << "-J / --jitter=" << std::setw(3) << std::left << "|"
+              << "Runs timing jitter, clock skew & BER analysis (e.g. -J \"B02 REF=B01 MAX_RMS=1p\")." << std::endl;
+    std::cout << std::setw(16) << std::left << "--jitter-file=" << std::setw(3) << std::left << "|"
+              << "Exports timing jitter and BER report to a CSV or JSON file." << std::endl;
+    std::cout << std::setw(16) << std::left << "--iv=" << std::setw(3) << std::left << "|"
+              << "Extracts model/circuit DC I-V or RF Shapiro steps (e.g. --iv=\"jmod 300u iv.csv\")." << std::endl;
+    std::cout << std::setw(16) << std::left << "--squid=" << std::setw(3) << std::left << "|"
+              << "Extracts 1D/2D SQUID V(Phi) & Ic(Phi) modulation (e.g. --squid=\"IB L1 IMAX=240u\")." << std::endl;
+    std::cout << std::setw(16) << std::left << "--sens=" << std::setw(3) << std::left << "|"
+              << "Runs batched OAAT sensitivity & automated margin centering (e.g. --sens=\"@DEVICES\")." << std::endl;
+    std::cout << std::setw(16) << std::left << "--sens-file=" << std::setw(3) << std::left << "|"
+              << "Exports sensitivity & margin-centering report to a CSV or JSON file." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Verbose switch
     // ---------------------------------------------------------------------------
@@ -599,8 +628,11 @@ void CliOptions::display_help() {
     std::cout << "Example commands:\n";
     std::cout << "  Single-thread nodal (general/monolithic): josim-cli -n -o out.npy test.cir\n";
     std::cout << "  Multi-core OpenMP + nodal fallback:       josim-cli -p -n -o out.npy test.cir\n";
+    std::cout << "  Zero-allocation SFQ events + pulse info:  josim-cli -p -n -e events.npy -E all test.cir\n";
+    std::cout << "  Critical operating margin finder:         josim-cli -M \"@DEVICES|X0\" --margin-file=m.csv test.cir\n";
+    std::cout << "  Batched OAAT sensitivity & centering:     josim-cli --sens=\"@DEVICES CENTER\" --sens-file=s.csv test.cir\n";
     std::cout << "  CUDA GPU auto-dispatch:                   josim-cli -g -o out.npy test.cir\n";
-    std::cout << "  Batched Monte Carlo (256 trials, OpenMP): josim-cli -p -b 256 -o mc.npy test.cir\n";
+    std::cout << "  Batched Monte Carlo (256 trials, OpenMP): josim-cli -p -n -b 256 -o mc.npy test.cir\n";
     std::cout << std::endl;
     exit(0);
 }

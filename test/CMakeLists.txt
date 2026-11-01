@@ -303,6 +303,19 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties("integration::test_cosim_step3_and_veriloga_comparison" PROPERTIES
     PASS_REGULAR_EXPRESSION "ALL STEP 3 & VERILOG-A COMPARISON BENCHMARKS PASSED."
   )
+
+  add_test(
+    NAME "integration::test_cosim_step4_layer3b"
+    COMMAND ${CMAKE_COMMAND} -E env
+            "JOSIM_BUILD_DIR=$<TARGET_FILE_DIR:josim_c>"
+            "JOSIM_C_LIB=$<TARGET_FILE:josim_c>"
+            "JOSIM_COSIM_SERVER_BIN=$<TARGET_FILE:josim-cosim-server>"
+            ${Python3_EXECUTABLE}
+            "${PROJECT_SOURCE_DIR}/test/test_cosim_step4_layer3b.py"
+  )
+  set_tests_properties("integration::test_cosim_step4_layer3b" PROPERTIES
+    PASS_REGULAR_EXPRESSION "ALL STEP 4 \\(LAYER 3B\\) CO-SIMULATION BENCHMARKS PASSED."
+  )
 endif()
 
 add_test(

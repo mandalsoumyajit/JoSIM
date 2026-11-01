@@ -1,0 +1,20 @@
+* Partition 2: 2-Port SFQ Receiver (Port 1 = n3) + Electrothermal nTron Driver (Port 2 = nch)
+.model jjmod jj(rtype=1, vg=2.8m, cap=0.07p, r0=160, rn=16, icrit=100u)
+.model nmod nanowire(rsheet=35, wch=120n, lch=600n, wg=45n, d=5n, ic0=420u, ig0=38u, tc=10.5, tsub=4.2, alpha=0.85, hc=1.8e4, cvol=2200, lkin0=18p, tau_th=8p)
+
+Ib3      0   n3  pwl(0 0 4p 75u)
+B3       n3  0   jjmod
+Rsh3     n3  0   2.5
+L34      n3  n4  4.2p
+Ib4      0   n4  pwl(0 0 4p 75u)
+B4       n4  0   jjmod
+Rsh4     n4  0   2.5
+Rg       n4  ng  3.5
+Rdump    ng  0   8.0
+Ibias_ch 0   nch pwl(0 0 5p 360u)
+N1       nch 0   ng 0 nmod
+Rload_ch nch 0   25.0
+
+.tran 0.1p 60p
+.print P(B3) P(B4) V(NCH) I(N1)
+.end

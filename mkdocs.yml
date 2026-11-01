@@ -5,6 +5,9 @@ site_author: Johannes Delport
 edit_uri: ""
 nav:
   - Home: 'index.md'
+  - Usage, Options & Benchmarks: 'usage_and_benchmarks.md'
+  - SPICE Co-Simulation & Python API: 'cosimulation.md'
+  - GPU & Nodal Solver Architecture: 'gpu_architecture.md'
   - Technical Discussion: 'tech_disc.md'
   - Example Usage: 'ex_usage.md'
   - Component Stamps: 'comp_stamps.md'

@@ -26,7 +26,7 @@ To enable co-simulation of superconducting circuits (**JoSIM**: RSFQ, AQFP, dc-S
 | **Step 1** | **Layer 1: `libjosim_c` Co-Simulation Stepping, Norton Jacobian & Auto-Rollback Engine** | **Completed** | `B1_JTL_NORTON_SPLIT`, `B2_CMOS_TO_SFQ_ROLLBACK`, `B3_NTRON_TO_CMOS_LNA`, `B4_BRANIN_WAVE_DUPLEX` ([`test/test_cosim_step1.py`](test/test_cosim_step1.py)) |
 | **Step 2** | **Layer 2: `josim-cosim-server` IPC Daemon, `josim_cosim.cm` XSPICE Code Model & `josim_cosim.py` Coordinator (Tested on `ngspice-45.2` & `LTspice.exe`)** | **Completed** | `NG1_SPLIT_JTL_XSPICE`, `NG2_CMOS_TO_SFQ_DFF`, `NG3_NTRON_TO_CMOS_LNA`, `LT1_CMOS_BRANIN_TRANSCEIVER`, `LT2_NTRON_TO_LTSPICE_LNA` ([`test/test_cosim_simulators_and_step2.py`](test/test_cosim_simulators_and_step2.py)) |
 | **Step 3** | **Layer 3A: Cadence Spectre Verilog-A + `CDS_VA_DPI` / DPI-C Adapter (`cosim/spectre/`, Tested Live on Cadence Spectre 25.1 on `asic2.inst.bnl.gov`)** | **Completed** | `SP1_DPI_C_INPROC_AND_SOCKET`, `SP2A_SPLIT_JTL_SPECTRE`, `SP2B_NTRON_LNA_SPECTRE`, `CMP1_NGSPICE_OPENVAF_SCALING`, `CMP2_SPECTRE_100JJ_SCALING`, `CMP3_PHYSICS_AND_CLUSTER_AUDIT` ([`test/test_cosim_step3_and_veriloga_comparison.py`](test/test_cosim_step3_and_veriloga_comparison.py)) |
-| **Step 4** | **Layer 3B: Multi-Window / Multi-Instance & End-to-End Verification** | Planned | Unified CLI & end-to-end cryo-hybrid system benchmarks |
+| **Step 4** | **Layer 3B: Multiplexed Multi-Instance Server, Multi-Window Branin / PWL Coordinators, Spectre Runner & Unified CLI (`scripts/josim_cosim.py`)** | **Completed** | `S4_1_MULTI_INSTANCE_SERVER_MUX`, `S4_2_MULTI_WINDOW_BRANIN_DUPLEX`, `S4_3_SPECTRE_MULTI_PARTITION_E2E`, `S4_4_UNIFIED_CLI_WORKFLOW` ([`test/test_cosim_step4_layer3b.py`](test/test_cosim_step4_layer3b.py)) |
 
 ---
 
@@ -107,4 +107,28 @@ Hybrid circuit: **32 Cryo-CMOS MOSFETs** (clocked 16-stage inverter/buffer tree)
 | **MNA Matrix Size & `cmin` Sensitivity** | Adds an `electrical ph` node per JJ with synthetic capacitor `PHI0_2PI = 0.3291 fF`. **Setting standard CMOS `cmin=0.1f` in Spectre adds $0.1\text{ fF}$ in parallel with `ph`, corrupting $\Phi_0$ by $+30.4\%$!** | Zero extra internal nodes in Spectre; Josephson phase lives inside JoSIM's state vector, completely immune to Spectre `cmin`/`gmin` options |
 | **DC Operating Point (`dcOp dc`)** | No DC resistance path on `ph` and indeterminate DC phase; **requires `skipdc=yes`**, breaking standard analog Cryo-CMOS DC bias initialization | Converges cleanly in 2 NR iterations in standard `dcOp dc` (`skipdc=no`) via JoSIM's $t=0$ Norton companion conductance |
 | **Device Physics Coverage** | Constant linear resistor `rtype=0` (`rqp`) only; lacks subgap piecewise-nonlinear $I\text{–}V$ (`rtype=1`), thermal noise, phase sources, and `nTron`/`hTron` nanowires | Full JoSIM physics: `rtype=1` nonlinear subgap/gap $I\text{–}V$ ($R_0, R_n, V_g$), thermal Johnson–Nyquist noise, mutual inductors, lossy T-lines, and electrothermal `nTron`/`hTron` |
+
+---
+
+## 7. Step 4 (Layer 3B): Multiplexed Multi-Session Server, Multi-Window Coordinators & Unified CLI
+
+Implemented in [`src/josim_cosim_server.cpp`](src/josim_cosim_server.cpp), [`scripts/josim_cosim.py`](scripts/josim_cosim.py), and [`test/test_cosim_step4_layer3b.py`](test/test_cosim_step4_layer3b.py):
+
+1. **Multiplexed Multi-Session IPC Daemon (`josim-cosim-server`):**
+   - Upgraded [`src/josim_cosim_server.cpp`](src/josim_cosim_server.cpp) to a `poll()`-multiplexed event loop maintaining an independent `ClientContext` (`clientFd -> josim_session_t*`) per connection.
+   - Allows multiple concurrent `josim_cosim` XSPICE instances in `ngspice` or multiple `josim_cosim_port_norton` / `josim_cosim_port_2p` instances in **Cadence Spectre** to share a single UNIX or TCP daemon process (`--expected-clients <N>`).
+2. **Layer 3B Python Coordinators & Unified CLI (`scripts/josim_cosim.py`):**
+   - `UnifiedCosimSession`: unified interface over in-process `pyjosim.Session` and socket `CosimSocketClient` (including `get_trace` and `get_events` IPC opcodes).
+   - `BraninWaveWindowCoordinator` (`run_ltspice_branin_cosim`, `run_ngspice_branin_cosim`): automated $N_w$-window causal Branin transmission-line wave relaxation ($W \le \tau_d$) with stateful JoSIM continuation across windows and automatic wave delay-line shifting (`2*b_p(t - \tau_d)`).
+   - `run_ltspice_pwl_cosim`: damped Robin/Thevenin PWL waveform relaxation coordinator for coupling `LTspice.exe` nonlinear MOSFET circuits to JoSIM ports without transmission-line delay.
+   - `SpectreCosimRunner`: local or remote SSH (`asic2.inst.bnl.gov`) Cadence Spectre 25.1 execution harness with automatic multi-client `josim-cosim-server` lifecycle and `.raw` ASCII waveform extraction.
+   - Unified CLI: `python3 scripts/josim_cosim.py --config <spec.json> --output-json <report.json>`.
+
+| Benchmark | Simulator(s) & Transport Modes | Description | Key Verified Metrics |
+| :--- | :--- | :--- | :--- |
+| **`S4_1_MULTI_INSTANCE_SERVER_MUX`** | `ngspice-45.2` + `josim_cosim.cm` + Multiplexed `josim-cosim-server` (In-proc, UNIX mux, TCP mux) | Dual JoSIM partitions (`A_sfq_tx` 2-JJ SFQ TX + `A_ntron_rx` 2-port SFQ RX + `nTron` driver) + 2-stage Cryo-CMOS CS + SF LNA sharing ONE `josim-cosim-server` | `tx_events` = 2, `rx_events` = 2, `V(nd)` peak = $8.939\text{ mV}$, LNA `V(vout)` swing = $83.426\text{ mV}$, In-proc vs. UNIX mux vs. TCP mux diff = $0.0$ |
+| **`S4_2_MULTI_WINDOW_BRANIN_DUPLEX`** | ADI `LTspice.exe -b` & `ngspice-45.2` (`BraninWaveWindowCoordinator`) | Multi-window ($N_w = 4$ at $W = 15\text{ ps}$ and $N_w = 6$ at $W = 10\text{ ps}$) full-duplex Branin coax transceiver ($\tau_d = 15\text{ ps}$, $60\text{ ps}$ total) | Quiet RX window before $\tau_d = 15\text{ ps}$ = $0.0\text{ mV}$, active RX swing = $52.954\text{ mV}$, 4-window in-proc vs. 6-window UNIX diff = $0.0$, `LTspice` vs. `ngspice` NRMSE = $5 \times 10^{-6}$ |
+| **`S4_3_SPECTRE_MULTI_PARTITION_E2E`** | Live **Cadence Spectre 25.1** on `asic2.inst.bnl.gov` (`SpectreCosimRunner` + Multiplexed Server) | 2-Partition Spectre co-simulation (`X_sfq_tx` + inter-chip pad filter + `X_ntron_rx` 2-port + 2-stage Cryo-CMOS LNA) with `dcOp dc` (`skipdc=no`) | `dcOp dc` converged (`0 errors`), 888 accepted steps ($0.0497\text{ s}$ CPU), `n3` peak = $0.331\text{ mV}$, `nd` peak = $8.939\text{ mV}$, `vout` swing = $83.427\text{ mV}$ (matches `ngspice` `S4_1` to $0.001\text{ mV}$!) |
+| **`S4_4_UNIFIED_CLI_WORKFLOW`** | `python3 scripts/josim_cosim.py --config <spec.json>` | Standalone JSON-configured CLI workflow (`ngspice_xspice` mode with automatic server launch and JSON report output) | CLI exit 0, `cli_events` = 2 ($2\pi$ SFQ phase slips), `V(n2)` peak = $0.370\text{ mV}$ |
+
 

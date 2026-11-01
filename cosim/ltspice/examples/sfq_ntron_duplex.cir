@@ -1,0 +1,28 @@
+* JoSIM 2-Port Full-Duplex SFQ + nTron Core for Multi-Window Branin Wave Co-Simulation
+* Port 1 (n_rx_port): Receives 50-Ohm Branin forward wave from LTspice/ngspice Cryo-CMOS TX
+* Port 2 (n_tx_port): Launches 50-Ohm Branin return wave from nTron N1 back to LTspice/ngspice RX LNA
+.model jjmod jj(rtype=1, vg=2.8m, cap=0.07p, r0=160, rn=16, icrit=120u)
+.model nmod ntron(ic=80u, ig=20u, ir=14u, rn=120, l=8p, lg=3p, rg=1.5, tau=12p, tau_hs=1.2p, alpha=1.0)
+
+* Port 1: 2-JJ SFQ Receiver JTL
+R_rx_att n_rx_port n_j1 12.0
+Ib_rx1   0         n_j1 pwl(0 0 2p 90u)
+B_rx1    n_j1      0    jjmod
+R_sh1    n_j1      0    2.2
+L_j12    n_j1      n_j2 3.8p
+Ib_rx2   0         n_j2 pwl(0 0 2p 90u)
+B_rx2    n_j2      0    jjmod
+R_sh2    n_j2      0    2.2
+
+* Gate coupling into 3-terminal nTron N1
+R_gate   n_j2      n_gate 4.0
+L_Bias   nbias     n_tx_port 80p
+IBIAS    0         nbias pwl(0 0 2p 85u)
+
+* Port 2: nTron channel driving return 50-Ohm coax
+N1       n_tx_port 0 n_gate nmod
+R_sh_ch  n_tx_port 0 180.0
+
+.tran 0.1p 60p
+.print P(B_RX1) P(B_RX2) V(N_RX_PORT) V(N_TX_PORT) I(N1)
+.end

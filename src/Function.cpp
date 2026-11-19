@@ -863,12 +863,19 @@ double Function::return_noise(double& x) {
     if (x < timeValues_.front()) {
         return ampValues_.at(1);
     } else {
-        if (x >= miscValues_.at(3)) {
+        // The source's values sit on its own grid TD + k TSTEP, one draw of variance VA^2 / (2 TSTEP) per
+        // interval, linearly interpolated. The grid must not follow the simulator's steps: moving the next
+        // draw to the current step whenever a step overshoots it (as this function once did) draws a new
+        // value every step at the variance of TSTEP, so a step finer than TSTEP made the bath colder by
+        // step / TSTEP (e.g. 40 times at .neb 1000GHz with a 0.025 ps step).
+        // Advance as many noise segments as needed (handles a step coarser than TSTEP too), as upstream
+        // JoSIM does since c7c2de3.
+        const double T = timeValues_.back();
+        while (x >= miscValues_.at(3)) {
             miscValues_.at(0) = miscValues_.at(1);
-            miscValues_.at(1) = ampValues_.at(0) * Misc::grand() / sqrt(2.0 * timeValues_.back());
+            miscValues_.at(1) = ampValues_.at(0) * Misc::grand() / sqrt(2.0 * T);
             miscValues_.at(2) = miscValues_.at(3);
-            if (x == miscValues_.at(3)) { miscValues_.at(3) = miscValues_.at(2) + timeValues_.back(); }
-            if (x > miscValues_.at(3)) { miscValues_.at(3) = x; }
+            miscValues_.at(3) = miscValues_.at(2) + T;
         }
         double& y2 = miscValues_.at(1);
         double& y1 = miscValues_.at(0);

@@ -115,3 +115,34 @@ precision and run 1-2.5 times faster.
   reported grid is the requested one.
 - `cmake/test_rejected_options.cmake`: `USING_OPENMP=ON` is supported.
 - `test/CMakeLists.txt` (fork's pyjosim test): 1200 samples, the corrected print grid (05f6494 printed 1199).
+- `noise_regression.cpp` (step guard): a local rollback counts as the fork's step reduction (`step_halvings()`).
+
+## The fork's own paths under test (`regression::fork_modes`)
+
+`test/regression_fork_modes.py` checks every fork path against the plain MNA loop rather than only running it:
+nodal, `-p`, `-p -n` and `-g` (without CUDA it falls back to the CPU partitioned loop), both analysis types,
+corrector and fixed step, local rollback, every output format, events-only against events taken from waveforms,
+event metrics and golden-event verification, decimation against the full run, Monte Carlo (zero spread equals the
+nominal run on the partitioned, nodal and serial batch loops), sweeps, margins and sensitivity (command line and
+netlist controls), saved and loaded states, initial conditions, the measurement, jitter, IV and loop-audit decks, and
+a table of bad inputs with their diagnostics. It found two bugs, fixed with it:
+
+- The partitioned windowed loop (`-p`) shifted each inductor's current history inside the loop, so a coupled inductor
+  read its partner's updated current (voltage analysis with K couplings; 0.011 rad off the MNA loop on the test deck).
+- `-b` with the corrector, thermal noise or a state file on a deck that partitions ran one trial and dropped the batch.
+
+Behaviour it records but does not change (follow-ups): a negative inductance makes the run halve its step without end
+(05f6494 and 736e609 too); a T line without `TD=` reports "point count outside the supported range" (736e609 hangs);
+a resistor with no value, `SIN()`/`PULSE()` with missing arguments and an unknown `-M` target are accepted silently;
+voltage analysis extracts no events for a node phase such as `P(3,0)`.
+
+## Coverage baseline
+
+Upstream's coverage policy (`tools/coverage-policy.json`) held upstream's measurements of upstream's code (81 % of
+lines overall, `Simulation.cpp` within 2 points of 94.6 %). The fork adds about 10,000 lines of its own solvers and
+analyses; with upstream's tests alone the coverage build measured 60.5 % of lines. With `regression::fork_modes` it
+measures 78.5 % of lines, 86.6 % of functions and 61.1 % of branches (LLVM 18, CI run 44725865596), and the policy now
+holds those figures as the fork's reference: each critical module within 2 points of its own measurement, the overall
+floors upstream's (the fork meets them), the critical-module floors lowered to 72 % of lines and 50 % of branches
+(`Simulation.cpp` 73.9 % of lines, `Input.cpp` 51.4 % of branches). The coverage build has no OpenMP, so the
+OpenMP-only windowed loops are measured as unreached there; the same tests run them in OpenMP builds.

@@ -24,12 +24,14 @@ class Model {
     double              d_;
     double              icFct_;
     double              phiOff_;
+    double              gwidth_;
+    bool                gateWidthSpecified_ = false;
     bool                tDep_;
 
   public:
     Model()
         : vg_(2.8E-3), ic_(1E-3), cpr_({1.0}), rtype_(1), rn_(5), r0_(30), c_(2.5E-12), t_(4.2), tc_(9.1),
-          deltaV_(0.1E-3), d_(0), icFct_(Constants::PI / 4), phiOff_(0), tDep_(false) {};
+          deltaV_(0.1E-3), d_(0), icFct_(Constants::PI / 4), phiOff_(0), gwidth_(0.1E-3), tDep_(false) {};
 
     const std::string&         modelName() const noexcept { return modelName_; }
 
@@ -44,6 +46,8 @@ class Model {
     void                       ic(const double& i) { ic_ = i; }
 
     const std::vector<double>& cpr() const noexcept { return cpr_; }
+
+    const std::vector<double>& cpr_view() const noexcept { return cpr_; }
 
     void                       cpr(const std::vector<double>& i) { cpr_ = i; }
 
@@ -87,12 +91,23 @@ class Model {
 
     void                       phiOff(const double& o) { phiOff_ = o; }
 
-    bool                       tDep() const noexcept { return tDep_; }
+    double                     gwidth() const { return gwidth_; }
+
+    void                       gwidth(double value) { gwidth_ = value; gateWidthSpecified_ = true; }
+
+    bool                       gateWidthSpecified() const { return gateWidthSpecified_; }
+
+    bool                tDep() const { return tDep_; }
 
     void                tDep(bool b) { tDep_ = b; }
 
+    void                validate() const;
+
     static void
     parse_model(const std::pair<tokens_t, string_o>& s, vector_pair_t<Model, string_o>& models, const param_map& p);
+
+    static const Model* find_model(const std::string& name, const vector_pair_t<Model, string_o>& models,
+                                  string_o scope);
 };
 } // namespace JoSIM
 

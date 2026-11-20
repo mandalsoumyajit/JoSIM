@@ -20,15 +20,18 @@ bool is_nanowire_model_keyword(const std::string& s) {
 }
 
 const tokens_t* find_nanowire_model(const std::string& tok, const Netlist& nl, const string_o& subckt) {
-    auto it = nl.models.find(std::make_pair(tok, subckt));
-    if (it != nl.models.end()) { return &it->second; }
-    if (subckt.has_value()) {
-        const size_t pipePos = subckt->find('|');
-        if (pipePos != std::string::npos) {
-            const string_o baseSub = subckt->substr(0, pipePos);
-            auto           itBase  = nl.models.find(std::make_pair(tok, baseSub));
-            if (itBase != nl.models.end()) { return &itBase->second; }
+    // Raw models are keyed by subcircuit type. A scoped instance ("|X1|X2") maps to its type through
+    // nl.scopeTypes; enclosing instances are searched outward, then the global scope.
+    string_o scope = subckt;
+    while (scope.has_value()) {
+        auto it = nl.models.find(std::make_pair(tok, scope));
+        if (it != nl.models.end()) { return &it->second; }
+        const auto type = nl.scopeTypes.find(*scope);
+        if (type != nl.scopeTypes.end()) {
+            auto itType = nl.models.find(std::make_pair(tok, string_o(type->second)));
+            if (itType != nl.models.end()) { return &itType->second; }
         }
+        scope = parent_parameter_scope(scope);
     }
     auto itGlob = nl.models.find(std::make_pair(tok, std::nullopt));
     if (itGlob != nl.models.end()) { return &itGlob->second; }

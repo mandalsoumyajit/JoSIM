@@ -19,6 +19,7 @@ class Matrix {
   private:
     std::vector<NodeConfig> nodeConfig, nodeConfig2;
     bool                    needsTR_ = true;
+    void validate_inductor_coupling() const;
 
   public:
     AnalysisType                             analysisType = AnalysisType::Phase;
@@ -31,11 +32,7 @@ class Matrix {
     std::unordered_set<std::string>          lm;
     int64_t                                  branchIndex = 0;
     std::vector<double>                      nz;
-#ifdef SLU
-    std::vector<long long> ci, rp;
-#else
     std::vector<int64_t> ci, rp;
-#endif
     std::vector<RelevantTrace> relevantTraces;
     std::vector<int64_t>       relevantIndices;
 

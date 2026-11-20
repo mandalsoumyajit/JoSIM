@@ -7,6 +7,8 @@
 #include "JoSIM/Misc.hpp"
 #include "JoSIM/TypeDefines.hpp"
 
+#include <memory>
+
 namespace JoSIM {
 
 class Matrix;
@@ -51,6 +53,7 @@ class RelevantTrace {
     int_o       variableIndex;
     int64_t     fIndex             = -1;
     bool        autoAddedForEvents = false;
+    std::shared_ptr<RelevantTrace> subtract;
 
     RelevantTrace() : device(false) {};
 }; // class RelevantTrace

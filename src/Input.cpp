@@ -6,7 +6,9 @@
 #include "JoSIM/ProgressBar.hpp"
 #include "JoSIM/Rng.hpp"
 
+#include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <ctime>
@@ -18,13 +20,93 @@
 
 using namespace JoSIM;
 
+namespace {
+std::string upper_copy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
+    return s;
+}
+
+// Fork: tokens whose case is kept because they name files (KEY=path, and path-like .IV/.SQUID arguments).
+std::optional<std::string> preserved_token(const std::string& token, bool ivOrSquid) {
+    const size_t eqPos = token.find('=');
+    if (eqPos != std::string::npos) {
+        const std::string key = upper_copy(token.substr(0, eqPos));
+        if (key == "FILE" || key == "OUT" || key == "MARGINFILE" || key == "MARGINSFILE" || key == "MEASFILE"
+            || key == "MEASUREFILE" || key == "LOOPFILE" || key == "LOOPSFILE" || key == "JITTERFILE"
+            || key == "VERIFYEVENTS" || key == "VERIFY_EVENTS" || key == "EVENTS" || key == "EVENTSONLY") {
+            return key + "=" + token.substr(eqPos + 1);
+        }
+    } else if (ivOrSquid) {
+        std::string cl = token;
+        std::transform(cl.begin(), cl.end(), cl.begin(), ::tolower);
+        if (cl.find('/') != std::string::npos || cl.find('\\') != std::string::npos
+            || (cl.size() > 4
+                && (cl.substr(cl.size() - 4) == ".csv" || cl.substr(cl.size() - 4) == ".dat"
+                    || cl.substr(cl.size() - 4) == ".txt"))
+            || (cl.size() > 5 && cl.substr(cl.size() - 5) == ".json")) {
+            return token;
+        }
+    }
+    return std::nullopt;
+}
+
+void normalize_netlist_line(tokens_t& tokens) {
+    if (tokens.front() == ".FILE" || tokens.front() == "FILE") { return; }
+    const std::string head = upper_copy(tokens.front());
+    // Fork: state checkpoint and event verification commands keep their file path (token 1).
+    if (head == ".SAVESTATE" || head == "SAVESTATE" || head == ".SAVEBIAS" || head == "SAVEBIAS"
+        || head == ".LOADSTATE" || head == "LOADSTATE" || head == ".LOADBIAS" || head == "LOADBIAS"
+        || head == ".VERIFY_EVENTS" || head == "VERIFY_EVENTS" || head == ".VERIFYEVENTS" || head == "VERIFYEVENTS") {
+        tokens.front() = head;
+        for (size_t i = 2; i < tokens.size(); ++i) { tokens[i] = upper_copy(tokens[i]); }
+        return;
+    }
+    const bool iv = head == ".IV" || head == "IV";
+    const bool ivOrSquid = iv || head == ".SQUID" || head == "SQUID";
+    const std::string filename = iv && tokens.size() > 3 ? tokens[3] : "";
+    const tokens_t originalTokens = tokens;
+    const auto original = Misc::vector_to_string(tokens);
+    auto normalized = original;
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    // CUS paths are filesystem names, including on continued logical lines.
+    static const std::regex custom_file(R"(\bCUS\s*\(\s*([^\s,)]+))", std::regex::icase);
+    for (auto match = std::sregex_iterator(original.begin(), original.end(), custom_file);
+         match != std::sregex_iterator(); ++match) {
+        normalized.replace(match->position(1), match->length(1), match->str(1));
+    }
+    tokens = Misc::tokenize(normalized);
+    if (iv && tokens.size() > 3) { tokens[3] = filename; }
+    // Tokens contain no spaces, so re-tokenizing keeps the token count and positions.
+    if (tokens.size() == originalTokens.size()) {
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            if (auto kept = preserved_token(originalTokens[i], ivOrSquid)) { tokens[i] = *kept; }
+        }
+    }
+}
+} // namespace
+
 std::vector<tokens_t> Input::read_input(LineInput& input, string_o fileName) {
+    struct IncludeStackGuard {
+        std::vector<std::string>& stack;
+        size_t size;
+        ~IncludeStackGuard() { stack.resize(size); }
+    } guard{activeIncludes_, activeIncludes_.size()};
     // When the standard input is selected, "fileName" will be in the nullopt
     // state.
     if (fileName != std::nullopt) {
-        if (std::filesystem::path(fileName.value()).has_parent_path()) {
-            fileParentPath = std::filesystem::path(fileName.value()).parent_path().string();
+        const auto path = std::filesystem::weakly_canonical(fileName.value());
+        for (const auto& ancestor : activeIncludes_) {
+            if (!ancestor.empty() && std::filesystem::equivalent(path, ancestor)) {
+                Errors::input_errors(InputErrors::CYCLIC_INCLUDE, path.string());
+            }
         }
+        if (activeIncludes_.empty()) { fileParentPath = path.parent_path().string(); }
+        activeIncludes_.push_back(path.string());
+        Misc::unique_push(inputFiles, path.string());
+    } else {
+        // Keep stdin as the root context while reading included files.
+        activeIncludes_.push_back("");
     }
     // Variable to store the read line
     std::string           line;
@@ -38,27 +120,30 @@ std::vector<tokens_t> Input::read_input(LineInput& input, string_o fileName) {
         line = input.line();
         // Remove all Carriage Return characters
         line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
+        line.erase(line.begin(), std::find_if(line.begin(), line.end(),
+                                             [](unsigned char c) { return !std::isspace(c); }));
         // Remove all the leading, trailing and extra white spaces
         Misc::collapse_spaces(line);
         if (!line.empty() && line.at(0) != '*' && line.at(0) != '#') {
             // Tokenize the line
             tokens = Misc::tokenize(line);
+            if (tokens.empty()) { continue; }
             // Uppercase just the first token for ".INCLUDE" and ".FILE" check
-            std::transform(tokens.begin(), tokens.begin() + 1, tokens.begin(), [](std::string& c) -> std::string {
-                std::transform(c.begin(), c.end(), c.begin(), toupper);
-                return c;
-            });
+            if (tokens.front().front() != '+') {
+                std::transform(tokens.begin(), tokens.begin() + 1, tokens.begin(), [](std::string& c) -> std::string {
+                    std::transform(c.begin(), c.end(), c.begin(), toupper);
+                    return c;
+                });
+            }
             // If the line contains a "INCLUDE" statement
             if (tokens.at(0) == ".INCLUDE" || tokens.at(0) == "INCLUDE") {
+                if (tokens.size() != 2) {
+                    Errors::input_errors(InputErrors::INVALID_INCLUDE, line);
+                }
                 // Variable to store path to file to include
                 std::string includeFile;
                 // If reading from a file
                 if (fileName) {
-                    // Sanity check to prevent cyclic includes
-                    if (std::filesystem::path(fileName.value()).c_str()
-                        == std::filesystem::path(fileName.value()).parent_path().append(tokens.at(1)).c_str()) {
-                        Errors::input_errors(InputErrors::CYCLIC_INCLUDE, fileName);
-                    }
                     includeFile = std::filesystem::path(fileName.value()).parent_path().append(tokens.at(1)).string();
                 } else {
                     includeFile = std::filesystem::current_path().append(tokens.at(1)).string();
@@ -103,36 +188,9 @@ std::vector<tokens_t> Input::read_input(LineInput& input, string_o fileName) {
                 break;
                 // If the line does not contain an "INCLUDE", "FILE" or "END" statement
             } else {
-                // Transform the entire line to upper case (preserving file paths after FILE=, MARGINFILE=, VERIFYEVENTS=, EVENTS=, EVENTSONLY=, OUT=, JITTERFILE=)
-                const bool isIvOrSquid = (tokens.at(0) == ".IV" || tokens.at(0) == "IV" || tokens.at(0) == ".SQUID"
-                                          || tokens.at(0) == "SQUID");
-                std::transform(tokens.begin() + 1, tokens.end(), tokens.begin() + 1, [isIvOrSquid](std::string& c) -> std::string {
-                    const size_t eqPos = c.find('=');
-                    if (eqPos != std::string::npos) {
-                        std::string key = c.substr(0, eqPos);
-                        std::transform(key.begin(), key.end(), key.begin(), toupper);
-                        if (key == "FILE" || key == "OUT" || key == "MARGINFILE" || key == "MARGINSFILE"
-                            || key == "MEASFILE" || key == "MEASUREFILE" || key == "LOOPFILE" || key == "LOOPSFILE"
-                            || key == "JITTERFILE" || key == "VERIFYEVENTS" || key == "VERIFY_EVENTS"
-                            || key == "EVENTS" || key == "EVENTSONLY") {
-                            return key + "=" + c.substr(eqPos + 1);
-                        }
-                    } else if (isIvOrSquid) {
-                        std::string cl = c;
-                        std::transform(cl.begin(), cl.end(), cl.begin(), ::tolower);
-                        if (cl.find('/') != std::string::npos || cl.find('\\') != std::string::npos
-                            || (cl.size() > 4
-                                && (cl.substr(cl.size() - 4) == ".csv" || cl.substr(cl.size() - 4) == ".dat"
-                                    || cl.substr(cl.size() - 4) == ".txt"))
-                            || (cl.size() > 5 && cl.substr(cl.size() - 5) == ".json")) {
-                            return c;
-                        }
-                    }
-                    std::transform(c.begin(), c.end(), c.begin(), toupper);
-                    return c;
-                });
                 // If the line starts with a '+' append it to the previous line.
                 if (tokens.at(0).at(0) == '+') {
+                    if (fileLines.empty()) { Errors::input_errors(InputErrors::INVALID_CONTINUATION, line); }
                     // Remove the '+'
                     tokens.at(0) = tokens.at(0).substr(1);
                     if (tokens.at(0).empty()) {
@@ -152,6 +210,7 @@ std::vector<tokens_t> Input::read_input(LineInput& input, string_o fileName) {
         Errors::input_errors(InputErrors::EMPTY_FILE, fileName);
         // Return the read in file lines.
     } else {
+        for (auto& logical_line : fileLines) { normalize_netlist_line(logical_line); }
         return fileLines;
     }
     // Return to satisfy return type. This should never be reached.
@@ -217,28 +276,16 @@ void Input::parse_tokens_lines(std::vector<tokens_t>& fileLines) {
                             netlist.subcircuits[subckt.value()].io.clear();
                             netlist.subcircuits[subckt.value()].lines.clear();
                         }
-                        // Separate IO nodes from default parameter assignments (PARAMS: key=val ...)
-                        tokens_t subParamTokens = {".PARAM"};
-                        bool     inSubParams    = false;
-                        for (size_t j = 2; j < fileLines.at(i).size(); ++j) {
-                            const std::string& tok = fileLines.at(i).at(j);
-                            if (tok == "PARAMS:" || tok == "PARAM:") {
-                                inSubParams = true;
-                                continue;
-                            }
-                            if (inSubParams || tok.find('=') != std::string::npos
-                                || (j + 1 < fileLines.at(i).size() && fileLines.at(i).at(j + 1).front() == '=')) {
-                                inSubParams = true;
-                                subParamTokens.push_back(tok);
-                            } else {
-                                netlist.subcircuits[subckt.value()].io.push_back(tok);
-                            }
+                        // Header defaults are parameters, not additional pins.
+                        const auto firstParameter = parameter_start(fileLines.at(i), 2);
+                        for (size_t j = 2; j < firstParameter; ++j) {
+                            netlist.subcircuits[subckt.value()].io.push_back(fileLines.at(i).at(j));
                         }
-                        if (netlist.subcircuits[subckt.value()].io.empty()) {
-                            Errors::input_errors(InputErrors::MISSING_SUBCKT_IO);
-                        }
-                        if (subParamTokens.size() > 1) {
-                            create_parameter(subParamTokens, parameters, subckt);
+                        if (firstParameter == 2) { Errors::input_errors(InputErrors::MISSING_SUBCKT_IO); }
+                        if (firstParameter < fileLines.at(i).size()) {
+                            tokens_t declaration{".PARAM"};
+                            declaration.insert(declaration.end(), fileLines.at(i).begin() + firstParameter, fileLines.at(i).end());
+                            create_parameter(declaration, parameters, subckt);
                         }
                         // Complain if no IO is found
                     } else {
@@ -338,7 +385,15 @@ void Input::parse_tokens_lines(std::vector<tokens_t>& fileLines) {
 
     // Sanity check all conrols for syntax and functionality
     syntax_check_controls(controls);
-    if (!parameters.empty()) { parse_parameters(parameters); }
+    // Global parameters only: a subcircuit's parameters can depend on its instance's bindings and on the
+    // enclosing instance's scope, so they are bound per instance during expansion (upstream 3.0, 121ca3e).
+    if (!parameters.empty()) {
+        std::vector<ParameterName> globals;
+        for (const auto& parameter : parameters) {
+            if (!parameter.first.subcircuit()) { globals.push_back(parameter.first); }
+        }
+        parse_parameters(parameters, globals);
+    }
     parse_options_and_state_controls();
     // Seed deterministic RNG streams (noise + spread) once per parsed run.
     if (auto seed = find_seed_option(); seed.has_value()) {
@@ -351,9 +406,22 @@ void Input::parse_tokens_lines(std::vector<tokens_t>& fileLines) {
         bar.complete();
         std::cout << "\n";
     }
-    if (!argMin && argVerb) { std::cout << "RNG seed: " << Rng::base_seed() << "\n"; }
+    if (argVerb) { std::cout << "RNG seed: " << Rng::base_seed() << "\n"; }
     // If main is empty, complain
     if (netlist.maindesign.empty()) { Errors::input_errors(InputErrors::MISSING_MAIN); }
+    if (cli_output_file) { ensure_safe_output(cli_output_file.value().name()); }
+    for (auto& output : output_files) { ensure_safe_output(output.name()); }
+}
+
+void Input::ensure_safe_output(const std::string& filename) const {
+    const auto output = std::filesystem::weakly_canonical(filename);
+    for (const auto& source : inputFiles) {
+        std::error_code error;
+        const bool equivalent = std::filesystem::equivalent(output, source, error);
+        if (output == std::filesystem::path(source) || (!error && equivalent)) {
+            Errors::cli_errors(CLIErrors::INPUT_SAME_OUTPUT, filename);
+        }
+    }
 }
 
 void Input::syntax_check_controls(std::vector<tokens_t>& controls) {
@@ -2298,7 +2366,7 @@ std::optional<uint64_t> Input::find_seed_option() const {
 
             // Fallback: expression -> double (but then RANGE CHECK!)
             double dv = parse_param(tok, parameters);
-            if (!std::isfinite(dv) || dv < 0.0 || dv > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+            if (!std::isfinite(dv) || dv < 0.0 || dv >= std::ldexp(1.0, 64)) {
                 Errors::input_errors(InputErrors::UNKNOWN_CONTROL, "OPTION SEED");
             }
 

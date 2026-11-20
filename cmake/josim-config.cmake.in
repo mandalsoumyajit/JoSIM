@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+# Fork: the OpenMP solvers (USING_OPENMP=ON) put OpenMP in the link interface.
+if(@USING_OPENMP@)
+  find_dependency(OpenMP)
+endif()
+find_dependency(CMakeSuiteSparseConfig CONFIG)
+find_dependency(CMakeSuiteSparseAMD CONFIG)
+find_dependency(CMakeSuiteSparseCOLAMD CONFIG)
+find_dependency(CMakeSuiteSparseBTF CONFIG)
+find_dependency(CMakeSuiteSparseKLU CONFIG)
+
+include("${CMAKE_CURRENT_LIST_DIR}/josim-targets.cmake")
+check_required_components(josim)

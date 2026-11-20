@@ -23,7 +23,9 @@ enum class CLIErrors : int64_t {
     INVALID_INTEGRATION,
     INVALID_CONVENTION,
     INVALID_MINIMAL,
-    INPUT_SAME_OUTPUT
+    INPUT_SAME_OUTPUT,
+    INVALID_ARGUMENT,
+    UNSUPPORTED_PARALLEL
 };
 
 enum class InputErrors : int64_t {
@@ -37,7 +39,9 @@ enum class InputErrors : int64_t {
     EMPTY_FILE,
     IO_MISMATCH,
     UNKNOWN_CONTROL,
-    DUPLICATE_SUBCIRCUIT
+    DUPLICATE_SUBCIRCUIT,
+    INVALID_INCLUDE,
+    INVALID_CONTINUATION
 };
 
 enum class ComponentErrors : int64_t {
@@ -133,7 +137,13 @@ enum class FunctionErrors : int64_t {
     NOISE_TOO_MANY_ARGUMENTS,
     NOISE_VA_ZERO,
     NOISE_VO_ZERO,
-    EXP_TOO_FEW_ARGUMENTS
+    EXP_TOO_FEW_ARGUMENTS,
+    PARENTHESIS,
+    UNKNOWN_FUNCTION,
+    INVALID_NOISE_PARAMETERS,
+    INVALID_CUS_PARAMETERS,
+    INVALID_PWL_PARAMETERS,
+    INVALID_PULSE_PARAMETERS
 };
 
 enum class SimulationErrors : int64_t {
@@ -142,7 +152,10 @@ enum class SimulationErrors : int64_t {
     JJPHASE_NODE_NOT_FOUND,
     INDUCTOR_CURRENT_NOT_FOUND,
     MATRIX_SINGULAR,
-    PHASEGUESS_TOO_LARGE
+    PHASEGUESS_TOO_LARGE,
+    INVALID_MATRIX,
+    SOLVER_FAILURE,
+    STORAGE_ALLOCATION_FAILED
 };
 
 enum class ParsingErrors : int64_t {
@@ -153,9 +166,9 @@ enum class ParsingErrors : int64_t {
     INVALID_DECLARATION
 };
 
-enum class OutputErrors : int64_t { CANNOT_OPEN_FILE, NOTHING_SPECIFIED };
+enum class OutputErrors : int64_t { CANNOT_OPEN_FILE, NOTHING_SPECIFIED, WRITE_FAILED, NONFINITE_TRACE };
 
-enum class NetlistErrors : int64_t { NO_SUCH_NODE, MISSING_IO };
+enum class NetlistErrors : int64_t { NO_SUCH_NODE, MISSING_IO, RECURSIVE_SUBCIRCUIT };
 
 enum class VerbosityErrors : int64_t { NO_SUCH_LEVEL, INVALID_VERBOSITY_LEVEL };
 

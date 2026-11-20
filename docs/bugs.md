@@ -6,6 +6,8 @@ We request that users test the software, pushing it to its limits and reporting 
 
 JoSIM, from v2.4, adopted a more rolling release like schedule where additional features and bug fixes will be implemented in incremental updates to mitigate large scale problems with long lasting effects.
 
-Major releases will be made available on the releases page and features will be reported in the changelog, whereas minor releases will not be reported on.
+Published fixes, features and compatibility changes are recorded in the
+[changelog](https://github.com/JoeyDelp/JoSIM/blob/master/CHANGELOG.md).
+Download the latest version from [GitHub Releases](https://github.com/JoeyDelp/JoSIM/releases).
 
 Please report any bugs through creating a new issue on the [Issues](https://github.com/JoeyDelp/JoSIM/issues) page.

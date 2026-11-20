@@ -17,23 +17,9 @@ using namespace JoSIM;
 
 namespace {
 
-bool has_top_level_equals(const std::string& tok) {
-    int depth = 0;
-    for (char c : tok) {
-        if (c == '(' || c == '{' || c == '[') {
-            ++depth;
-        } else if (c == ')' || c == '}' || c == ']') {
-            depth = std::max(0, depth - 1);
-        } else if (c == '=' && depth == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 std::string strip_outer_braces(std::string s) {
     while (s.size() >= 2 && s.front() == '{' && s.back() == '}') {
-        int  depth      = 0;
+        int  depth       = 0;
         bool closesAtEnd = true;
         for (size_t i = 0; i + 1 < s.size(); ++i) {
             if (s[i] == '{') {
@@ -55,36 +41,24 @@ std::string strip_outer_braces(std::string s) {
     return s;
 }
 
+// One-argument functions (upstream's set plus the fork's additions).
 const std::vector<std::string> funcs1 = {"COS",   "SIN",   "TAN",   "ACOS",  "ASIN",  "ATAN",  "COSH",  "SINH",
                                          "TANH",  "ACOSH", "ASINH", "ATANH", "EXP",   "EXP2",  "LOG",   "LN",
                                          "LOG10", "LOG2",  "SQRT",  "CBRT",  "ABS",   "FABS",  "SGN",   "SIGN",
                                          "FLOOR", "CEIL",  "ROUND", "NINT",  "TRUNC", "INT",   "FRAC",  "STEP",
                                          "U",     "URAMP", "ERF",   "ERFC",  "DB",    "NEG"};
 
+// Two-argument functions; MIN and MAX also take more than two.
 const std::vector<std::string> funcs2 = {"MIN", "MAX", "ATAN2", "POW", "PWR", "PWRS", "HYPOT", "MOD", "FMOD"};
 
+// Three-argument functions.
 const std::vector<std::string> funcs3 = {"IF", "TERNARY", "LIMIT", "CLAMP"};
 
 bool is_func1(const std::string& s) { return std::find(funcs1.begin(), funcs1.end(), s) != funcs1.end(); }
 bool is_func2(const std::string& s) { return std::find(funcs2.begin(), funcs2.end(), s) != funcs2.end(); }
 bool is_func3(const std::string& s) { return std::find(funcs3.begin(), funcs3.end(), s) != funcs3.end(); }
 bool is_known_func(const std::string& s) { return is_func1(s) || is_func2(s) || is_func3(s); }
-
-const Parameter* lookup_scoped_param(const std::string& name, const param_map& params, const string_o& subc) {
-    if (subc.has_value()) {
-        std::string curScope = subc.value();
-        while (true) {
-            auto it = params.find(ParameterName(name, curScope));
-            if (it != params.end()) { return &it->second; }
-            const size_t barPos = curScope.rfind('|');
-            if (barPos == std::string::npos) { break; }
-            curScope = curScope.substr(0, barPos);
-        }
-    }
-    auto itGlobal = params.find(ParameterName(name, std::nullopt));
-    if (itGlobal != params.end()) { return &itGlobal->second; }
-    return nullptr;
-}
+bool is_variadic(const std::string& s) { return s == "MIN" || s == "MAX"; }
 
 double eval_func3(const std::string& op, double v0, double v1, double v2) {
     if (op == "IF" || op == "TERNARY") {
@@ -97,93 +71,84 @@ double eval_func3(const std::string& op, double v0, double v1, double v2) {
     return 0.0;
 }
 
+bool is_params_keyword(const std::string& token) { return token == "PARAMS:" || token == "PARAM:"; }
+
 } // namespace
+
+size_t JoSIM::parameter_start(const tokens_t& tokens, size_t first) {
+    for (size_t i = first; i < tokens.size(); ++i) {
+        if (is_params_keyword(tokens[i]) || tokens[i].find('=') != std::string::npos
+            || (i + 1 < tokens.size() && tokens[i + 1].rfind("=", 0) == 0)) { return i; }
+    }
+    return tokens.size();
+}
+
+std::vector<std::pair<std::string, std::string>> JoSIM::parameter_assignments(const tokens_t& tokens, size_t first) {
+    std::vector<std::pair<std::string, std::string>> result;
+    if (first >= tokens.size()) { return result; }
+    const auto text = Misc::vector_to_string(tokens_t(tokens.begin() + first, tokens.end()));
+    auto fail = [&] { Errors::parsing_errors(ParsingErrors::INVALID_DECLARATION, text); };
+    auto space = [](unsigned char c) { return std::isspace(c) || c == ','; };
+    auto name_char = [](unsigned char c) { return std::isalnum(c) || c == '_' || c == '|' || c == '.'; };
+    size_t pos = 0;
+    if (text.rfind("PARAMS:", 0) == 0) { pos = 7; }
+    else if (text.rfind("PARAM:", 0) == 0) { pos = 6; }
+    while (pos < text.size()) {
+        while (pos < text.size() && space(text[pos])) { ++pos; }
+        if (pos == text.size()) { break; }
+        const auto begin = pos;
+        while (pos < text.size() && name_char(text[pos])) { ++pos; }
+        const auto name = text.substr(begin, pos - begin);
+        while (pos < text.size() && space(text[pos])) { ++pos; }
+        if (name.empty() || pos == text.size() || text[pos++] != '=') { fail(); }
+        const auto expression = pos;
+        std::string brackets;
+        while (pos < text.size()) {
+            const char c = text[pos];
+            if (std::string("({[").find(c) != std::string::npos) { brackets += c; }
+            else if (std::string(")}]").find(c) != std::string::npos) {
+                if (brackets.empty() || std::string("({[").find(brackets.back()) != std::string(")}]").find(c)) { fail(); }
+                brackets.pop_back();
+            } else if (brackets.empty() && space(c)) {
+                size_t next = pos;
+                while (next < text.size() && space(text[next])) { ++next; }
+                const auto nextName = next;
+                while (next < text.size() && name_char(text[next])) { ++next; }
+                const auto nextEnd = next;
+                while (next < text.size() && space(text[next])) { ++next; }
+                if (nextEnd > nextName && next < text.size() && text[next] == '=') { break; }
+            }
+            ++pos;
+        }
+        auto value = text.substr(expression, pos - expression);
+        while (!value.empty() && space(value.back())) { value.pop_back(); }
+        if (!brackets.empty() || value.find_first_not_of(" \t,") == std::string::npos
+            || std::any_of(result.begin(), result.end(), [&](const auto& kv) { return kv.first == name; })) { fail(); }
+        result.emplace_back(name, value);
+    }
+    if (result.empty()) { fail(); }
+    return result;
+}
+
+string_o JoSIM::parent_parameter_scope(const string_o& scope) {
+    if (scope && !scope->empty() && scope->front() == '|') {
+        const auto separator = scope->find('|', 1);
+        if (separator != std::string::npos) { return scope->substr(separator); }
+    }
+    return std::nullopt;
+}
 
 void JoSIM::create_parameter(const tokens_t& s, param_map& parameters, string_o subc) {
     if (s.size() < 2) { Errors::parsing_errors(ParsingErrors::INVALID_DECLARATION, Misc::vector_to_string(s)); }
-    if (Misc::vector_to_string(s).find('=') == std::string::npos) {
-        Errors::parsing_errors(ParsingErrors::INVALID_DECLARATION, Misc::vector_to_string(s));
-    }
-
-    // Step 1: balance multi-token { ... } or ( ... ) fragments
-    tokens_t balanced;
-    for (size_t i = 1; i < s.size(); ++i) {
-        if (s[i] == "PARAMS:" || s[i] == "PARAM:") { continue; }
-        std::string cur   = s[i];
-        int         depth = 0;
-        for (char c : cur) {
-            if (c == '(' || c == '{' || c == '[') {
-                ++depth;
-            } else if (c == ')' || c == '}' || c == ']') {
-                --depth;
-            }
-        }
-        while (depth > 0 && i + 1 < s.size()) {
-            ++i;
-            cur += s[i];
-            for (char c : s[i]) {
-                if (c == '(' || c == '{' || c == '[') {
-                    ++depth;
-                } else if (c == ')' || c == '}' || c == ']') {
-                    --depth;
-                }
-            }
-        }
-        balanced.push_back(std::move(cur));
-    }
-
-    // Step 2: attach standalone, trailing, or leading '=' to adjacent tokens
-    tokens_t merged;
-    for (size_t i = 0; i < balanced.size(); ++i) {
-        if (balanced[i] == "=" && !merged.empty() && i + 1 < balanced.size()) {
-            merged.back() += "=" + balanced[i + 1];
-            ++i;
-        } else if (!merged.empty() && merged.back().back() == '=') {
-            merged.back() += balanced[i];
-        } else if (!balanced[i].empty() && balanced[i].front() == '=' && !merged.empty()) {
-            merged.back() += balanced[i];
-        } else {
-            merged.push_back(balanced[i]);
-        }
-    }
-
-    // Step 3: group into one or more NAME=EXPR assignments
-    std::vector<std::pair<std::string, std::string>> assignments;
-    for (const auto& tok : merged) {
-        if (has_top_level_equals(tok)) {
-            const size_t eqPos = tok.find('=');
-            std::string  pName = tok.substr(0, eqPos);
-            std::string  pExpr = tok.substr(eqPos + 1);
-            while (!pName.empty() && pName.front() == ',') { pName.erase(pName.begin()); }
-            if (!pName.empty()) {
-                assignments.emplace_back(std::move(pName), std::move(pExpr));
-            }
-        } else if (!assignments.empty()) {
-            assignments.back().second += tok;
-        }
-    }
-
-    if (assignments.empty()) {
-        Errors::parsing_errors(ParsingErrors::INVALID_DECLARATION, Misc::vector_to_string(s));
-        return;
-    }
-
-    for (auto& kv : assignments) {
-        std::string& pName = kv.first;
-        std::string& pExpr = kv.second;
-        while (!pExpr.empty() && pExpr.back() == ',') { pExpr.pop_back(); }
-        pExpr = strip_outer_braces(pExpr);
-        if (pName.empty() || pExpr.empty()) {
-            Errors::parsing_errors(ParsingErrors::INVALID_DECLARATION, Misc::vector_to_string(s));
-            continue;
-        }
+    for (const auto& assignment : parameter_assignments(s, 1)) {
         Parameter temp;
-        temp.set_expression(pExpr);
-        const ParameterName key(pName, subc);
-        if (parameters.count(key) != 0) {
+        // A wholly braced value ({expr}) is stored as the bare expression, as the fork always has.
+        temp.set_expression(strip_outer_braces(assignment.second));
+        const ParameterName name(assignment.first, subc);
+        if (parameters.count(name)) {
             Errors::parsing_errors(ParsingErrors::EXPRESSION_ARLEADY_DEFINED, Misc::vector_to_string(s));
         }
-        parameters[key] = temp;
+        parameters[name] = temp;
     }
 }
 
@@ -191,225 +156,237 @@ int64_t JoSIM::precedence_lvl(const std::string& op) {
     if (op.empty()) { return 4; }
     if (is_known_func(op)) { return 4; }
     switch (op.at(0)) {
+            // + and - are lowest level
         case '+':
-        case '-': return 1;
+        case '-':
+            return 1;
+            // * and / are higher level
         case '*':
-        case '/': return 2;
-        case '^': return 3;
+        case '/':
+            return 2;
+            // ^ (pow) is highest level
+        case '^':
+            return 3;
+            // default (functions) are max level
         default: return 4;
     }
 }
 
 double JoSIM::parse_param(const std::string& expr, const param_map& params, string_o subc, bool single) {
-    std::string expToEval = strip_outer_braces(expr);
-    expToEval.erase(std::remove_if(expToEval.begin(), expToEval.end(), ::isspace), expToEval.end());
-    if (expToEval.empty()) { return 0.0; }
-    if (expToEval.front() == '.') { expToEval = "0" + expToEval; }
-
-    std::vector<std::string> rpnQueue, rpnQueueCopy, opStack;
-    std::vector<char>        qType, qTypeCopy;
-    std::vector<int>         parenCommaCount;
-    std::string              partToEval;
-    int64_t                  popCount          = 0;
-    double                   result            = 0.0;
-    bool                     prevTokenWasValue = false;
-
-    auto is_sci_exponent_sign = [&](int64_t pos) -> bool {
-        if (pos <= 1 || pos + 1 >= static_cast<int64_t>(expToEval.size())) { return false; }
-        if (expToEval[pos] != '-' && expToEval[pos] != '+') { return false; }
-        if (expToEval[pos - 1] != 'E') { return false; }
-        const char beforeE = expToEval[pos - 2];
-        const char afterOp = expToEval[pos + 1];
-        return (std::isdigit(static_cast<unsigned char>(beforeE)) || beforeE == '.')
-               && std::isdigit(static_cast<unsigned char>(afterOp));
+    std::string text = expr;
+    text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) { return std::isspace(c); }), text.end());
+    if (text.empty()) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+    auto uppercase = [](std::string name) {
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::toupper(c); });
+        return name;
     };
-
-    while (!expToEval.empty()) {
-        int64_t opLoc = static_cast<int64_t>(expToEval.find_first_of("/*-+(){}[]^,"));
-
-        if (opLoc == 0 && (expToEval[0] == '-' || expToEval[0] == '+') && !prevTokenWasValue) {
-            if (expToEval.size() > 1
-                && (std::isdigit(static_cast<unsigned char>(expToEval[1])) || expToEval[1] == '.')) {
-                opLoc = static_cast<int64_t>(expToEval.find_first_of("/*-+(){}[]^,", 1));
-                while (opLoc != -1 && is_sci_exponent_sign(opLoc)) {
-                    opLoc = static_cast<int64_t>(expToEval.find_first_of("/*-+(){}[]^,", static_cast<size_t>(opLoc + 1)));
-                }
-            } else {
-                if (expToEval[0] == '-') { opStack.push_back("NEG"); }
-                expToEval = expToEval.substr(1);
-                continue;
-            }
-        } else {
-            while (opLoc != -1 && is_sci_exponent_sign(opLoc)) {
-                opLoc = static_cast<int64_t>(expToEval.find_first_of("/*-+(){}[]^,", static_cast<size_t>(opLoc + 1)));
-            }
+    auto parameter = [&](const std::string& name) {
+        auto scope = subc;
+        const auto upper = uppercase(name);
+        for (;;) {
+            auto found = params.find(ParameterName(name, scope));
+            if (found == params.end() && upper != name) { found = params.find(ParameterName(upper, scope)); }
+            if (found != params.end() || !scope) { return found; }
+            scope = parent_parameter_scope(scope);
         }
-
-        if (opLoc == -1) {
-            partToEval = expToEval;
-        } else if (opLoc == 0) {
-            partToEval = expToEval.substr(0, 1);
-        } else {
-            partToEval = expToEval.substr(0, static_cast<size_t>(opLoc));
+    };
+    auto resolved = [&](const Parameter& value) {
+        if (!value.get_value()) {
+            if (!single) { return std::numeric_limits<double>::quiet_NaN(); }
+            Errors::parsing_errors(ParsingErrors::UNIDENTIFIED_PART, expr);
         }
+        if (!std::isfinite(value.get_value().value())) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+        return value.get_value().value();
+    };
+    // Preserve exact whole-parameter lookup, including names supplied directly
+    // by embedding callers, before interpreting an expression's operators.
+    auto whole = parameter(text);
+    if (whole != params.end()) { return resolved(whole->second); }
 
-        if (partToEval.front() == '.' && partToEval.size() > 1) {
-            partToEval = "0" + partToEval;
-        } else if ((partToEval.front() == '-' || partToEval.front() == '+') && partToEval.size() > 2
-                   && partToEval[1] == '.') {
-            partToEval.insert(1, "0");
+    // An operator token carries its argument count (functions take 1-3 arguments, MIN/MAX two or more).
+    struct Token {
+        std::string op;
+        double      value;
+        int64_t     arity = 0;
+    };
+    std::vector<Token>       output;
+    std::vector<std::string> operators;
+    // Commas seen inside each open bracket, in the order the brackets were opened.
+    std::vector<int64_t>     commas;
+    bool operand = true;
+    auto function = [](const std::string& name) { return is_known_func(name); };
+    auto opening = [](const std::string& token) { return token.size() == 1 && std::string("([{").find(token[0]) != std::string::npos; };
+    auto priority = [](const std::string& op) { return op == "U-" || op == "U+" ? int64_t(3) : precedence_lvl(op); };
+    auto emit = [&] {
+        const std::string op = operators.back();
+        operators.pop_back();
+        output.push_back({op, 0.0, (op == "U-" || op == "U+" || is_func1(op)) ? 1 : 2});
+    };
+    const std::string delimiters = "+-*/^()[]{},";
+    size_t position = 0;
+    while (position < text.size()) {
+        const char c = text[position];
+        if (std::isdigit(static_cast<unsigned char>(c))
+            || (c == '.' && position + 1 < text.size() && std::isdigit(static_cast<unsigned char>(text[position + 1])))) {
+            if (!operand) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+            size_t numeric = 0;
+            try { std::stod(text.substr(position), &numeric); }
+            catch (const std::exception&) { Errors::misc_errors(MiscErrors::STOD_ERROR, text.substr(position)); }
+            // std::stod identifies exponent signs as part of the number. Only
+            // subsequent operators delimit its optional engineering/unit suffix.
+            size_t end = text.find_first_of(delimiters, position + numeric);
+            if (end == std::string::npos) { end = text.size(); }
+            const auto literal = text.substr(position, end - position);
+            const auto suffix = literal.substr(numeric);
+            if ((!suffix.empty() && (suffix.front() == 'E' || suffix.front() == 'e'))
+                || std::any_of(suffix.begin(), suffix.end(), [](unsigned char ch) { return !std::isalpha(ch); })) {
+                Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr);
+            }
+            const double value = Misc::modifier(literal);
+            if (!std::isfinite(value)) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+            output.push_back({"", value});
+            position = end;
+            operand = false;
+            continue;
         }
-
-        if (std::isdigit(static_cast<unsigned char>(partToEval.at(0)))
-            || ((partToEval.at(0) == '-' || partToEval.at(0) == '+') && partToEval.size() > 1)) {
-            rpnQueue.push_back(Misc::precise_to_string(Misc::modifier(partToEval)));
-            qType.push_back('V');
-            prevTokenWasValue = true;
-        } else if (const Parameter* p = lookup_scoped_param(partToEval, params, subc)) {
-            if (!p->get_value().has_value()) {
-                if (!single) { return std::numeric_limits<double>::quiet_NaN(); }
-                Errors::parsing_errors(ParsingErrors::UNIDENTIFIED_PART, expr);
-                return 0.0;
-            }
-            rpnQueue.push_back(Misc::precise_to_string(p->get_value().value()));
-            qType.push_back('V');
-            prevTokenWasValue = true;
-        } else if (is_known_func(partToEval)) {
-            opStack.push_back(partToEval);
-            prevTokenWasValue = false;
-        } else if (Misc::string_constant(partToEval) != 0.0) {
-            rpnQueue.push_back(Misc::precise_to_string(Misc::string_constant(partToEval)));
-            qType.push_back('V');
-            prevTokenWasValue = true;
-        } else if (partToEval == ",") {
-            while (!opStack.empty() && opStack.back().find_first_of("([{") == std::string::npos) {
-                rpnQueue.push_back(opStack.back());
-                qType.push_back('O');
-                opStack.pop_back();
-            }
-            if (opStack.empty()) { Errors::parsing_errors(ParsingErrors::MISMATCHED_PARENTHESIS, expr); }
-            if (!parenCommaCount.empty()) {
-                parenCommaCount.back()++;
-                if (parenCommaCount.back() >= 2 && opStack.size() >= 2) {
-                    const std::string& fn = opStack[opStack.size() - 2];
-                    if (fn == "MIN" || fn == "MAX") {
-                        rpnQueue.push_back(fn);
-                        qType.push_back('O');
-                    }
-                }
-            }
-            prevTokenWasValue = false;
-        } else if (partToEval.find_first_of("/*-+^") != std::string::npos) {
-            while ((!opStack.empty())
-                   && (((precedence_lvl(opStack.back()) == 4)
-                        || (precedence_lvl(opStack.back()) > precedence_lvl(partToEval))
-                        || (precedence_lvl(opStack.back()) == precedence_lvl(partToEval) && partToEval != "^"))
-                       && (opStack.back().find_first_of("([{") == std::string::npos))) {
-                rpnQueue.push_back(opStack.back());
-                qType.push_back('O');
-                opStack.pop_back();
-            }
-            opStack.push_back(partToEval);
-            prevTokenWasValue = false;
-        } else if (partToEval.find_first_of("([{") != std::string::npos) {
-            opStack.push_back(partToEval);
-            parenCommaCount.push_back(0);
-            prevTokenWasValue = false;
-        } else if (partToEval.find_first_of(")]}") != std::string::npos) {
-            while ((!opStack.empty()) && (opStack.back().find_first_of("([{") == std::string::npos)) {
-                rpnQueue.push_back(opStack.back());
-                qType.push_back('O');
-                opStack.pop_back();
-            }
-            if ((!opStack.empty()) && (opStack.back().find_first_of("([{") != std::string::npos)) {
-                opStack.pop_back();
-                if (!parenCommaCount.empty()) { parenCommaCount.pop_back(); }
-                if (!opStack.empty() && is_known_func(opStack.back())) {
-                    rpnQueue.push_back(opStack.back());
-                    qType.push_back('O');
-                    opStack.pop_back();
-                }
-            } else {
+        if (c == '(' || c == '[' || c == '{') {
+            if (!operand) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+            operators.emplace_back(1, c);
+            commas.push_back(0);
+            ++position;
+            continue;
+        }
+        if (c == ',') {
+            // Argument separator, only inside brackets (a function's, checked at the closing bracket).
+            if (operand) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+            while (!operators.empty() && !opening(operators.back())) { emit(); }
+            if (operators.empty() || commas.empty()) { Errors::parsing_errors(ParsingErrors::MISMATCHED_PARENTHESIS, expr); }
+            ++commas.back();
+            ++position;
+            operand = true;
+            continue;
+        }
+        if (c == ')' || c == ']' || c == '}') {
+            if (operand) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+            while (!operators.empty() && !opening(operators.back())) { emit(); }
+            if (operators.empty()
+                || std::string("([{").find(operators.back()[0]) != std::string(")]}").find(c)) {
                 Errors::parsing_errors(ParsingErrors::MISMATCHED_PARENTHESIS, expr);
             }
-            prevTokenWasValue = true;
-        } else {
-            if (!single) {
-                return std::numeric_limits<double>::quiet_NaN();
+            operators.pop_back();
+            const int64_t args = 1 + (commas.empty() ? 0 : commas.back());
+            if (!commas.empty()) { commas.pop_back(); }
+            if (!operators.empty() && function(operators.back())) {
+                const std::string fn     = operators.back();
+                const int64_t     wanted = is_func1(fn) ? 1 : is_func2(fn) ? 2 : 3;
+                if (args != wanted && !(is_variadic(fn) && args >= 2)) {
+                    Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr);
+                }
+                operators.pop_back();
+                output.push_back({fn, 0.0, args});
+            } else if (args != 1) {
+                Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr);
+            }
+            ++position;
+            operand = false;
+            continue;
+        }
+        if (std::string("+-*/^").find(c) != std::string::npos) {
+            if (operand) {
+                if (c != '+' && c != '-') { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+                // Unary signs bind after exponentiation but before products;
+                // pushing them directly also permits a signed exponent.
+                operators.push_back(c == '-' ? "U-" : "U+");
             } else {
+                const std::string op(1, c);
+                while (!operators.empty() && !opening(operators.back())
+                       && (priority(operators.back()) > priority(op)
+                           || (priority(operators.back()) == priority(op) && c != '^'))) { emit(); }
+                operators.push_back(op);
+                operand = true;
+            }
+            ++position;
+            continue;
+        }
+        if (!operand) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+        size_t end = text.find_first_of(delimiters, position);
+        if (end == std::string::npos) { end = text.size(); }
+        const auto name = text.substr(position, end - position);
+        auto found = parameter(name);
+        if (found != params.end()) {
+            const double value = resolved(found->second);
+            if (std::isnan(value)) { return value; }
+            output.push_back({"", value});
+            operand = false;
+        } else {
+            const auto canonical = uppercase(name);
+            if (function(canonical)) {
+                if (end == text.size() || std::string("([{").find(text[end]) == std::string::npos) {
+                    Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr);
+                }
+                operators.push_back(canonical);
+            } else if (Misc::string_constant(canonical) != 0.0) {
+                output.push_back({"", Misc::string_constant(canonical)});
+                operand = false;
+            } else {
+                if (!single) { return std::numeric_limits<double>::quiet_NaN(); }
                 Errors::parsing_errors(ParsingErrors::UNIDENTIFIED_PART, expr);
             }
         }
-
-        if (opLoc == 0) {
-            expToEval = expToEval.substr(1);
-        } else if (opLoc == -1) {
-            expToEval = "";
-        } else {
-            expToEval = expToEval.substr(static_cast<size_t>(opLoc));
-        }
+        position = end;
     }
-
-    while (!opStack.empty()) {
-        if (opStack.back().find_first_of("([{") != std::string::npos) {
-            Errors::parsing_errors(ParsingErrors::MISMATCHED_PARENTHESIS, expr);
-            opStack.pop_back();
-        } else {
-            rpnQueue.push_back(opStack.back());
-            qType.push_back('O');
-            opStack.pop_back();
-        }
+    if (operand) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+    while (!operators.empty()) {
+        if (opening(operators.back())) { Errors::parsing_errors(ParsingErrors::MISMATCHED_PARENTHESIS, expr); }
+        emit();
     }
-
-    if (rpnQueue.empty()) { return 0.0; }
-
-    while (rpnQueue.size() > 1) {
-        rpnQueueCopy.clear();
-        qTypeCopy.clear();
-        bool progressed = false;
-        for (size_t i = 0; i < qType.size(); ++i) {
-            if (qType[i] == 'V') {
-                rpnQueueCopy.push_back(rpnQueue[i]);
-                qTypeCopy.push_back('V');
-            } else if (qType[i] == 'O') {
-                const std::string& op = rpnQueue[i];
-                if (i == 0) {
-                    Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr);
-                    return 0.0;
-                } else if (is_func3(op)) {
-                    if (i < 3) {
-                        Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr);
-                        return 0.0;
-                    }
-                    result = eval_func3(
-                            op, Misc::modifier(rpnQueue[i - 3]), Misc::modifier(rpnQueue[i - 2]), Misc::modifier(rpnQueue[i - 1]));
-                    for (int k = 0; k < 3; ++k) { rpnQueueCopy.pop_back(); }
-                    qTypeCopy.pop_back();
-                    qTypeCopy.pop_back();
-                    rpnQueueCopy.push_back(Misc::precise_to_string(result));
-                } else if (i < 2) {
-                    rpnQueueCopy.pop_back();
-                    rpnQueueCopy.push_back(
-                            Misc::precise_to_string(parse_operator(op, 0.0, Misc::modifier(rpnQueue[i - 1]), popCount)));
-                } else {
-                    result = parse_operator(op, Misc::modifier(rpnQueue[i - 2]), Misc::modifier(rpnQueue[i - 1]), popCount);
-                    for (int64_t k = 0; k < popCount; ++k) { rpnQueueCopy.pop_back(); }
-                    if (popCount == 2) { qTypeCopy.pop_back(); }
-                    rpnQueueCopy.push_back(Misc::precise_to_string(result));
-                }
-                if (rpnQueue.size() > i + 1) {
-                    rpnQueueCopy.insert(rpnQueueCopy.end(), rpnQueue.begin() + static_cast<ptrdiff_t>(i + 1), rpnQueue.end());
-                    qTypeCopy.insert(qTypeCopy.end(), qType.begin() + static_cast<ptrdiff_t>(i + 1), qType.end());
-                }
-                progressed = true;
-                break;
+    std::vector<double> values;
+    for (const auto& token : output) {
+        if (token.op.empty()) {
+            values.push_back(token.value);
+            continue;
+        }
+        const bool    sign  = token.op == "U-" || token.op == "U+";
+        const int64_t arity = token.arity;
+        if (arity < 1 || values.size() < static_cast<size_t>(arity)) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+        double result;
+        if (sign) {
+            const double right = values.back();
+            values.pop_back();
+            result = token.op == "U-" ? -right : right;
+        } else if (is_variadic(token.op)) {
+            // MIN/MAX fold over all their arguments, left to right.
+            const auto first = values.end() - arity;
+            result           = *first;
+            for (auto it = first + 1; it != values.end(); ++it) {
+                result = token.op == "MIN" ? std::min(result, *it) : std::max(result, *it);
             }
+            values.erase(first, values.end());
+        } else if (arity == 3) {
+            const double v2 = values.back();
+            values.pop_back();
+            const double v1 = values.back();
+            values.pop_back();
+            const double v0 = values.back();
+            values.pop_back();
+            result = eval_func3(token.op, v0, v1, v2);
+        } else {
+            const double right = values.back();
+            values.pop_back();
+            double left = 0.0;
+            if (arity == 2) {
+                left = values.back();
+                values.pop_back();
+            }
+            int64_t consumed = 0;
+            result = parse_operator(token.op, left, right, consumed);
+            if (consumed != arity) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
         }
-        if (!progressed) { break; }
-        rpnQueue = rpnQueueCopy;
-        qType    = qTypeCopy;
+        if (!std::isfinite(result)) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+        values.push_back(result);
     }
-    return Misc::modifier(rpnQueue.back());
+    if (values.size() != 1) { Errors::parsing_errors(ParsingErrors::INVALID_RPN, expr); }
+    return values.back();
 }
 
 double JoSIM::parse_operator(const std::string& op, double val1, double val2, int64_t& popCount) {
@@ -514,40 +491,49 @@ double JoSIM::parse_operator(const std::string& op, double val1, double val2, in
 }
 
 void JoSIM::parse_parameters(param_map& parameters) {
-    double value;
-    size_t parsedCounter = 0;
-    for (const auto& i : parameters) {
-        if (i.second.get_value()) { parsedCounter++; }
+    std::vector<ParameterName> names;
+    for (const auto& parameter : parameters) { names.push_back(parameter.first); }
+    parse_parameters(parameters, names);
+}
+
+void JoSIM::parse_parameters(param_map& parameters, const std::vector<ParameterName>& names) {
+    std::vector<ParameterName> pending;
+    for (const auto& name : names) {
+        if (!parameters.at(name).get_value()) { pending.push_back(name); }
     }
-    while (parsedCounter < parameters.size()) {
-        int64_t previous_counter = static_cast<int64_t>(parsedCounter);
-        for (auto& i : parameters) {
-            if (!i.second.get_value()) {
-                value = parse_param(i.second.get_expression(), parameters, i.first.subcircuit(), false);
-                if (!std::isnan(value)) {
-                    i.second.set_value(value);
-                    parsedCounter++;
-                }
-            }
-        }
-        if (previous_counter == static_cast<int64_t>(parsedCounter)) {
-            std::string unknownParams;
-            for (auto& i : parameters) {
-                if (!i.second.get_value()) {
-                    unknownParams += i.first.name() + " " + i.first.subcircuit().value_or("") + "\n";
-                }
-            }
-            Errors::parsing_errors(ParsingErrors::UNIDENTIFIED_PART, unknownParams);
+    while (!pending.empty()) {
+        const auto previous = pending.size();
+        pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const ParameterName& name) {
+            auto& parameter = parameters.at(name);
+            const double value = parse_param(parameter.get_expression(), parameters, name.subcircuit(), false);
+            if (std::isnan(value)) { return false; }
+            parameter.set_value(value);
+            return true;
+        }), pending.end());
+        if (pending.size() == previous) {
+            std::string unknown;
+            for (const auto& name : pending) { unknown += name.name() + " " + name.subcircuit().value_or("") + "\n"; }
+            Errors::parsing_errors(ParsingErrors::UNIDENTIFIED_PART, unknown);
         }
     }
 }
 
 void JoSIM::update_parameters(param_map& parameters) {
-    for (auto& i : parameters) { i.second.reset_value(); }
-    parse_parameters(parameters);
+    // Re-evaluate global and per-instance ("|path") parameters. Subcircuit-definition defaults are templates
+    // that may depend on an instance's bindings, so they are not evaluated on their own.
+    std::vector<ParameterName> names;
+    for (auto& parameter : parameters) {
+        const auto& scope = parameter.first.subcircuit();
+        if (!scope || (!scope->empty() && scope->front() == '|')) {
+            parameter.second.reset_value();
+            names.push_back(parameter.first);
+        }
+    }
+    parse_parameters(parameters, names);
 }
 
 void JoSIM::expand_inline_parameters(std::pair<tokens_t, string_o>& s, param_map& parameters) {
+    // Expand every {expression} in the line; a token may carry text before and after its braces.
     while (true) {
         int_o oPos, cPos;
         for (size_t i = 0; i < s.first.size(); ++i) {

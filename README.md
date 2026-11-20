@@ -1,5 +1,5 @@
 # JoSIM
-### Superconductor Circuit Simulator
+### Superconducting circuit simulator
 
 ---
 

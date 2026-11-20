@@ -500,14 +500,9 @@ JOSIM_API int josim_run(josim_session_t* s) {
             s->activeInput.parameters[ParameterName(std::get<0>(ov), std::get<1>(ov))] = p;
         }
 
-        if (!s->activeInput.parameters.empty()) { parse_parameters(s->activeInput.parameters); }
+        // Bind parameters and models per subcircuit instance (upstream 3.x expansion).
         s->activeInput.netlist.models_new.clear();
-        for (const auto& m : s->activeInput.netlist.models) {
-            Model::parse_model(
-                std::make_pair(m.second, m.first.second), s->activeInput.netlist.models_new, s->activeInput.parameters);
-        }
-        s->activeInput.netlist.expand_subcircuits();
-        s->activeInput.netlist.expand_maindesign();
+        s->activeInput.netlist.expand_maindesign(s->activeInput.parameters);
         Transient::identify_simulation(
             s->activeInput.controls, s->activeInput.transSim, s->activeInput.parameters);
         IV ivObj(s->activeInput);
@@ -1035,14 +1030,9 @@ JOSIM_API int josim_cosim_init(josim_session_t* s) {
             s->activeInput.parameters[ParameterName(std::get<0>(ov), std::get<1>(ov))] = p;
         }
 
-        if (!s->activeInput.parameters.empty()) { parse_parameters(s->activeInput.parameters); }
+        // Bind parameters and models per subcircuit instance (upstream 3.x expansion).
         s->activeInput.netlist.models_new.clear();
-        for (const auto& m : s->activeInput.netlist.models) {
-            Model::parse_model(
-                std::make_pair(m.second, m.first.second), s->activeInput.netlist.models_new, s->activeInput.parameters);
-        }
-        s->activeInput.netlist.expand_subcircuits();
-        s->activeInput.netlist.expand_maindesign();
+        s->activeInput.netlist.expand_maindesign(s->activeInput.parameters);
         Transient::identify_simulation(
             s->activeInput.controls, s->activeInput.transSim, s->activeInput.parameters);
 

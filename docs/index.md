@@ -67,34 +67,28 @@ The JoSIM repository has the following layout. A quick description shows the pur
     CMakeLists.txt		# Configuration to compile code.
     ...					# Other configuration files and scripts.
 
-## Initial setup
-With each major version of JoSIM a release for all major platforms is generated and placed under the [Releases](https://github.com/JoeyDelp/JoSIM/releases) section of the GitHub repository. At the time of writing, this is version 2.5.
+## Getting started
 
-To compile JoSIM from source, the following packages are required:
+Download and extract the archive for your operating system and architecture from
+[GitHub Releases](https://github.com/JoeyDelp/JoSIM/releases). The executable is
+in `bin/`. Add that directory to your `PATH`, or invoke the executable by its
+full path. The archive includes the C++ library and headers.
 
-- CMake 3.14
-- Git
-- C++ compiler with C++17 support
-
-### Building from source
-#### Linux
-
-These instructions were executed on a minimal install of CentOS 7 to reduce oversight in the compilation instructions created by previous package installs. For other distributions please use the package manager relevant to the distribution of choice.
-
-A working internet connection is required, as well as the ability to install packages. If the internet connection is not up please run, and replace <network interface> with your relevant interface i.e *eth0*:
+For example, from the repository root with a local build:
 
 ```bash
-sudo ifup <network interface>
+build/dev/josim-cli -o build/example.csv test/ex_dcsfq_jtl_sink.cir
 ```
 
-CentOS 7 does not contain all the enterprise Linux packages in its default repository and therefore needs to be activated using:
+On multi-configuration Windows builds the executable is under
+`build/dev/Release/`. See [Example Usage](ex_usage.md) and the
+[Syntax Guide](syntax.md) for netlists, analysis modes and output options.
 
-```bash
-sudo yum install epel-release
-sudo yum update
-```
+To compile and test from source, follow [Developing JoSIM](DEVELOPMENT.md).
+The [release procedure](RELEASE_POLICY.md) describes binary targets, runtime
+requirements and packaging.
 
-CentOS 7 will require development packages to be installed. Fortunately this can be done using a single command:
+Further guides:
 
 ```bash
 sudo yum groupinstall "Development Tools"

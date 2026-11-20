@@ -7,9 +7,25 @@
 #include "JoSIM/Errors.hpp"
 #include "JoSIM/Misc.hpp"
 
+#include <algorithm>
+#include <initializer_list>
 #include <utility>
 
 using namespace JoSIM;
+
+namespace {
+double scaled_product(std::initializer_list<double> values) {
+    double mantissa = 1.0;
+    int exponent = 0;
+    for (double value : values) {
+        if (value == 0) { return 0.0; }
+        int part = 0;
+        mantissa *= std::frexp(value, &part);
+        exponent += part;
+    }
+    return std::ldexp(mantissa, exponent);
+}
+} // namespace
 
 /*
   Llabel V+ V- L
@@ -36,23 +52,30 @@ Inductor::Inductor(const std::pair<tokens_t, string_o>& s,
                    Input&                               iObj,
                    Spread&                              spread,
                    int64_t&                             bi) {
-    double                spr     = 1.0;
-    std::optional<double> fluxVal = std::nullopt;
-    std::optional<double> phiVal  = std::nullopt;
-    for (size_t idx = 4; idx < s.first.size(); ++idx) {
-        const auto& i = s.first.at(idx);
-        if (i.rfind("SPREAD=", 0) == 0) {
-            spr = parse_param(i.substr(7), iObj.parameters, s.second);
-        } else if (i.rfind("FLUX=", 0) == 0) {
-            fluxVal = parse_param(i.substr(5), iObj.parameters, s.second);
-        } else if (i.rfind("PHI0=", 0) == 0) {
-            fluxVal = parse_param(i.substr(5), iObj.parameters, s.second);
-        } else if (i.rfind("PHI=", 0) == 0) {
-            phiVal = parse_param(i.substr(4), iObj.parameters, s.second);
-        } else if (i.rfind("PHIOFF=", 0) == 0) {
-            phiVal = parse_param(i.substr(7), iObj.parameters, s.second);
-        } else if (i.rfind("IC=", 0) == 0) {
-            icCurrent_ = parse_param(i.substr(3), iObj.parameters, s.second);
+    double                spr            = 1.0;
+    bool                  alphaSpecified = false;
+    std::optional<double> fluxVal        = std::nullopt;
+    std::optional<double> phiVal         = std::nullopt;
+    for (const auto& attribute : parameter_assignments(s.first, 4)) {
+        const auto& key = attribute.first;
+        if (key == "SPREAD") {
+            spr = parse_param(attribute.second, iObj.parameters, s.second);
+        } else if (key == "ALPHA") {
+            alphaSpecified = true;
+            alpha_ = parse_param(attribute.second, iObj.parameters, s.second);
+            if (!std::isfinite(alpha_) || alpha_ < 0) {
+                Errors::invalid_component_errors(ComponentErrors::INVALID_COMPONENT_DECLARATION,
+                    s.first.front() + ": ALPHA must be finite and non-negative");
+            }
+        } else if (key == "FLUX" || key == "PHI0") {
+            fluxVal = parse_param(attribute.second, iObj.parameters, s.second);
+        } else if (key == "PHI" || key == "PHIOFF") {
+            phiVal = parse_param(attribute.second, iObj.parameters, s.second);
+        } else if (key == "IC") {
+            icCurrent_ = parse_param(attribute.second, iObj.parameters, s.second);
+        } else {
+            Errors::invalid_component_errors(ComponentErrors::INVALID_COMPONENT_DECLARATION,
+                s.first.front() + ": unknown inductor parameter " + attribute.first);
         }
     }
     at_  = iObj.argAnal;
@@ -70,6 +93,10 @@ Inductor::Inductor(const std::pair<tokens_t, string_o>& s,
     nominalValue_      = parse_param(s.first.at(3), iObj.parameters, s.second);
     spread_            = spr;
     netlistInfo.value_ = spread.spread_value(nominalValue_, Spread::IND, spread_);
+    if (alphaSpecified && (!std::isfinite(netlistInfo.value_) || netlistInfo.value_ <= 0)) {
+        Errors::invalid_component_errors(ComponentErrors::INVALID_COMPONENT_DECLARATION,
+            s.first.front() + ": ALPHA requires finite positive L0");
+    }
     if (fluxVal.has_value()) {
         phiOffset_ = 2.0 * Constants::PI * fluxVal.value();
     } else if (phiVal.has_value()) {
@@ -92,6 +119,7 @@ Inductor::Inductor(const std::pair<tokens_t, string_o>& s,
     set_node_indices(tokens_t(s.first.begin() + 1, s.first.begin() + 3), nm, nc);
     // Set the non zero, column index and row pointer vectors
     set_matrix_info();
+    selfIndex_ = matrixInfo.nonZeros_.size();
     // Append the value to the non zero vector
     if (at_ == AnalysisType::Voltage) {
         // If voltage mode analysis then append -(3/2) * (L/h)
@@ -100,6 +128,33 @@ Inductor::Inductor(const std::pair<tokens_t, string_o>& s,
         // If phase mdoe analysis then append -(L/σ)
         matrixInfo.nonZeros_.emplace_back(-netlistInfo.value_ / Constants::SIGMA);
     }
+}
+
+double Inductor::flux(double current) const {
+    if (alpha_ == 0) { return netlistInfo.value_ * current; }
+    const double coefficient = netlistInfo.value_ * alpha_;
+    if (!std::isfinite(coefficient) || coefficient == 0) {
+        return netlistInfo.value_ * current
+             + scaled_product({netlistInfo.value_, alpha_, current, current, current, 1.0 / 3.0});
+    }
+    return current * (netlistInfo.value_ + ((coefficient * current) * current) / 3.0);
+}
+
+double Inductor::differential_inductance(double current) const {
+    if (alpha_ == 0) { return netlistInfo.value_; }
+    const double coefficient = netlistInfo.value_ * alpha_;
+    if (!std::isfinite(coefficient) || coefficient == 0) {
+        return netlistInfo.value_ + scaled_product({netlistInfo.value_, alpha_, current, current});
+    }
+    return netlistInfo.value_ + (coefficient * current) * current;
+}
+
+bool Inductor::linearize(double current, double timestep) {
+    const double scale = at_ == AnalysisType::Voltage ? 1.5 / timestep : 1.0 / Constants::SIGMA;
+    const double value = -scale * differential_inductance(current);
+    const bool changed = matrixInfo.nonZeros_.at(selfIndex_) != value;
+    matrixInfo.nonZeros_.at(selfIndex_) = value;
+    return changed;
 }
 
 void Inductor::add_mutualInductance(const double& m, const AnalysisType& at, const double& h, const int64_t& ci) {
@@ -119,5 +174,12 @@ void Inductor::add_mutualInductance(const double& m, const AnalysisType& at, con
 
 // Update timestep based on a scalar factor i.e 0.5 for half the timestep
 void Inductor::update_timestep(const double& factor) {
-    if (at_ == AnalysisType::Voltage) { matrixInfo.nonZeros_.back() = (1.0 / factor) * matrixInfo.nonZeros_.back(); }
+    if (at_ == AnalysisType::Voltage) {
+        const auto own = std::find(matrixInfo.columnIndex_.begin(), matrixInfo.columnIndex_.end(),
+                                   indexInfo.currentIndex_.value());
+        // The own-current coefficient is followed by every mutual-current term.
+        for (size_t i = own - matrixInfo.columnIndex_.begin(); i < matrixInfo.nonZeros_.size(); ++i) {
+            matrixInfo.nonZeros_.at(i) = (1.0 / factor) * matrixInfo.nonZeros_.at(i);
+        }
+    }
 }

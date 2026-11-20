@@ -1,0 +1,113 @@
+# Numerical methods
+
+JoSIM solves the transient circuit equations using voltage or phase as the nodal
+unknown. It uses the second-order backward difference formula (BDF2):
+
+\[
+\left.\frac{dx}{dt}\right|_n\approx
+\frac{3x_n-4x_{n-1}+x_{n-2}}{2h},
+\]
+
+where `h` is the internal timestep. Nonlinear junction terms are predicted from
+previous samples. Without nonlinear inductors, each step uses one sparse linear
+solve. Quadratic inductors add the correction described below. JoSIM does not
+provide general SPICE RELTOL/ABSTOL controls or a fully implicit junction solve.
+
+## Nonlinear inductors
+
+For the [quadratic inductor model](model_limits.md#nonlinear-inductance), voltage
+mode differentiates total flux linkage with BDF2. Phase mode imposes
+`SIGMA*(phi_positive-phi_negative)=Phi_total`. The solver corrects the inductor
+rows using damped Newton iteration, retaining KLU's symbolic analysis and
+refactorizing the numerical coefficients together for each iteration.
+
+The flux residual must be below `1e-26 Wb + 1e-12*S`, where S is the sum of
+the absolute node-derived flux, self flux, mutual flux terms and BDF2 history
+contribution in that row. Sources, noise samples, junction predictions and
+histories are evaluated once per attempted step and held fixed during correction.
+Junction terms retain their existing explicit predictor.
+
+Each step permits at most 40 Newton corrections and 16 damping halvings per
+correction. Failure restarts the complete run at half the timestep, restoring
+the initial state and random streams. Circuits with nonlinear inductors permit
+at most eight such timestep reductions, including junction phase-advance retries;
+failure then reports an error. These residual and iteration limits are not a
+local integration-error estimate. Check timestep refinement for the quantities
+of interest, especially large excursions and long ladders.
+
+## Timestep and startup
+
+Each attempt uses a fixed timestep. Transmission-line delays can require a
+smaller step when the matrix is built. During a run, a predicted junction phase
+increment above 0.2 cycles after the first 1% of samples causes the whole run
+to restart at half the timestep. The step is never increased automatically.
+
+This phase-advance check is not an estimate of integration error. Repeat the
+simulation with a smaller requested step and compare the quantities that matter
+for the circuit. Use `-V 1` to see the final step and sample count. Settling time,
+noise bandwidth and output sampling need their own checks.
+
+Default startup advances the circuit through a finite negative-time interval
+from zero stored histories. It does not calculate a DC operating point.
+`DST` disables this interval. With explicit capacitor `IC=`, a coupled initial
+solve supplies the voltages, currents and voltage derivatives at t=0. These
+give linear voltage and quadratic phase histories for starting BDF2; the actual
+initial state is output before the first advance to h. Each timestep restart
+reconstructs that state. See the [initial-state guide](model_limits.md#capacitor-voltage)
+for supported circuits and the alternative of a physical charging interval.
+
+For phase and controlled sources, the initializer selects independent sparse
+constraints from the circuit equations, their derivatives and capacitor initial
+voltages before solving with KLU. Prescribed phase offsets are included in the
+histories and junction currents. Phase-source derivatives use right-hand waveform
+probes within h/2; known source curvature also constrains capacitor-current
+derivatives where needed. These are initial-state tangents, rather than a
+negative-time simulation of the waveform. Quadratic phase prehistory can give
+an O(h) capacitor-current error at the first subsequent sample of a curved
+phase source; its value at t=0 is constrained separately. Check timestep
+refinement when that startup current matters.
+
+## Junction phase {#junction-phase}
+
+The Josephson voltage relation is
+
+\[
+V=\sigma\frac{d\phi}{dt},\qquad \sigma=\frac{\Phi_0}{2\pi}.
+\]
+
+Under constant voltage, phase should therefore increase linearly:
+
+\[
+\phi(t)-\phi(t_a)=\frac{V}{\sigma}(t-t_a).
+\]
+
+This provides a simple check for long simulations. Earlier versions used
+slightly different constants in the junction matrix and history terms, which
+caused an accumulating phase error in voltage mode. Version 3.0 uses the same
+constant in both places. Phase is not wrapped, so accumulated cycles remain
+available in the output.
+
+## Buffer example {#buffer}
+
+The circuit in [issue #101](https://github.com/JoeyDelp/JoSIM/issues/101) has two
+junctions and two inductors. Its reverse response contains positive and negative
+voltage pulses, even though their net area is almost zero. B02 makes a negative
+phase excursion while B01 returns; the two voltage peaks need not coincide.
+
+A separate integration of the Kirchhoff and RCSJ equations gives the same
+response. For the supplied parameters, the reverse net pulse area is about
+`-1.38e-6 Phi0`, while the forward area is about `0.999998 Phi0`. The triangular
+input pulse is approximately 4.3 ppm below one flux quantum.
+
+The [reference circuits and data](https://github.com/JoeyDelp/JoSIM/tree/master/test/reference)
+include both directions. They use the subgap resistance because the junction
+voltages stay below the model's transition region. Tests compare both JoSIM
+analysis modes with the reference and repeat them at smaller timesteps.
+
+## Noise and output sampling
+
+A resolved integration step does not by itself prevent output aliasing.
+Check the print interval and filtering against the frequencies present in the
+circuit. The [noise guide](noise_sources.md) describes the interpolation and
+bandwidth conventions; the [SQUID example](squid_noise.md) shows how to compare
+bandwidth, timestep and sample spacing.

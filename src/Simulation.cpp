@@ -23,11 +23,56 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 using namespace JoSIM;
 
+namespace {
+// Local ownership also covers exceptions and retries during construction.
+struct KluResources {
+    klu_l_symbolic*& symbolic;
+    klu_l_numeric*& numeric;
+    klu_l_common& common;
+    ~KluResources() {
+        klu_l_free_numeric(&numeric, &common);
+        klu_l_free_symbolic(&symbolic, &common);
+    }
+};
+
+[[noreturn]] void solver_failure(const klu_l_common& common) {
+    if (common.status == KLU_SINGULAR) {
+        Errors::simulation_errors(SimulationErrors::MATRIX_SINGULAR);
+    }
+    Errors::simulation_errors(SimulationErrors::SOLVER_FAILURE,
+                              "Status " + std::to_string(common.status));
+}
+
+void validate_matrix(const Matrix& matrix) {
+    const auto n = matrix.branchIndex;
+    if (n <= 0 || matrix.rp.size() != static_cast<size_t>(n) + 1
+        || matrix.ci.empty() || matrix.ci.size() != matrix.nz.size()
+        || matrix.rp.front() != 0 || matrix.rp.back() != static_cast<int64_t>(matrix.nz.size())) {
+        Errors::simulation_errors(SimulationErrors::INVALID_MATRIX, "Inconsistent dimensions or empty circuit.");
+    }
+    for (size_t i = 1; i < matrix.rp.size(); ++i) {
+        if (matrix.rp[i] < matrix.rp[i - 1] || matrix.rp[i] > matrix.rp.back()) {
+            Errors::simulation_errors(SimulationErrors::INVALID_MATRIX, "Invalid row offsets.");
+        }
+    }
+    for (size_t i = 0; i < matrix.ci.size(); ++i) {
+        if (matrix.ci[i] < 0 || matrix.ci[i] >= n || !std::isfinite(matrix.nz[i])) {
+            Errors::simulation_errors(SimulationErrors::INVALID_MATRIX, "Invalid column index or non-finite coefficient.");
+        }
+    }
+}
+
+} // namespace
+
 Simulation::Simulation(Input& iObj, Matrix& mObj) {
     while (needsTR_) {
+        validate_matrix(mObj);
         // Do generic simulation setup for given step size
         setup(iObj, mObj);
         // Do solver setup
@@ -42,7 +87,13 @@ Simulation::Simulation(Input& iObj, Matrix& mObj) {
             std::cout << "JoSIM: Transient simulation time: " << tSimSec << " s\n";
         }
         // If step size is too large, reduce and try again
-        if (needsTR_) { reduce_step(iObj, mObj); }
+        if (needsTR_) {
+            if (!nonlinearInductors_.empty() && nonlinearRetries_++ >= 8) {
+                Errors::simulation_errors(SimulationErrors::SOLVER_FAILURE,
+                    "Nonlinear inductor timestep retry limit reached (8 reductions): " + nonlinearFailure_);
+            }
+            reduce_step(iObj, mObj);
+        }
 
         // Do solver cleanup
         free_lu();
@@ -52,6 +103,7 @@ Simulation::Simulation(Input& iObj, Matrix& mObj) {
 void Simulation::cosim_initialize(Input& iObj, Matrix& mObj) {
     free_lu();
     cosimMode_ = true;
+    firstStepIdx_ = 0;
     setup(iObj, mObj);
     nodal_         = false;
     usePartitions_ = false;
@@ -80,8 +132,10 @@ void Simulation::cosim_initialize(Input& iObj, Matrix& mObj) {
                 }
             }
             if (nonZeroInit) {
-                int64_t startup = static_cast<int64_t>(2 * pow(10, (abs(log10(stepSize_)) - 12) * 2 + 1));
+                const double proposedStartup = 2 * pow(10, (abs(log10(stepSize_)) - 12) * 2 + 1);
+                int64_t      startup = proposedStartup >= 1000 ? 1000 : static_cast<int64_t>(proposedStartup);
                 if (startup > 1000) { startup = 1000; }
+                firstStepIdx_ = -startup;
                 for (int64_t i = -startup; i < 0; ++i) {
                     setup_b(mObj, i, i * stepSize_);
                     solve_lu(mObj);
@@ -203,10 +257,24 @@ void Simulation::cosim_finish(Matrix& mObj) {
     }
 }
 
+void Simulation::factorize(Matrix& mObj) {
+    mObj.create_nz();
+    validate_matrix(mObj);
+    klu_l_free_numeric(&Numeric_, &Common_);
+    Numeric_ = klu_l_factor(mObj.rp.data(), mObj.ci.data(), mObj.nz.data(), Symbolic_, &Common_);
+    if (!Numeric_) { solver_failure(Common_); }
+    needsLU_ = false;
+}
+
 void Simulation::setup(Input& iObj, Matrix& mObj) {
     // Simulation setup
     input_                   = &iObj;
     simSize_                 = iObj.transSim.simsize();
+    // Per-step schedules and histories are sized by the step count: refuse an impossible one up front
+    // (upstream 3.0 reports this instead of throwing from an allocation).
+    if (simSize_ < 0 || static_cast<uint64_t>(simSize_) > std::vector<double>().max_size() / 2) {
+        Errors::simulation_errors(SimulationErrors::STORAGE_ALLOCATION_FAILED, std::to_string(simSize_));
+    }
     atyp_                    = iObj.argAnal;
     minOut_                  = iObj.argMin;
     parallel_                = iObj.argPar;
@@ -417,6 +485,52 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
         gpu_   = false;
     }
 
+    // Devices that only upstream 3.x models run on the reference MNA path (trans_sim_reference), with the
+    // device state in mObj.components: gate-controlled and Ic-noise junctions, nonlinear inductors, capacitor IC=
+    // and colored-noise sources.
+    nonlinearInductors_.clear();
+    nonlinearFailure_ = "junction phase advance or nonlinear convergence";
+    for (auto index : mObj.components.inductorIndices) {
+        if (std::get<Inductor>(mObj.components.devices[index]).alpha_ > 0) { nonlinearInductors_.push_back(index); }
+    }
+    needsMnaOnly_ = !nonlinearInductors_.empty();
+    for (const auto& jj : jjs_) {
+        if (jj.gateIndex_ || jj.icNoise || jj.model_.tDep()) { needsMnaOnly_ = true; }
+    }
+    for (const auto& cap : capacitors_) {
+        if (cap.initialVoltage_) { needsMnaOnly_ = true; }
+    }
+    for (const auto& src : mObj.sourcegen) {
+        const auto type = src.fType();
+        if (type == FunctionType::PNOISE || type == FunctionType::FNOISE || type == FunctionType::ICNOISE) {
+            needsMnaOnly_ = true;
+        }
+    }
+    // Voltage and phase sources difference their own earlier samples (BDF2); the fork re-evaluates the waveform
+    // at earlier times, which a NOISE() source cannot do, so these use upstream's sample histories.
+    for (const auto& vs : vsources_) {
+        if (mObj.sourcegen[vs.sourceIndex_].fType() == FunctionType::NOISE) { needsMnaOnly_ = true; }
+    }
+    for (const auto& ps : psources_) {
+        if (mObj.sourcegen[ps.sourceIndex_].fType() == FunctionType::NOISE) { needsMnaOnly_ = true; }
+    }
+    // An explicit NOISE() source cannot be re-evaluated for output, and only the MNA loop records what it applied.
+    for (const auto& src : mObj.sourcegen) {
+        if (src.fType() == FunctionType::NOISE) {
+            nodal_ = false;
+            gpu_   = false;
+        }
+    }
+    if (needsMnaOnly_) {
+        nodal_ = false;
+        gpu_   = false;
+        if (mcRuns_ > 1 || iObj.argMcRuns > 1) {
+            std::cout << "JoSIM: Monte Carlo batches are not available with GC=, ICNOISE=, ALPHA=, capacitor IC= or "
+                         "colored noise; running one trial.\n";
+        }
+        mcRuns_ = 1;
+    }
+
     if (iObj.argMargins || iObj.argSens) {
         expand_margin_targets(iObj, mObj);
         mcRuns_ = std::max<int64_t>(1, iObj.argMcRuns);
@@ -427,7 +541,7 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     const bool autoMcEventsOnly = (mcRuns_ > 1) && (iObj.argMargins || iObj.argSens)
                                   && !iObj.cli_output_file.has_value() && iObj.output_files.empty()
                                   && iObj.measurements.empty() && !iObj.argSweep;
-    eventsOnly_ = (iObj.argEventsOnly || autoMcEventsOnly) && !mObj.relevantTraces.empty()
+    eventsOnly_ = (iObj.argEventsOnly || autoMcEventsOnly) && !mObj.relevantTraces.empty() && !needsMnaOnly_
                   && (iObj.transSim.prfirwindow() <= 0.0) && (atyp_ == AnalysisType::Phase) && !gpu_
                   && (mcRuns_ <= 1 || nodal_);
     eventMetrics_  = iObj.argEventMetrics;
@@ -435,7 +549,8 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     keepStep_.clear();
     results.printIndices.clear();
     int64_t reserveSteps = simSize_;
-    if (iObj.transSim.prfirwindow() <= 0.0 && (eventsOnly_ || prstart_ > 0.0 || prstep_ > stepSize_ * (1.0 + 1e-9))) {
+    if (iObj.argDecimate && !needsMnaOnly_ && iObj.transSim.prfirwindow() <= 0.0
+        && (eventsOnly_ || prstart_ > 0.0 || prstep_ > stepSize_ * (1.0 + 1e-9))) {
         bool needsFullHistoryPhase = false;
         bool needsBDF2Lookback     = false;
         for (const auto& tr : mObj.relevantTraces) {
@@ -449,21 +564,29 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
             }
         }
         if (!needsFullHistoryPhase && simSize_ > 0) {
+            // Print points k: the first step at or after prstart + k prstep, with a tolerance of a few ulps of
+            // time so that exact grid ties land consistently (upstream e6e0cbf; matches Output::write_output).
+            const auto reaches = [&](double sample, double requested) {
+                const double scale = std::max({std::abs(sample), std::abs(requested), stepSize_});
+                return sample >= requested - 8 * std::numeric_limits<double>::epsilon() * scale;
+            };
             std::vector<int64_t> printSteps;
             int64_t              firstStep = -1;
             for (int64_t i = 0; i < simSize_; ++i) {
-                if (i * stepSize_ >= prstart_) {
+                if (reaches(i * stepSize_, prstart_)) {
                     firstStep = i;
                     printSteps.push_back(i);
                     break;
                 }
             }
             if (firstStep != -1) {
-                double nextPrintPoint = prstart_ + prstep_;
-                for (int64_t i = firstStep; i < simSize_; ++i) {
-                    if (i * stepSize_ >= nextPrintPoint) {
+                int64_t printPoint     = 1;
+                double  nextPrintPoint = std::fma(static_cast<double>(printPoint), prstep_, prstart_);
+                for (int64_t i = firstStep + 1; i < simSize_; ++i) {
+                    if (reaches(i * stepSize_, nextPrintPoint)) {
                         printSteps.push_back(i);
-                        nextPrintPoint += prstep_;
+                        ++printPoint;
+                        nextPrintPoint = std::fma(static_cast<double>(printPoint), prstep_, prstart_);
                     }
                 }
             }
@@ -517,8 +640,44 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
         results.xVector.resize(mObj.branchIndex, std::vector<double>(0));
     }
 
+    // Pre-start phase histories for the voltage <-> phase output conversion (upstream 3.0), filled by the startup
+    // steps; applied current-source samples are recorded on the reference path.
+    results.sourceCurrents.clear();
+    results.phaseBefore.clear();
+    lastSrcVal_.clear();
+    {
+        const auto capture_source = [&](const RelevantTrace& trace) {
+            if (trace.storageType == StorageType::Current && trace.sourceIndex) {
+                if (results.sourceCurrents.empty()) { results.sourceCurrents.resize(mObj.sourcegen.size()); }
+                results.sourceCurrents.at(trace.sourceIndex.value()).emplace();
+            }
+        };
+        for (const auto& trace : mObj.relevantTraces) {
+            capture_source(trace);
+            if (trace.subtract) { capture_source(*trace.subtract); }
+        }
+        if (!results.sourceCurrents.empty()) { lastSrcVal_.assign(mObj.sourcegen.size(), 0.0); }
+    }
+    {
+        const auto converted     = atyp_ == AnalysisType::Phase ? StorageType::Voltage : StorageType::Phase;
+        const auto capture_phase = [&](const RelevantTrace& trace) {
+            if (trace.storageType == converted && !trace.variableIndex) {
+                if (trace.index1) { results.phaseBefore.emplace(trace.index1.value(), std::array<double, 2>{}); }
+                if (trace.index2) { results.phaseBefore.emplace(trace.index2.value(), std::array<double, 2>{}); }
+            }
+        };
+        if (mObj.relevantTraces.empty()) {
+            for (const auto& node : mObj.nm) { results.phaseBefore.emplace(node.second, std::array<double, 2>{}); }
+        } else {
+            for (const auto& trace : mObj.relevantTraces) {
+                capture_phase(trace);
+                if (trace.subtract) { capture_phase(*trace.subtract); }
+            }
+        }
+    }
+
     init_event_trackers(mObj);
-    if (!hasIndFluxOffset_ && !hasInitialConditions_ && nanowires_.empty()) {
+    if (!hasIndFluxOffset_ && !hasInitialConditions_ && nanowires_.empty() && !needsMnaOnly_) {
         setup_partitions(mObj);
     }
 }
@@ -3502,9 +3661,9 @@ void Simulation::rescale_nodal_timestep(double oldH, double newH, bool hasPrevSt
         const double vDiff     = read_nx(gj.posIdx) - read_nx(gj.negIdx);
         const double oldVarVal = hasPrevStep ? (gj.gVar * (vDiff - b_[gj.varIdx])) : 0.0;
         jj.h_                  = newH;
-        jj.phaseConst_         = (atyp_ == AnalysisType::Voltage)
-                                         ? ((3.0 * Constants::HBAR) / (4.0 * newH * Constants::EV))
-                                         : ((4.0 * newH * Constants::EV) / (3.0 * Constants::HBAR));
+        // The same Josephson scale as JJ's constructor and the phase-history RHS (upstream 69b9f1d, #91).
+        jj.phaseConst_         = (atyp_ == AnalysisType::Voltage) ? ((3.0 * Constants::SIGMA) / (2.0 * newH))
+                                                                  : ((2.0 * newH) / (3.0 * Constants::SIGMA));
         jj.negInvSubgap_       = -1.0 / jj.subgap_impedance();
         jj.negInvTrans_        = -1.0 / jj.transient_impedance();
         jj.negInvNormal_       = -1.0 / jj.normal_impedance();
@@ -3916,8 +4075,9 @@ void Simulation::rescale_mna_timestep(Matrix& mObj, double oldH, double newH, bo
     const int64_t nNodes = static_cast<int64_t>(mObj.nm.size());
     for (auto& jj : jjs_) {
         jj.h_          = newH;
-        jj.phaseConst_ = (atyp_ == AnalysisType::Voltage) ? ((3.0 * Constants::HBAR) / (4.0 * newH * Constants::EV))
-                                                          : ((4.0 * newH * Constants::EV) / (3.0 * Constants::HBAR));
+        // The same Josephson scale as JJ's constructor and the phase-history RHS (upstream 69b9f1d, #91).
+        jj.phaseConst_ = (atyp_ == AnalysisType::Voltage) ? ((3.0 * Constants::SIGMA) / (2.0 * newH))
+                                                          : ((2.0 * newH) / (3.0 * Constants::SIGMA));
         jj.negInvSubgap_ = -1.0 / jj.subgap_impedance();
         jj.negInvTrans_  = -1.0 / jj.transient_impedance();
         jj.negInvNormal_ = -1.0 / jj.normal_impedance();
@@ -4808,6 +4968,8 @@ void Simulation::factorize_lu(Matrix& mObj) {
             Symbolic_ = klu_l_analyze(nRows, &mObj.rp.front(), &mObj.ci.front(), &Common_);
             Numeric_  = klu_l_factor(&mObj.rp.front(), &mObj.ci.front(), &mObj.nz.front(), Symbolic_, &Common_);
         }
+        // A singular or failed factorization is an error, not a silent null solver (upstream 3.0).
+        if (!Symbolic_ || !Numeric_) { solver_failure(Common_); }
     }
 #endif
 }
@@ -10374,6 +10536,12 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
 void Simulation::trans_sim(Matrix& mObj) {
     // Ensure the b vector is sized once
     b_.assign(std::max(mObj.rp.size(), x_.size()), 0.0);
+    startupRan_   = false;
+    firstStepIdx_ = 0;
+    if (needsMnaOnly_) {
+        trans_sim_reference(mObj);
+        return;
+    }
     if (loadStateFile_.has_value()) {
         load_state(loadStateFile_.value(), mObj);
     } else {
@@ -10397,8 +10565,14 @@ void Simulation::trans_sim(Matrix& mObj) {
             }
             if (nonZeroInit) {
                 // Stabilize the simulation before starting at t=0
-                int64_t startup = static_cast<int64_t>(2 * pow(10, (abs(log10(stepSize_)) - 12) * 2 + 1));
+                const double proposedStartup = 2 * pow(10, (abs(log10(stepSize_)) - 12) * 2 + 1);
+                int64_t      startup = proposedStartup >= 1000 ? 1000 : static_cast<int64_t>(proposedStartup);
                 if (startup > 1000) { startup = 1000; }
+                if (!std::isfinite(static_cast<double>(startup) * stepSize_)) {
+                    Errors::control_errors(ControlErrors::TRANS_ERROR, "Startup interval exceeds the supported range");
+                }
+                startupRan_   = true;
+                firstStepIdx_ = -startup;
                 for (int64_t i = -startup; i < 0; ++i) {
                     // Setup the b matrix
                     setup_b(mObj, i, i * stepSize_);
@@ -10406,6 +10580,16 @@ void Simulation::trans_sim(Matrix& mObj) {
                     // Solve Ax=b, storing the results in x_
                     solve_lu(mObj);
                     if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
+                    for (auto& history : results.phaseBefore) {
+                        const auto   node  = x_[history.first];
+                        const double phase = atyp_ == AnalysisType::Phase
+                                                     ? node
+                                                     : (2.0 * stepSize_ / (3.0 * Constants::SIGMA)) * node
+                                                               + (4.0 / 3.0) * history.second[0]
+                                                               - (1.0 / 3.0) * history.second[1];
+                        history.second[1] = history.second[0];
+                        history.second[0] = phase;
+                    }
                 }
             }
         }
@@ -10722,12 +10906,12 @@ void Simulation::trans_sim(Matrix& mObj) {
     }
     ProgressBar bar;
     if (!minOut_) {
-        bar.create_thread();
         bar.set_bar_width(30);
         bar.fill_bar_progress_with("O");
         bar.fill_bar_remainder_with(" ");
         bar.set_status_text("Simulating");
         bar.set_total((float) simSize_);
+        bar.create_thread();
     }
     const bool      hasRelevantTraces = !mObj.relevantTraces.empty();
     bool            stateSaved        = false;
@@ -10901,6 +11085,18 @@ void Simulation::trans_sim(Matrix& mObj) {
                     if (results.xVector[j]) { results.xVector[j]->emplace_back(x_[j]); }
                 }
             }
+            if (hasRelevantTraces) {
+                for (const auto& j : mObj.relevantIndices) {
+                    if (!std::isfinite(x_[j])) {
+                        Errors::simulation_errors(SimulationErrors::SOLVER_FAILURE,
+                                                  "Non-finite solution; model or numerical range exceeded");
+                    }
+                }
+            }
+            // Requested current sources report the samples they applied (upstream 30e311b).
+            for (size_t k = 0; k < results.sourceCurrents.size(); ++k) {
+                if (results.sourceCurrents[k]) { results.sourceCurrents[k]->push_back(lastSrcVal_[k]); }
+            }
         }
         if (!stateSaved && saveStateFile_.has_value() && saveStateFile_->second.has_value()
             && baseTime >= saveStateFile_->second.value()) {
@@ -10985,6 +11181,8 @@ void Simulation::reduce_step(Input& iObj, Matrix& mObj) {
     // iObj.netlist.expNetlist.shrink_to_fit();
     if (!tempMinOut) { iObj.argMin = tempMinOut; }
     results.xVector.clear();
+    results.sourceCurrents.clear();
+    results.phaseBefore.clear();
     results.timeAxis.clear();
 }
 
@@ -11238,6 +11436,7 @@ void Simulation::handle_cs(Matrix& mObj, double& step, const int64_t& i) {
         if (!dedup || !csSameAsPrev_[k]) {
             srcVal = mObj.sourcegen[j.sourceIndex_].value(step);
         }
+        if (!lastSrcVal_.empty()) { lastSrcVal_[j.sourceIndex_] = srcVal; }
         if (j.indexInfo.nodeConfig_ == NodeConfig::POSGND) {
             b_[j.indexInfo.posIndex_.value()] -= srcVal;
         } else if (j.indexInfo.nodeConfig_ == NodeConfig::GNDNEG) {
@@ -11300,18 +11499,17 @@ void Simulation::handle_resistors(Matrix& mObj, double& step) {
     }
 
     for (auto& temp : resistors_) {
-        NodeConfig& nc = temp.indexInfo.nodeConfig_;
+        const double noiseVal = temp.thermalNoise ? temp.thermalNoise.value().value(step) : 0.0;
+        NodeConfig&  nc       = temp.indexInfo.nodeConfig_;
         if (nc == NodeConfig::POSGND) {
-            if (temp.thermalNoise) { b_[temp.indexInfo.posIndex_.value()] -= temp.thermalNoise.value().value(step); }
+            b_[temp.indexInfo.posIndex_.value()] -= noiseVal;
             temp.pn1_ = x_[temp.indexInfo.posIndex_.value()];
         } else if (nc == NodeConfig::GNDNEG) {
-            if (temp.thermalNoise) { b_[temp.indexInfo.negIndex_.value()] += temp.thermalNoise.value().value(step); }
+            b_[temp.indexInfo.negIndex_.value()] += noiseVal;
             temp.pn1_ = -x_[temp.indexInfo.negIndex_.value()];
         } else if (nc == NodeConfig::POSNEG) {
-            if (temp.thermalNoise) {
-                b_[temp.indexInfo.posIndex_.value()] -= temp.thermalNoise.value().value(step);
-                b_[temp.indexInfo.negIndex_.value()] += temp.thermalNoise.value().value(step);
-            }
+            b_[temp.indexInfo.posIndex_.value()] -= noiseVal;
+            b_[temp.indexInfo.negIndex_.value()] += noiseVal;
             temp.pn1_ = x_[temp.indexInfo.posIndex_.value()] - x_[temp.indexInfo.negIndex_.value()];
         } else {
             temp.pn1_ = 0.0;
@@ -11349,9 +11547,13 @@ void Simulation::handle_inductors(Matrix& mObj, double factor) {
             b_[curIdx]   += (-((2 * m.second) / h) * x_[mi.indexInfo.currentIndex_.value()]
                            + (m.second / (2.0 * h)) * mi.In2_);
         }
+    }
+    // Shift the current histories only after every branch has read them, so coupled branches all use the same
+    // preceding samples (upstream 3.1; the shift used to happen inside the loop above).
+    for (auto& temp : inductors_) {
         temp.In4_ = temp.In3_;
         temp.In3_ = temp.In2_;
-        temp.In2_ = x_[curIdx];
+        temp.In2_ = x_[temp.indexInfo.currentIndex_.value()];
     }
 }
 
@@ -11445,13 +11647,11 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
             } else {
                 temp.pn1_ = 0.0;
             }
-            if (i > 0 || subStepIdx_ > 0) {
-                if (atyp_ == AnalysisType::Voltage) {
-                    temp.vn1_ = temp.pn1_;
-                    temp.pn1_ = x_[temp.variableIndex_];
-                } else if (atyp_ == AnalysisType::Phase) {
-                    temp.vn1_ = x_[temp.variableIndex_];
-                }
+            if (atyp_ == AnalysisType::Voltage) {
+                temp.vn1_ = temp.pn1_;
+                temp.pn1_ = x_[temp.variableIndex_];
+            } else if (atyp_ == AnalysisType::Phase) {
+                temp.vn1_ = x_[temp.variableIndex_];
             }
             double v0  = temp.vn1_ + 1.5 * (temp.vn1_ - temp.vn2_) - 0.5 * (temp.vn2_ - temp.vn3_);
             temp.phi0_ = temp.pn1_ + ((1.0 / 3.0) * (temp.pn1_ - temp.pn2_)
@@ -11542,29 +11742,24 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
     for (int64_t idx = 0; idx < nJJ; ++idx) {
         auto&       temp  = jjs_[idx];
         const auto& model = temp.model_;
+
+        // ---- Node voltage/phase "pn1_" ----
         if (temp.indexInfo.posIndex_ && !temp.indexInfo.negIndex_) {
-            if (temp.thermalNoise) { b_[temp.indexInfo.posIndex_.value()] -= temp.thermalNoise.value().value(step); }
             temp.pn1_ = x_[temp.indexInfo.posIndex_.value()];
         } else if (!temp.indexInfo.posIndex_ && temp.indexInfo.negIndex_) {
-            if (temp.thermalNoise) { b_[temp.indexInfo.negIndex_.value()] += temp.thermalNoise.value().value(step); }
             temp.pn1_ = -x_[temp.indexInfo.negIndex_.value()];
         } else if (temp.indexInfo.posIndex_ && temp.indexInfo.negIndex_) {
-            if (temp.thermalNoise) {
-                b_[temp.indexInfo.posIndex_.value()] -= temp.thermalNoise.value().value(step);
-                b_[temp.indexInfo.negIndex_.value()] += temp.thermalNoise.value().value(step);
-            }
             temp.pn1_ = x_[temp.indexInfo.posIndex_.value()] - x_[temp.indexInfo.negIndex_.value()];
         } else {
             temp.pn1_ = 0.0;
         }
-        if (i > 0 || subStepIdx_ > 0 || hasInitialConditions_) {
-            if (atyp_ == AnalysisType::Voltage) {
-                temp.vn1_ = temp.pn1_;
-                temp.pn1_ = x_[temp.variableIndex_];
-            } else if (atyp_ == AnalysisType::Phase) {
-                temp.vn1_ = x_[temp.variableIndex_];
-                temp.pn1_ = temp.pn1_;
-            }
+        // Use the previous solved phase/voltage during startup and at t = 0 as well as later (upstream 3.0);
+        // a zero-state run starts with x_ = 0, so its first steps are unchanged.
+        if (atyp_ == AnalysisType::Voltage) {
+            temp.vn1_ = temp.pn1_;
+            temp.pn1_ = x_[temp.variableIndex_];
+        } else if (atyp_ == AnalysisType::Phase) {
+            temp.vn1_ = x_[temp.variableIndex_];
         }
         // Guess voltage (V0)
         double v0  = temp.vn1_ + 1.5 * (temp.vn1_ - temp.vn2_) - 0.5 * (temp.vn2_ - temp.vn3_);
@@ -11577,26 +11772,28 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
                 offendingJJ_ = temp.netlistInfo.label_;
                 needsTR_     = true;
                 return;
-                /*Errors::simulation_errors(
-                  SimulationErrors::PHASEGUESS_TOO_LARGE, temp.netlistInfo.label_);*/
             }
         }
-        // (hbar / 2 * e) ( -(2 / h) φp1 + (1 / 2h) φp2 )
+
+        // ---- RHS1 (phase/voltage equation row) ----
         if (atyp_ == AnalysisType::Voltage) {
             b_[temp.variableIndex_]
                     = (Constants::SIGMA) * (-(2.0 / (stepSize_)) * temp.pn1_ + (1.0 / (2.0 * (stepSize_))) * temp.pn2_);
-            // (4 / 3) φp1 - (1/3) φp2
         } else if (atyp_ == AnalysisType::Phase) {
             b_[temp.variableIndex_] = temp.pn1_ + (1.0 / 3.0) * (temp.pn1_ - temp.pn2_);
         }
+
+        // ---- Shift history (phase + voltage) ----
         temp.pn4_ = temp.pn3_;
         temp.pn3_ = temp.pn2_;
         temp.pn2_ = temp.pn1_;
+
         temp.vn6_ = temp.vn5_;
         temp.vn5_ = temp.vn4_;
         temp.vn4_ = temp.vn3_;
         temp.vn3_ = temp.vn2_;
-        // Update junction transition
+
+        // ---- Update junction transition (may trigger LU refactor) ----
         if (model.rtype() == 1) {
             auto testLU = temp.update_value(v0);
             if (testLU) {
@@ -11611,6 +11808,12 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
 #endif
                 if (!needsLU_) { needsLU_ = true; }
             }
+        }
+        // Thermal noise: one sample per step, with the amplitude of the conductance chosen for this step.
+        if (temp.thermalNoise) {
+            const double noise = temp.thermalNoise.value().value(step);
+            if (temp.indexInfo.posIndex_) { b_[*temp.indexInfo.posIndex_] -= noise; }
+            if (temp.indexInfo.negIndex_) { b_[*temp.indexInfo.negIndex_] += noise; }
         }
         // Ic * sin (phi * (φ0 - φ))
         const auto&  cpr        = model.cpr();
@@ -11660,6 +11863,8 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
                        // + It)
                        + temp.it_);
         }
+
+        // ---- Final history update (as in your original code) ----
         temp.vn2_ = temp.vn1_;
     }
 }
@@ -11768,12 +11973,16 @@ void Simulation::handle_vs(Matrix& mObj, const int64_t& i, double& step, double 
 }
 
 void Simulation::handle_ps(Matrix& mObj, const int64_t& i, double& step, double factor) {
-    const int64_t totalStep = i * subSteps_ + subStepIdx_;
+    // Steps since the first simulated step (the first startup step, else t = 0). The source's history before
+    // that step is zero, as in upstream 3.0 (3ec0525); without startup this is the fork's original step count.
+    const int64_t totalStep = (i < 0) ? (i - firstStepIdx_) : (-firstStepIdx_ + i * subSteps_ + subStepIdx_);
     for (auto& temp : psources_) {
         if (atyp_ == AnalysisType::Phase) {
             // φn
             b_[temp.indexInfo.currentIndex_.value()] = mObj.sourcegen[temp.sourceIndex_].value(step);
         } else if (atyp_ == AnalysisType::Voltage) {
+            // Without startup steps the source has no history before t = 0; after them, its earlier samples are
+            // the ones applied during startup (upstream 3ec0525), so the full BDF2 form applies at once.
             if (totalStep == 0) {
                 b_[temp.indexInfo.currentIndex_.value()]
                         = (Constants::SIGMA / (stepSize_ * factor))
@@ -12067,6 +12276,21 @@ void Simulation::handle_tx(Matrix& mObj, const int64_t& i, double& step, double 
                                      + temp.atten_
                                                * ((Z / Constants::SIGMA) * ((2.0 * stepSize_ * factor) / 3.0) * I1nk
                                                   + ((temp.nk_1_ - temp.nk1_1_) - (1.0 / 3.0) * (temp.nk1_1_ - temp.nk2_1_))));
+                }
+                if (capacitorIC_ && i <= k + 1) {
+                    const auto before = [&](int_o positive, int_o negative, size_t sample) {
+                        return (positive ? results.phaseBefore.at(*positive).at(sample) : 0.0)
+                             - (negative ? results.phaseBefore.at(*negative).at(sample) : 0.0);
+                    };
+                    // Recover the launch voltage at t=0 from its consistent
+                    // phase history, while retaining zero incoming waves for t<TD.
+                    const auto correction = [&](int_o positive, int_o negative) {
+                        return i == k ? -(4.0 / 3.0) * before(positive, negative, 0)
+                                          + (1.0 / 3.0) * before(positive, negative, 1)
+                                      : (1.0 / 3.0) * before(positive, negative, 0);
+                    };
+                    b_.at(curInd) += correction(posInd2, negInd2);
+                    b_.at(curInd2) += correction(posInd, negInd);
                 }
             } else {
                 // I1 = (4/3)φ1n-1 - (1/3)φ1n-2

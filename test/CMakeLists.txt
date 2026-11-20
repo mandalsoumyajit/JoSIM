@@ -274,7 +274,8 @@ if(Python3_Interpreter_FOUND AND _PYTHON_NO_NUMPY EQUAL 0)
             $<TARGET_FILE:josim_c>
   )
   set_tests_properties("integration::test_pyjosim" PROPERTIES
-    PASS_REGULAR_EXPRESSION "pyjosim PASS: 5 traces x 1199 steps, 6 SFQ events"
+    # 1200 internal steps of 0.1 ps; 05f6494 printed 1199 (its accumulated print time skipped one, upstream e6e0cbf).
+    PASS_REGULAR_EXPRESSION "pyjosim PASS: 5 traces x 1200 steps, 6 SFQ events"
   )
 
   add_test(
@@ -357,3 +358,89 @@ set_tests_properties("integration::test_ntron" PROPERTIES
 
 
 
+if(BUILD_TESTING)
+  add_executable(josim-library-regression library_regression.cpp)
+  target_link_libraries(josim-library-regression PRIVATE josim)
+  josim_instrument_target(josim-library-regression)
+  add_test(NAME regression::library COMMAND josim-library-regression)
+  set_tests_properties(regression::library PROPERTIES TIMEOUT 30)
+  add_test(NAME regression::build_options
+    COMMAND ${CMAKE_COMMAND}
+      "-DTEST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+      "-DTEST_BINARY_DIR=${PROJECT_BINARY_DIR}"
+      "-DTEST_GENERATOR=${CMAKE_GENERATOR}"
+      "-DTEST_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+      "-DTEST_C_COMPILER=${CMAKE_C_COMPILER}"
+      "-DTEST_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+      "-DTEST_SUITESPARSE_SOURCE=${CMakeSuiteSparse_SOURCE_DIR}"
+      -P "${PROJECT_SOURCE_DIR}/cmake/test_rejected_options.cmake")
+  set_tests_properties(regression::build_options PROPERTIES TIMEOUT 210)
+  add_executable(josim-function-regression function_regression.cpp)
+  target_link_libraries(josim-function-regression PRIVATE josim)
+  josim_instrument_target(josim-function-regression)
+  add_test(NAME regression::functions COMMAND josim-function-regression)
+  set_tests_properties(regression::functions PROPERTIES TIMEOUT 30)
+  add_executable(josim-noise-regression noise_regression.cpp)
+  josim_instrument_target(josim-noise-regression)
+  target_link_libraries(josim-noise-regression PRIVATE josim suitesparse::klu)
+  add_test(NAME regression::noise COMMAND josim-noise-regression)
+  set_tests_properties(regression::noise PROPERTIES TIMEOUT 90)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME regression::qualification
+           COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/regression_qualification.py)
+  set_tests_properties(regression::qualification PROPERTIES TIMEOUT 30)
+  add_test(NAME regression::gate
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/regression_gate.py
+                   $<TARGET_FILE:josim-cli>)
+  set_tests_properties(regression::gate PROPERTIES TIMEOUT 90)
+  add_test(NAME regression::cli
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/regression_cli.py
+                   $<TARGET_FILE:josim-cli>)
+  set_tests_properties(regression::cli PROPERTIES TIMEOUT 90)
+  add_executable(josim-junction-regression junction_numerics.cpp)
+  target_link_libraries(josim-junction-regression PRIVATE josim)
+  josim_instrument_target(josim-junction-regression)
+  add_test(NAME regression::junction_numerics COMMAND josim-junction-regression)
+  set_tests_properties(regression::junction_numerics PROPERTIES TIMEOUT 90)
+  add_test(NAME regression::numerics
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/regression_numerics.py
+                   $<TARGET_FILE:josim-cli>)
+  set_tests_properties(regression::numerics PROPERTIES TIMEOUT 90)
+  add_test(NAME regression::capacitor_ic
+           COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/regression_capacitor_ic.py
+                   $<TARGET_FILE:josim-cli>)
+  set_tests_properties(regression::capacitor_ic PROPERTIES TIMEOUT 45)
+  add_test(NAME regression::nonlinear_inductor
+           COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/regression_nonlinear_inductor.py
+                   $<TARGET_FILE:josim-cli>)
+  set_tests_properties(regression::nonlinear_inductor PROPERTIES TIMEOUT 60)
+  add_test(NAME regression::buffer
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/regression_buffer.py
+                   $<TARGET_FILE:josim-cli>)
+  set_tests_properties(regression::buffer PROPERTIES TIMEOUT 90)
+  add_test(NAME regression::sweep
+           COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/regression_sweep.py
+                   $<TARGET_FILE:josim-cli>)
+  set_tests_properties(regression::sweep PROPERTIES TIMEOUT 90)
+  add_test(NAME regression::installed_package
+    COMMAND ${CMAKE_COMMAND}
+      "-DTEST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+      "-DTEST_BINARY_DIR=${PROJECT_BINARY_DIR}"
+      "-DTEST_CONFIG=$<CONFIG>"
+      "-DTEST_GENERATOR=${CMAKE_GENERATOR}"
+      "-DTEST_PLATFORM=${CMAKE_GENERATOR_PLATFORM}"
+      "-DTEST_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+      "-DTEST_MSVC_RUNTIME_LIBRARY=${CMAKE_MSVC_RUNTIME_LIBRARY}"
+      "-DTEST_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}"
+      "-DTEST_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+      -P "${PROJECT_SOURCE_DIR}/cmake/test_installed_package.cmake")
+  set_tests_properties(regression::installed_package PROPERTIES TIMEOUT 90)
+  if(WIN32 AND BUILD_SHARED_LIBS)
+    # The C++ test executables are below test/<config>, away from josim.dll.
+    # Scope DLL discovery to these test processes; do not alter the host PATH.
+    set(josim_test_path "$<TARGET_FILE_DIR:josim>;$ENV{PATH}")
+    string(REPLACE ";" "\\;" josim_test_path "${josim_test_path}")
+    set_tests_properties(regression::library regression::functions regression::noise regression::junction_numerics
+      PROPERTIES ENVIRONMENT "PATH=${josim_test_path}")
+  endif()
+endif()

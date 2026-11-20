@@ -29,10 +29,40 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#include <limits>
 
 using namespace JoSIM;
 
 namespace {
+
+// Print points k: the first sample at or after prstart + k prstep, with a tolerance of a few ulps of time so that
+// exact grid ties land consistently (upstream e6e0cbf). Matches Simulation::setup's decimation schedule.
+std::vector<int64_t> print_grid_indices(const std::vector<double>& t, const Transient& tran) {
+    std::vector<int64_t> indices;
+    const auto           reaches = [&](double sample, double requested) {
+        const double scale = std::max({std::abs(sample), std::abs(requested), tran.tstep()});
+        return sample >= requested - 8 * std::numeric_limits<double>::epsilon() * scale;
+    };
+    size_t first = t.size();
+    for (size_t i = 0; i < t.size(); ++i) {
+        if (reaches(t[i], tran.prstart())) {
+            first = i;
+            break;
+        }
+    }
+    if (first == t.size()) { return indices; }
+    indices.push_back(static_cast<int64_t>(first));
+    int64_t printPoint = 1;
+    double  next       = std::fma(static_cast<double>(printPoint), tran.prstep(), tran.prstart());
+    for (size_t i = first + 1; i < t.size(); ++i) {
+        if (reaches(t[i], next)) {
+            indices.push_back(static_cast<int64_t>(i));
+            ++printPoint;
+            next = std::fma(static_cast<double>(printPoint), tran.prstep(), tran.prstart());
+        }
+    }
+    return indices;
+}
 struct StreamTraceDesc {
     std::string   name;
     char          type      = 'T';
@@ -211,6 +241,8 @@ void write_streamed_row_major(std::ofstream&                        outfile,
 } // namespace
 
 Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
+    if (iObj.cli_output_file) { iObj.ensure_safe_output(iObj.cli_output_file.value().name()); }
+    for (auto& output : iObj.output_files) { iObj.ensure_safe_output(output.name()); }
     if (iObj.argEvents && iObj.eventsFile.has_value() && !iObj.eventsFile->empty()) {
         write_events(iObj, mObj, sObj);
     }
@@ -301,21 +333,7 @@ Output::Output(Input& iObj, Matrix& mObj, Simulation& sObj) {
         if (!sObj.results.printIndices.empty()) {
             result_indices = sObj.results.printIndices;
         } else {
-            for (size_t i = 0; i < t.size(); ++i) {
-                if (t[i] >= tran.prstart()) {
-                    result_indices.emplace_back(static_cast<int64_t>(i));
-                    break;
-                }
-            }
-            double next_print_point = tran.prstart() + tran.prstep();
-            if (!result_indices.empty()) {
-                for (size_t i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
-                    if (t[i] >= next_print_point) {
-                        result_indices.emplace_back(static_cast<int64_t>(i));
-                        next_print_point += tran.prstep();
-                    }
-                }
-            }
+            result_indices = print_grid_indices(t, tran);
         }
 
         std::vector<StreamTraceDesc> cols;
@@ -572,9 +590,22 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
     auto&   x           = sObj.results.xVector;
     auto&   t           = sObj.results.timeAxis;
     auto&   tran        = iObj.transSim;
+    tran.validate_output();
+    if (t.empty()) { Errors::control_errors(ControlErrors::TRANS_ERROR, "Output contains no simulation samples"); }
+    // Phase of unknown 'index' at sample (negative: before t = 0, from the startup history). Without a recorded
+    // history (the fork's nodal and partitioned solvers) the fork's convention is kept: the first sample is repeated
+    // for the voltage conversion, zero for the phase integration.
+    const auto phase_at = [&](int64_t index, int64_t sample, bool replicateFirst) {
+        if (index < 0) { return 0.0; }
+        if (sample >= 0) { return x.at(index).value().at(sample); }
+        const auto history = sObj.results.phaseBefore.find(index);
+        if (history != sObj.results.phaseBefore.end()) { return history->second.at(static_cast<size_t>(-sample - 1)); }
+        return replicateFirst ? x.at(index).value().at(0) : 0.0;
+    };
     // Create downsampling FIR window, use Hanning function with odd number of taps.
     // The FIR filter is centered around the requested point in time, i. e. looks into the past and future.
-    int64_t halffirsize = static_cast<int64_t>(tran.prfirwindow() <= 0. ? 0 : .5 * tran.prfirwindow() / tran.tstep());
+    const double window = std::min(tran.prfirwindow(), tran.tstop());
+    int64_t halffirsize = static_cast<int64_t>(window <= 0. ? 0 : .5 * window / tran.tstep());
     int64_t firsize     = halffirsize * 2 + 1; // Guarantees odd number of taps or 1 in case of disabled filter.
     std::vector<double> firwindow;
     firwindow.reserve(firsize);
@@ -591,22 +622,31 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
     for (auto& hanning : firwindow) { hanning = firscale * hanning; }
     // Indices to print
     std::vector<int64_t> result_indices;
+    const auto reaches_print_point = [&](double sample, double requested) {
+        // Treat roundoff at an exact grid tie consistently. The tolerance is
+        // a few ulps of time, not a fraction of the physical timestep.
+        const double scale = std::max({std::abs(sample), std::abs(requested), tran.tstep()});
+        return sample >= requested - 8 * std::numeric_limits<double>::epsilon() * scale;
+    };
     if (!sObj.results.printIndices.empty()) {
         result_indices = sObj.results.printIndices;
     } else {
         for (auto i = 0; i < t.size(); ++i) {
-            if (t.at(i) >= tran.prstart()) {
+            if (reaches_print_point(t.at(i), tran.prstart())) {
                 result_indices.emplace_back(i);
                 break;
             }
         }
-        double next_print_point = tran.prstart() + tran.prstep();
-        if (!result_indices.empty()) {
-            for (auto i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
-                if (t.at(i) >= next_print_point) {
-                    result_indices.emplace_back(i);
-                    next_print_point += tran.prstep();
-                }
+        if (result_indices.empty()) {
+            Errors::control_errors(ControlErrors::TRANS_ERROR, "Output window contains no simulation samples");
+        }
+        int64_t print_point = 1;
+        double  next_print_point = std::fma(static_cast<double>(print_point), tran.prstep(), tran.prstart());
+        for (auto i = static_cast<size_t>(result_indices.back()) + 1; i < t.size(); ++i) {
+            if (reaches_print_point(t.at(i), next_print_point)) {
+                result_indices.emplace_back(i);
+                ++print_point;
+                next_print_point = std::fma(static_cast<double>(print_point), tran.prstep(), tran.prstart());
             }
         }
     }
@@ -1040,7 +1080,6 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
         // Create progress bar
         ProgressBar bar;
         if (!iObj.argMin) {
-            bar.create_thread();
             bar.set_bar_width(30);
             bar.fill_bar_progress_with("O");
             bar.fill_bar_remainder_with(" ");
@@ -1060,11 +1099,9 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
             }
             traces.back().data_.reserve(result_indices.size());
         }
-        auto process_trace = [&](int64_t uIdx) {
-            const auto& i        = mObj.relevantTraces[userTraceIndices[uIdx]];
-            auto&       outTrace = traces[uIdx + 1];
-            auto&       st       = i.storageType;
-            if (!iObj.argMin && uIdx % 4 == 0) { bar.update(static_cast<float>(uIdx)); }
+        // Formats one requested trace into outTrace (a trace and, for V(A,B)/I(A,B) of devices, its subtrahend).
+        auto compute_trace = [&](const RelevantTrace& i, Trace& outTrace) {
+            auto& st = i.storageType;
             // Shorthand for the optional value
             auto                       i1    = i.index1.has_value() ? i.index1.value() : -1;
             auto                       i2    = i.index2.has_value() ? i.index2.value() : -1;
@@ -1104,20 +1141,8 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                             if (i.deviceLabel.value().at(3) == 'B' && vv) {
                                 value = (*vv)[jk];
                             } else {
-                                double valin1n1, valin1n2;
-                                double valin2n1, valin2n2;
-                                if (jk >= 2) {
-                                    valin1n2 = v1 ? (*v1)[jk - 2] : 0.0;
-                                    valin1n1 = v1 ? (*v1)[jk - 1] : 0.0;
-                                    valin2n2 = v2 ? (*v2)[jk - 2] : 0.0;
-                                    valin2n1 = v2 ? (*v2)[jk - 1] : 0.0;
-                                } else if (jk == 1) {
-                                    valin1n2 = valin1n1 = v1 ? (*v1)[jk - 1] : 0.0;
-                                    valin2n2 = valin2n1 = v2 ? (*v2)[jk - 1] : 0.0;
-                                } else {
-                                    valin1n2 = valin1n1 = valin1;
-                                    valin2n2 = valin2n1 = valin2;
-                                }
+                                const double valin1n1 = phase_at(i1, jk - 1, true), valin1n2 = phase_at(i1, jk - 2, true);
+                                const double valin2n1 = phase_at(i2, jk - 1, true), valin2n2 = phase_at(i2, jk - 2, true);
                                 value = ((3.0 * Constants::SIGMA) / (2.0 * iObj.transSim.tstep()))
                                         * ((valin1 - valin2) - (4.0 / 3.0) * (valin1n1 - valin2n1)
                                            + (1.0 / 3.0) * (valin1n2 - valin2n2));
@@ -1177,7 +1202,8 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                         // It takes extra memory and time, so do it only if necessary.
                         std::vector<double> vectphase;
                         vectphase.reserve(xsize);
-                        double phaseN1 = 0., phaseN2 = phaseN1;
+                        double phaseN1 = phase_at(i1, -1, false) - phase_at(i2, -1, false);
+                        double phaseN2 = phase_at(i1, -2, false) - phase_at(i2, -2, false);
                         for (size_t j = 0; j < xsize; j++) {
                             auto valin1 = v1 ? (*v1)[j] : 0.0;
                             auto valin2 = v2 ? (*v2)[j] : 0.0;
@@ -1211,6 +1237,16 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                 Function localSrc;
                 bool     isISrc = (i.deviceLabel.value().at(3) == 'I');
                 if (isISrc) { localSrc = mObj.sourcegen.at(i.sourceIndex.value()); }
+                // The samples the simulation applied (upstream 3.x; noise sources cannot be re-evaluated), where
+                // the solver recorded them; otherwise the source is evaluated on the time axis.
+                const std::vector<double>* appliedSrc = nullptr;
+                if (isISrc && i.sourceIndex) {
+                    const auto& applied = sObj.results.sourceCurrents;
+                    const auto  srcIdx  = static_cast<size_t>(*i.sourceIndex);
+                    if (srcIdx < applied.size() && applied[srcIdx] && applied[srcIdx]->size() == xsize) {
+                        appliedSrc = &*applied[srcIdx];
+                    }
+                }
                 // Push the FIR filtered values for each value on the time axis
                 for (auto j : result_indices) { // j: Index of window center
                     // FIR filter current
@@ -1229,11 +1265,25 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
                         if (!isISrc) {
                             value = (*v1)[jk];
                         } else {
-                            value = localSrc.value(t[jk]);
+                            value = appliedSrc ? (*appliedSrc)[jk] : localSrc.value(t[jk]);
                         }
                         accumulator += firwindow[k] * value;
                     }
                     outTrace.data_.emplace_back(accumulator);
+                }
+            }
+        };
+        auto process_trace = [&](int64_t uIdx) {
+            const auto& i        = mObj.relevantTraces[userTraceIndices[uIdx]];
+            auto&       outTrace = traces[uIdx + 1];
+            if (!iObj.argMin && uIdx % 4 == 0) { bar.update(static_cast<float>(uIdx)); }
+            compute_trace(i, outTrace);
+            if (i.subtract) {
+                Trace other(outTrace.name_);
+                other.data_.reserve(outTrace.data_.size());
+                compute_trace(*i.subtract, other);
+                for (size_t sample = 0; sample < outTrace.data_.size(); ++sample) {
+                    outTrace.data_[sample] -= other.data_[sample];
                 }
             }
         };
@@ -1254,12 +1304,12 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
     } else {
         ProgressBar bar;
         if (!iObj.argMin) {
-            bar.create_thread();
             bar.set_bar_width(30);
             bar.fill_bar_progress_with("O");
             bar.fill_bar_remainder_with(" ");
             bar.set_status_text("Formatting Output");
             bar.set_total((float) mObj.nm.size());
+            bar.create_thread();
         }
         std::vector<int64_t> nodeIndices;
         nodeIndices.reserve(mObj.nm.size());
@@ -1311,6 +1361,16 @@ void Output::write_output(const Input& iObj, Matrix& mObj, Simulation& sObj) {
             std::cout << "\n";
         }
     }
+    // Finite solved unknowns can overflow during conversion, filtering or subtraction.
+    // Reject the complete result before any destination is opened or truncated.
+    for (const auto& trace : traces) {
+        for (size_t sample = 0; sample < trace.data_.size(); ++sample) {
+            if (!std::isfinite(trace.data_.at(sample))) {
+                Errors::output_errors(OutputErrors::NONFINITE_TRACE,
+                    trace.name_ + " at output sample " + std::to_string(sample));
+            }
+        }
+    }
 }
 
 void Output::format_csv_or_dat(const std::string& filename, const char& delimiter, bool argmin, int64_t fIndex) {
@@ -1330,7 +1390,6 @@ void Output::format_csv_or_dat(const std::string& filename, const char& delimite
         const size_t numRows = traces[0].data_.size();
         const size_t numCols = tIndices.size();
         if (!argmin) {
-            bar.create_thread();
             bar.set_bar_width(30);
             bar.fill_bar_progress_with("O");
             bar.fill_bar_remainder_with(" ");
@@ -1347,6 +1406,8 @@ void Output::format_csv_or_dat(const std::string& filename, const char& delimite
             }
             outfile << colPtrs[numCols - 1][j] << "\n";
         }
+        outfile.close();
+        if (!outfile) { Errors::output_errors(OutputErrors::WRITE_FAILED, filename); }
         if (!argmin) {
             bar.complete();
             std::cout << "\n\n";
@@ -1624,12 +1685,12 @@ void Output::format_raw(const std::string& filename, bool argmin, int64_t fIndex
             int64_t     pointSizeSpacing = std::to_string(loopsize).length() + 1;
             ProgressBar bar;
             if (!argmin) {
-                bar.create_thread();
                 bar.set_bar_width(30);
                 bar.fill_bar_progress_with("O");
                 bar.fill_bar_remainder_with(" ");
                 bar.set_status_text("Writing Output");
                 bar.set_total((float) loopsize);
+                bar.create_thread();
             }
             for (int64_t i = 0; i < loopsize; ++i) {
                 if (!argmin) { bar.update(static_cast<float>(i)); }
@@ -1651,6 +1712,7 @@ void Output::format_raw(const std::string& filename, bool argmin, int64_t fIndex
             Errors::output_errors(OutputErrors::NOTHING_SPECIFIED);
         }
         outfile.close();
+        if (!outfile) { Errors::output_errors(OutputErrors::WRITE_FAILED, filename); }
         // If the file could not be opened for writing
     } else {
         // Complain about it
@@ -1670,6 +1732,8 @@ void Output::format_cout(const bool& argMin) {
             std::cout << std::setw(15) << std::scientific << std::setprecision(6)
                       << traces.at(traces.size() - 1).data_ptr()[j] << "\n";
         }
+        std::cout.flush();
+        if (!std::cout) { Errors::output_errors(OutputErrors::WRITE_FAILED, "standard output"); }
     }
 }
 
@@ -1682,21 +1746,7 @@ void Output::write_events(const Input& iObj, Matrix& mObj, Simulation& sObj) {
     if (!sObj.results.printIndices.empty()) {
         result_indices = sObj.results.printIndices;
     } else if (!t.empty()) {
-        for (size_t i = 0; i < t.size(); ++i) {
-            if (t[i] >= tran.prstart()) {
-                result_indices.emplace_back(static_cast<int64_t>(i));
-                break;
-            }
-        }
-        double next_print_point = tran.prstart() + tran.prstep();
-        if (!result_indices.empty()) {
-            for (size_t i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
-                if (t[i] >= next_print_point) {
-                    result_indices.emplace_back(static_cast<int64_t>(i));
-                    next_print_point += tran.prstep();
-                }
-            }
-        }
+        result_indices = print_grid_indices(t, tran);
     }
 
     std::vector<RelevantTrace> fallbackTraces;
@@ -2333,21 +2383,7 @@ void extract_trial_phase_events(const Input&                                    
     if (!sObj.results.printIndices.empty()) {
         result_indices = sObj.results.printIndices;
     } else if (!t.empty()) {
-        for (size_t i = 0; i < t.size(); ++i) {
-            if (t[i] >= tran.prstart()) {
-                result_indices.emplace_back(static_cast<int64_t>(i));
-                break;
-            }
-        }
-        double next_print_point = tran.prstart() + tran.prstep();
-        if (!result_indices.empty()) {
-            for (size_t i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
-                if (t[i] >= next_print_point) {
-                    result_indices.emplace_back(static_cast<int64_t>(i));
-                    next_print_point += tran.prstep();
-                }
-            }
-        }
+        result_indices = print_grid_indices(t, tran);
     }
 
     std::vector<RelevantTrace> fallbackTraces;
@@ -3418,21 +3454,7 @@ void Output::evaluate_measurements(const Input& iObj, Matrix& mObj, Simulation& 
     if (!sObj.results.printIndices.empty()) {
         result_indices = sObj.results.printIndices;
     } else if (!t.empty()) {
-        for (size_t i = 0; i < t.size(); ++i) {
-            if (t[i] >= tran.prstart()) {
-                result_indices.emplace_back(static_cast<int64_t>(i));
-                break;
-            }
-        }
-        double next_print_point = tran.prstart() + tran.prstep();
-        if (!result_indices.empty()) {
-            for (size_t i = static_cast<size_t>(result_indices.back()); i < t.size(); ++i) {
-                if (t[i] >= next_print_point) {
-                    result_indices.emplace_back(static_cast<int64_t>(i));
-                    next_print_point += tran.prstep();
-                }
-            }
-        }
+        result_indices = print_grid_indices(t, tran);
     }
 
     std::vector<double> tGrid;

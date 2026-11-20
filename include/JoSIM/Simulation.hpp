@@ -13,6 +13,8 @@
 #include <cassert>
 #include <cmath>
 #include <memory>
+#include <array>
+#include <unordered_map>
 #include <suitesparse/klu.h>
 
 namespace JoSIM {
@@ -281,6 +283,10 @@ class Results {
     int64_t                                         mcNumKeptSteps = 0;
     std::vector<int32_t>                            mcRowToSlot;
     std::vector<double>                             mcTraceOut;
+    // Requested applied current-source samples, indexed by sourcegen index.
+    std::vector<std::optional<std::vector<double>>> sourceCurrents;
+    // Nodal phase at -h and -2h for BDF2 output conversion in either mode.
+    std::unordered_map<int64_t, std::array<double, 2>> phaseBefore;
 };
 
 struct KluPartition {
@@ -463,7 +469,8 @@ struct RollingCheckpoint {
 
 class Simulation {
   private:
-    bool                SLU = false;
+    // Preserve the existing class layout while retiring the unused selection.
+    [[maybe_unused]] bool SLU = false;
     Input*              input_ = nullptr;
     std::vector<double> x_, b_;
     int64_t             simSize_;
@@ -493,12 +500,25 @@ class Simulation {
     bool                hasResistorThermalNoise_ = false;
     bool                hasIndFluxOffset_        = false;
     bool                hasInitialConditions_    = false;
+    // Deck uses devices only upstream 3.x models (GC=/ICNOISE= junctions, ALPHA= inductors, capacitor IC=,
+    // colored noise): it runs on trans_sim_reference.
+    bool                needsMnaOnly_            = false;
+    // Startup steps ran before t = 0 in this transient (phase-source histories exist).
+    bool                startupRan_              = false;
+    // Index of the first simulated step (-startup when startup ran, else 0).
+    int64_t             firstStepIdx_            = 0;
+    // Last value each source applied (indexed by sourcegen), for requested current-source traces.
+    std::vector<double> lastSrcVal_;
     bool                needsLU_;
     bool                needsTR_ = true;
     bool                startup_;
     double              stepSize_, baseStepSize_ = 0.0, prstep_, prstart_;
     int                 subSteps_                = 1;
     int                 subStepIdx_              = 0;
+    bool                capacitorIC_ = false;
+    std::vector<int64_t> nonlinearInductors_;
+    int                 nonlinearRetries_ = 0;
+    std::string         nonlinearFailure_;
     RollingCheckpoint   ckpt_[2];
 
     // In-loop print windowing & decimation schedule
@@ -581,6 +601,21 @@ class Simulation {
 #endif
 #endif
 
+    bool initialize_capacitors(Matrix& mObj);
+    void factorize(Matrix& mObj);
+    bool solve_step(Matrix& mObj);
+    // Reference MNA path (SimulationReference.cpp): upstream 3.1's transient loop and step helpers.
+    void trans_sim_reference(Matrix& mObj);
+    void ref_setup_b(Matrix& mObj, int64_t i, double step, double factor = 1);
+    void ref_handle_cs(Matrix& mObj, double& step, const int64_t& i);
+    void ref_handle_resistors(Matrix& mObj, double& step);
+    void ref_handle_inductors(Matrix& mObj, double factor = 1);
+    void ref_handle_capacitors(Matrix& mObj);
+    void ref_handle_jj(Matrix& mObj, int64_t& i, double& step, double factor = 1);
+    void ref_handle_vs(Matrix& mObj, const int64_t& i, double& step, double factor = 1);
+    void ref_handle_ps(Matrix& mObj, const int64_t& i, double& step, double factor = 1);
+    void ref_handle_ccvs(Matrix& mObj);
+    void ref_handle_vccs(Matrix& mObj);
     void setup(Input& iObj, Matrix& mObj);
     void apply_initial_conditions(Matrix& mObj);
     void save_nodal_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx);

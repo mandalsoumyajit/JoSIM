@@ -46,6 +46,8 @@ class Capacitor : public BasicComponent {
     double                nominalValue_ = 0.0;
     double                spread_       = 1.0;
     std::optional<double> icVoltage_, icPhase_;
+    // IC= (upstream 3.1): initial voltage set before t = 0 in a DST run.
+    std::optional<double> initialVoltage_;
     Capacitor(const std::pair<tokens_t, string_o>& s,
               const NodeConfig&                    ncon,
               const nodemap&                       nm,

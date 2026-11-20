@@ -327,6 +327,22 @@ Screenshot 2020-09-18 at 15.17.27.png
 /test/dcsfq.svg
 /test/jtl.svg
 
+# Build outputs, local project context and Python caches.
+/build/
+/artifacts/
+/docs/context/
+__pycache__/
+*.pyc
+
 test_internal
 
 !cosim/**/examples/*.json
+# Versioned independent numerical reference provenance.
+!test/reference/buffer-101-manifest.json
+
+# Reviewed first-party coverage requirements.
+!tools/coverage-policy.json
+
+# Reviewed release notes, not generated release archives.
+!/docs/releases/
+!/docs/releases/*.md

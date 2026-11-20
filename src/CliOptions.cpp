@@ -12,17 +12,18 @@
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 
 using namespace JoSIM;
 
 tokens_t CliOptions::argv_to_tokens(const int64_t& argc, const char** argv) {
     // Tokens variable of size argc to store arguments
-    tokens_t tokens(argc - 1);
     // If argument count is less or equal to one
     if (argc <= 1) {
         // Complain that josim was run without arguments
         Errors::cli_errors(CLIErrors::TOO_FEW_ARGUMENTS);
     }
+    tokens_t tokens(argc - 1);
     // Loop through arguments, starting at 1 (0 is josim-cli)
     for (int64_t i = 1; i < argc; ++i) {
         // Add the arguments at the appropriate position
@@ -33,21 +34,39 @@ tokens_t CliOptions::argv_to_tokens(const int64_t& argc, const char** argv) {
 }
 
 vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& tokens) {
-    // Variable to store the argument pairs
     vector_pair_t<char_o, string_o> ap;
+    // Switch letters this parser handles (see parse()); anything else is rejected (upstream 3.0 rejects unknown
+    // switches instead of ignoring them).
+    static const std::string knownShort = "abceEfgnMFTGYAQWILJKUZXDhimopsSVv";
+    // Long names without a prefix rule below.
+    static const std::unordered_map<std::string, char> longNames = {
+            {"analysis", 'a'}, {"batch", 'b'},  {"corrector", 'c'}, {"events", 'e'}, {"fixedstep", 'f'},
+            {"gpu", 'g'},      {"help", 'h'},   {"input", 'i'},     {"minimal", 'm'}, {"nodal", 'n'},
+            {"output", 'o'},   {"parallel", 'p'}, {"sanity", 's'},  {"verbose", 'V'}, {"version", 'v'}};
+    bool positional = false;
     // Loop through the argument tokens
     for (auto t : tokens) {
-        if (t.empty()) { continue; }
+        if (t.empty()) { Errors::cli_errors(CLIErrors::INVALID_ARGUMENT, "Empty argument"); }
+        // "--" ends the switches: what follows is positional
+        if (!positional && t == "--") {
+            positional = true;
+            continue;
+        }
         // If the string is a switch, remove leading '-' chars and split on the first '=' if present
-        if (t.at(0) == '-') {
-            size_t      eqPos = t.find('=');
-            std::string swStr = (eqPos != std::string::npos) ? t.substr(0, eqPos) : t;
-            string_o    val   = (eqPos != std::string::npos) ? string_o(t.substr(eqPos + 1)) : std::nullopt;
+        if (!positional && t.at(0) == '-') {
+            size_t      eqPos  = t.find('=');
+            std::string swStr  = (eqPos != std::string::npos) ? t.substr(0, eqPos) : t;
+            string_o    val    = (eqPos != std::string::npos) ? string_o(t.substr(eqPos + 1)) : std::nullopt;
+            const bool  isLong = swStr.rfind("--", 0) == 0;
             swStr.erase(std::remove(swStr.begin(), swStr.end(), '-'), swStr.end());
             if (swStr.empty()) { Errors::cli_errors(CLIErrors::UNKNOWN_SWITCH, t); }
             std::string swLower = swStr;
             std::transform(swLower.begin(), swLower.end(), swLower.begin(), ::tolower);
             char swChar = swStr.at(0);
+            if (isLong) {
+                const auto named = longNames.find(swLower);
+                swChar           = (named != longNames.end()) ? named->second : '\0';
+            }
             if (swLower.rfind("eventmetric", 0) == 0 || swLower.rfind("eventpulse", 0) == 0) {
                 swChar = 'E';
             } else if (swLower.rfind("sweep", 0) == 0) {
@@ -86,7 +105,15 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
             } else if (swLower.rfind("sens", 0) == 0) {
                 swChar = 'X';
             }
+            if (swChar == '\0' || knownShort.find(swChar) == std::string::npos) {
+                Errors::cli_errors(CLIErrors::UNKNOWN_SWITCH, t);
+            }
+            if (val && (swChar == 'p' || swChar == 'h' || swChar == 'v' || swChar == 'i')) {
+                Errors::cli_errors(CLIErrors::INVALID_ARGUMENT, t + " takes no value");
+            }
             ap.emplace_back(std::make_pair(swChar, val));
+        } else if (positional) {
+            ap.emplace_back(std::make_pair(std::nullopt, t));
         } else {
             if (!ap.empty() && !ap.back().second) {
                 const char prevSw = ap.back().first.value_or('\0');
@@ -127,7 +154,8 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
             const char sw = kv.first.value();
             if (sw == 'p' || sw == 'g' || sw == 'n' || sw == 'f' || sw == 'w' || sw == 'm' || sw == 'e' || sw == 'E'
                 || sw == 'M' || sw == 'L' || sw == 'J' || sw == 'X') {
-                if (idx == ap.size() || looks_like_cir_file(kv.second.value())) {
+                // A numeric -m value is its own (e.g. "-m 1" before a deck on standard input).
+                if ((idx == ap.size() && sw != 'm') || looks_like_cir_file(kv.second.value())) {
                     const std::string cirName = kv.second.value();
                     kv.second                 = std::nullopt;
                     ap.emplace_back(std::make_pair(std::nullopt, cirName));
@@ -137,7 +165,8 @@ vector_pair_t<char_o, string_o> CliOptions::argument_pairs(const tokens_t& token
             }
         }
     }
-    if (!hasInput && ap.size() == 1 && ap.back().first && ap.back().second) {
+    if (!hasInput && ap.size() == 1 && ap.back().first && ap.back().second
+        && ap.back().first.value() != 'm' && ap.back().first.value() != 'V' && ap.back().first.value() != 'a') {
         ap.emplace_back(std::make_pair(std::nullopt, ap.back().second));
         ap.at(ap.size() - 2).second = std::nullopt;
     }
@@ -155,8 +184,8 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
         // If the argument is not accompanied by any switch
         if (!i.first) {
             // This argument is the file name
+            if (out.cir_file_name) { Errors::cli_errors(CLIErrors::INVALID_ARGUMENT, "Multiple input files"); }
             out.cir_file_name = i.second;
-            auto path         = std::filesystem::path(i.second.value());
             // Else if the switch is not empty
         } else {
             // Use the char in a case statment
@@ -360,10 +389,10 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                     explicit_stdin_input = true;
                     break;
                     // Enable minimal reporting
-                case 'm': try { out.minimal = std::stoi(i.second.value_or("1"));
-                    } catch (const std::invalid_argument&) {
-                        Errors::cli_errors(CLIErrors::INVALID_MINIMAL, i.second.value());
-                    }
+                case 'm':
+                    if (i.second.value_or("1") == "1") { out.minimal = true; }
+                    else if (i.second == "0") { out.minimal = false; }
+                    else { Errors::cli_errors(CLIErrors::INVALID_MINIMAL); }
                     break;
                     // Set output file
                 case 'o':
@@ -376,7 +405,6 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                         out.output_file = OutputFile(i.second.value());
                     }
                     break;
-                    // Enable parallel processing (EXPERIMENTAL)
                 case 'p':
 #ifdef _OPENMP
                     out.parallel = true;
@@ -401,11 +429,14 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
                     }
                     break;
                     // Enable verbose mode
-                case 'V': try { out.verbose = std::stoi(i.second.value_or("1"));
-                    } catch (const std::invalid_argument&) {
-                        Errors::verbosity_errors(VerbosityErrors::INVALID_VERBOSITY_LEVEL, i.second.value());
+                case 'V': {
+                    const auto value = i.second.value_or("1");
+                    if (value.size() != 1 || value[0] < '0' || value[0] > '3') {
+                        Errors::cli_errors(CLIErrors::INVALID_ARGUMENT, "Verbose level must be 0, 1, 2 or 3");
                     }
+                    out.verbose = value[0] - '0';
                     break;
+                }
                     // Show version info
                 case 'v':
                     exit(0);
@@ -415,6 +446,7 @@ CliOptions CliOptions::parse(int64_t argc, const char** argv) {
             }
         }
     }
+    if (explicit_stdin_input) { out.cir_file_name = std::nullopt; }
     // Do a few sanity checks
     // If the input was not specified
     if (!out.cir_file_name && !(out.minimal && explicit_stdin_input)) {
@@ -545,7 +577,7 @@ void CliOptions::display_help() {
     // Output
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-o" << std::setw(3) << std::left << "|"
-              << "Specify output file for simulation results." << std::endl;
+              << "Specify output file for simulation results (.csv, .dat, .raw)." << std::endl;
     std::cout << std::setw(16) << std::left << "--output=" << std::setw(3) << std::left << "|"
               << "Supported extensions: .csv, .dat, .raw, .bin, .npy, .rawb" << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
@@ -565,7 +597,7 @@ void CliOptions::display_help() {
     std::cout << std::setw(16) << std::left << "-s" << std::setw(3) << std::left << "|"
               << "(EXPERIMENTAL) Sanity check circuit netlist (main design). "
               << "Subcircuits can also be checked if specified." << std::endl;
-    std::cout << std::setw(16) << std::left << "--sanitycheck" << std::setw(3) << std::left << "|"
+    std::cout << std::setw(16) << std::left << "--sanity" << std::setw(3) << std::left << "|"
               << "Multiple subcircuits can be specified by providing CLI option "
               << "multiple times. (e.g. -s SUBCKT1 -s SUBCKT2)" << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|"
@@ -627,8 +659,8 @@ void CliOptions::display_help() {
     // ---------------------------------------------------------------------------
     std::cout << std::setw(16) << std::left << "-V" << std::setw(3) << std::left << "|"
               << "Runs JoSIM in verbose mode." << std::endl;
-    std::cout << std::setw(16) << std::left << "--Verbose=" << std::setw(3) << std::left << "|"
-              << "Defaults to minimal(1), can be medium(2) or maximum(3)" << std::endl;
+    std::cout << std::setw(16) << std::left << "--verbose=" << std::setw(3) << std::left << "|"
+              << "Default level 1; 0 disables verbosity; 2 and 3 add detail." << std::endl;
     std::cout << std::setw(16) << std::left << "  " << std::setw(3) << std::left << "|" << std::endl;
     // Version info
     // ---------------------------------------------------------------------------

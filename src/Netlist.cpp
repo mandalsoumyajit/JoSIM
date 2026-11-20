@@ -7,87 +7,12 @@
 #include "JoSIM/Components.hpp"
 #include "JoSIM/Errors.hpp"
 #include "JoSIM/Misc.hpp"
-#include "JoSIM/ProgressBar.hpp"
+#include "JoSIM/Nanowire.hpp"
 
 #include <algorithm>
-#include <cstring> // for strcmp
-#include <thread>
+#include <cstring>
 
 using namespace JoSIM;
-
-namespace {
-
-tokens_t normalize_subckt_call_tokens(const tokens_t& raw) {
-    if (raw.empty()) { return {}; }
-    tokens_t balanced;
-    balanced.push_back(raw.front());
-    for (size_t i = 1; i < raw.size(); ++i) {
-        if (raw[i] == "PARAMS:" || raw[i] == "PARAM:") { continue; }
-        std::string cur   = raw[i];
-        int         depth = 0;
-        for (char c : cur) {
-            if (c == '(' || c == '{' || c == '[') {
-                ++depth;
-            } else if (c == ')' || c == '}' || c == ']') {
-                --depth;
-            }
-        }
-        while (depth > 0 && i + 1 < raw.size()) {
-            ++i;
-            cur += raw[i];
-            for (char c : raw[i]) {
-                if (c == '(' || c == '{' || c == '[') {
-                    ++depth;
-                } else if (c == ')' || c == '}' || c == ']') {
-                    --depth;
-                }
-            }
-        }
-        balanced.push_back(std::move(cur));
-    }
-
-    tokens_t merged;
-    merged.push_back(balanced.front());
-    for (size_t i = 1; i < balanced.size(); ++i) {
-        if (balanced[i] == "=" && merged.size() > 1 && i + 1 < balanced.size()) {
-            merged.back() += "=" + balanced[i + 1];
-            ++i;
-        } else if (merged.size() > 1 && merged.back().back() == '=') {
-            merged.back() += balanced[i];
-        } else if (!balanced[i].empty() && balanced[i].front() == '=' && merged.size() > 1) {
-            merged.back() += balanced[i];
-        } else {
-            merged.push_back(balanced[i]);
-        }
-    }
-    return merged;
-}
-
-std::string strip_outer_braces_str(std::string s) {
-    while (s.size() >= 2 && s.front() == '{' && s.back() == '}') {
-        int  depth       = 0;
-        bool closesAtEnd = true;
-        for (size_t i = 0; i + 1 < s.size(); ++i) {
-            if (s[i] == '{') {
-                ++depth;
-            } else if (s[i] == '}') {
-                --depth;
-                if (depth == 0) {
-                    closesAtEnd = false;
-                    break;
-                }
-            }
-        }
-        if (closesAtEnd) {
-            s = s.substr(1, s.size() - 2);
-        } else {
-            break;
-        }
-    }
-    return s;
-}
-
-} // namespace
 
 void Netlist::id_io_subc_label(const tokens_t&                                    lineTokens,
                                tokens_t&                                          io,
@@ -95,172 +20,66 @@ void Netlist::id_io_subc_label(const tokens_t&                                  
                                std::string&                                       subcktName,
                                std::string&                                       label,
                                const std::unordered_map<std::string, Subcircuit>& subcircuits) {
-    const tokens_t normTokens = normalize_subckt_call_tokens(lineTokens);
-    label                     = normTokens.front();
-    bool found                = false;
-    for (size_t i = 1; i < normTokens.size(); ++i) {
-        if (normTokens.at(i).find('=') != std::string::npos) {
-            const size_t eqPos = normTokens.at(i).find('=');
-            std::string  param = normTokens.at(i).substr(0, eqPos);
-            std::string  value = normTokens.at(i).substr(eqPos + 1);
-            if (!param.empty() && !value.empty()) {
-                params[param] = value;
-            }
-        } else if (subcircuits.count(normTokens.at(i)) != 0) {
-            found      = true;
-            subcktName = normTokens.at(i);
-        } else {
-            io.emplace_back(normTokens.at(i));
-        }
+    label = lineTokens.front();
+    const auto firstParameter = parameter_start(lineTokens, 1);
+    for (const auto& assignment : parameter_assignments(lineTokens, firstParameter)) {
+        params.emplace(assignment);
     }
-    if (!found) { Errors::input_errors(InputErrors::UNKNOWN_SUBCKT, Misc::vector_to_string(lineTokens)); }
+    // Both documented instance conventions put the type at one end of the IO.
+    size_t type = firstParameter;
+    if (firstParameter > 1 && subcircuits.count(lineTokens[1])) { type = 1; }
+    else if (firstParameter > 1 && subcircuits.count(lineTokens[firstParameter - 1])) { type = firstParameter - 1; }
+    if (type == firstParameter) { Errors::input_errors(InputErrors::UNKNOWN_SUBCKT, Misc::vector_to_string(lineTokens)); }
+    subcktName = lineTokens[type];
+    for (size_t i = 1; i < firstParameter; ++i) {
+        if (i != type) { io.push_back(lineTokens[i]); }
+    }
 }
 
-bool Netlist::rename_io_nodes(std::string& node, const tokens_t& subIO, const tokens_t& parentIO) {
-    // Loop through the subcircuit IO in a single pass
-    for (size_t l = 0; l < subIO.size(); ++l) {
-        // If the nodes match
-        if (node == subIO[l]) {
-            // Replace the node with the IO node
-            node = parentIO[l];
-            // Return true
-            return true;
-        }
-    }
-    // Return false
-    return false;
+static std::string bind_node(const std::string& node, const tokens_t& formal, const tokens_t& actual,
+                             const std::string& label) {
+    const auto pin = std::find(formal.begin(), formal.end(), node);
+    if (pin != formal.end()) { return actual.at(static_cast<size_t>(pin - formal.begin())); }
+    if (label.empty() || node == "0" || node == "GND") { return node; }
+    return node + "|" + label;
 }
 
-void Netlist::expand_io(Subcircuit&        subc,
-                        s_map&             params,
-                        const tokens_t&    io,
-                        const std::string& label,
-                        const std::string& subcktName,
-                        const string_o&    callerScope) {
-    // Sanity check
-    if (io.size() != subc.io.size()) { Errors::input_errors(InputErrors::IO_MISMATCH, label); }
-
-    bool createInstScope = false;
-    if (parametersPtr != nullptr && !subcktName.empty()) {
-        if (!params.empty()) {
-            createInstScope = true;
-        } else if (callerScope.has_value()) {
-            for (const auto& kv : *parametersPtr) {
-                if (kv.first.subcircuit() == callerScope) {
-                    createInstScope = true;
-                    break;
-                }
-            }
-        }
+void Netlist::expand_line(tokens_t& tokens, const tokens_t& formal, const tokens_t& actual,
+                          const std::string& label, const string_o& scope) {
+    const auto map_node = [&](const std::string& node) { return bind_node(node, formal, actual, label); };
+    if (!label.empty()) { tokens.front() += "|" + label; }
+    size_t nodeCount = std::string("EFGHT").find(tokens.front().front()) != std::string::npos ? 4 : 2;
+    if (tokens.front().front() == 'B' && tokens.size() > 4) {
+        const auto* model = Model::find_model(tokens[4], models_new, scope);
+        if (model && model->gateWidthSpecified()) { nodeCount = 3; }
     }
-
-    if (createInstScope) {
-        hasInstScopes = true;
-        std::vector<std::string> origScopes;
-        for (const auto& line : subc.lines) {
-            const std::string sc = line.second.value_or(subcktName);
-            if (std::find(origScopes.begin(), origScopes.end(), sc) == origScopes.end()) {
-                origScopes.push_back(sc);
+    if (tokens.front().front() == 'N') {
+        // nTron/hTron (fork): 2-4 nodes before the model; GATE= names a device of the same instance.
+        nodeCount = 2;
+        for (size_t m = 3; m < tokens.size() && nodeCount < 4; ++m) {
+            if (Nanowire::is_node_token(tokens[m], *this, scope)) {
+                ++nodeCount;
+            } else {
+                break;
             }
         }
-        std::vector<std::pair<ParameterName, Parameter>> existingParams(parametersPtr->begin(), parametersPtr->end());
-        for (const auto& origScope : origScopes) {
-            const std::string newScope = origScope + "|" + label;
-            if (callerScope.has_value()) {
-                for (const auto& kv : existingParams) {
-                    if (kv.first.subcircuit() == callerScope) {
-                        Parameter p = kv.second;
-                        p.reset_value();
-                        (*parametersPtr)[ParameterName(kv.first.name(), newScope)] = p;
-                    }
-                }
-            }
-            for (const auto& kv : existingParams) {
-                if (kv.first.subcircuit() && kv.first.subcircuit().value() == subcktName) {
-                    Parameter p = kv.second;
-                    p.reset_value();
-                    (*parametersPtr)[ParameterName(kv.first.name(), newScope)] = p;
-                }
-            }
-            if (origScope != subcktName) {
-                for (const auto& kv : existingParams) {
-                    if (kv.first.subcircuit() && kv.first.subcircuit().value() == origScope) {
-                        Parameter p = kv.second;
-                        p.reset_value();
-                        (*parametersPtr)[ParameterName(kv.first.name(), newScope)] = p;
-                    }
-                }
-            }
-            for (const auto& pkv : params) {
-                const std::string cleanExpr = strip_outer_braces_str(pkv.second);
-                Parameter         p;
-                if (!callerScope.has_value()) {
-                    const double v = parse_param(cleanExpr, *parametersPtr, std::nullopt, false);
-                    if (!std::isnan(v)) {
-                        p.set_expression(Misc::precise_to_string(v));
-                        p.set_value(v);
-                    } else {
-                        p.set_expression(cleanExpr);
-                    }
-                } else {
-                    p.set_expression(cleanExpr);
-                }
-                (*parametersPtr)[ParameterName(pkv.first, newScope)] = p;
-            }
-        }
-    }
-
-    // Loop through the identified subcircuit
-    for (auto k = 0; k < subc.lines.size(); ++k) {
-        // Set shorthand for long variable name
-        tokens_t& tokens = subc.lines.at(k).first;
-        if (createInstScope) {
-            const std::string origScope = subc.lines.at(k).second.value_or(subcktName);
-            subc.lines.at(k).second     = origScope + "|" + label;
-        }
-        // Check for value parameterization
-        if (!params.empty() && params.count(tokens.front()) != 0) { insert_parameter(tokens, params); }
-        // Append the label of the parent to the subcircuit label in-place
-        tokens.at(0).reserve(tokens.at(0).size() + 1 + label.size());
-        tokens.at(0).push_back('|');
-        tokens.at(0).append(label);
-        // Determine amount of nodes to process
-        const char devType   = tokens.at(0).at(0);
-        int64_t    nodeCount = (devType == 'E' || devType == 'F' || devType == 'G' || devType == 'H' || devType == 'T')
-                                       ? 4
-                                       : 2;
-        if (devType == 'N') {
-            nodeCount = 2;
-            for (size_t m = 3; m < tokens.size() && nodeCount < 4; ++m) {
-                if (Nanowire::is_node_token(tokens.at(m), *this, subc.lines.at(k).second)) {
-                    ++nodeCount;
-                } else {
-                    break;
-                }
-            }
+        if (!label.empty()) {
             for (size_t m = 1; m < tokens.size(); ++m) {
                 for (const char* pfx : {"GATE=", "GATE_IND=", "GATEDEV="}) {
                     const size_t pfxLen = std::strlen(pfx);
-                    if (tokens.at(m).compare(0, pfxLen, pfx) == 0 && tokens.at(m).size() > pfxLen) {
-                        tokens.at(m).push_back('|');
-                        tokens.at(m).append(label);
+                    if (tokens[m].compare(0, pfxLen, pfx) == 0 && tokens[m].size() > pfxLen) {
+                        tokens[m] += "|" + label;
                     }
                 }
             }
         }
-        // Loop through all the nodes changing where necessary
-        for (int64_t n = 1; n < nodeCount + 1; ++n) {
-            // Ensure nodes don't identify as ground
-            if (tokens.at(n) != "0" && tokens.at(n) != "GND") {
-                // Ensure the node is not part of the IO
-                if (!rename_io_nodes(tokens.at(n), subc.io, io)) {
-                    // Append the label to the node number in-place to make it unique
-                    tokens.at(n).reserve(tokens.at(n).size() + 1 + label.size());
-                    tokens.at(n).push_back('|');
-                    tokens.at(n).append(label);
-                }
-            }
-        }
+    }
+    if (tokens.size() <= nodeCount) {
+        Errors::invalid_component_errors(ComponentErrors::INVALID_COMPONENT_DECLARATION, Misc::vector_to_string(tokens));
+    }
+    for (size_t n = 1; n <= nodeCount; ++n) { tokens[n] = map_node(tokens[n]); }
+    for (auto& token : tokens) {
+        if (token.rfind("GC=", 0) == 0) { token = "GC=" + map_node(token.substr(3)); }
     }
 }
 
@@ -291,161 +110,177 @@ void Netlist::insert_parameter(tokens_t& t, s_map& params) {
 }
 
 void Netlist::expand_subcircuits() {
-    // std::vector<std::pair<tokens_t, string_o>> moddedLines;
-    std::string subcktName, label;
-    // Loop through subcircuits, line by line
-    for (const auto& i : subcircuits) {
-        for (const auto& j : i.second.lines) {
-            // If a line is found that starts with an 'X'
-            if (j.first.front().at(0) == 'X') {
-                // This subcircuit contains a subcircuit
-                subcircuits.at(i.first).containsSubckt = true;
-                // Increase the expansion counter
-                subcircuits.at(i.first).subcktCounter++;
-                // Increase the nest depth
-                nestedSubcktCount++;
-            }
+    // Check every definition, including unused ones, without destroying the
+    // templates needed to bind each instance's parameters before its children.
+    std::unordered_map<std::string, std::unordered_set<std::string>> dependencies;
+    subcktNodeCounts.clear();
+    for (const auto& entry : subcircuits) {
+        auto& required = dependencies[entry.first];
+        if (sanityCheck && sanityCheckSubckts.count(entry.first)) {
+            for (const auto& pin : entry.second.io) { increment_subcircuit_node_count(entry.first, pin); }
         }
-    }
-    ProgressBar bar;
-    if (!argMin) {
-        bar.create_thread();
-        bar.set_bar_width(30);
-        bar.fill_bar_progress_with("O");
-        bar.fill_bar_remainder_with(" ");
-        bar.set_status_text("Expanding Subcircuits");
-        bar.set_total((float) nestedSubcktCount);
-    }
-    // If not minimal printing
-    int64_t cc = 0;
-    // While we are nested (depth not zero)
-    while (nestedSubcktCount != 0) {
-        // If not minimal printing
-        if (!argMin) {
-            // Report progress
-            bar.update((float) cc);
-        }
-        // Loop through subcircuits
-        for (const auto& i : subcircuits) {
-            if (sanityCheck && sanityCheckSubckts.count(i.first) != 0) {
-                for (auto node : i.second.io) { increment_subcircuit_node_count(i.first, node); }
-            }
-            Subcircuit& subcircuit = subcircuits.at(i.first);
-            if (!subcircuit.containsSubckt) { continue; }
-            std::vector<std::pair<tokens_t, string_o>> newLines;
-            newLines.reserve(subcircuit.lines.size() * 2);
-            for (size_t j = 0; j < subcircuit.lines.size(); ++j) {
-                tokens_t& subcCurrentLine = subcircuit.lines[j].first;
-                // If the line denotes a subcircuit
-                if (subcCurrentLine.front().at(0) == 'X') {
-                    // Variable to store io and parameters
-                    tokens_t io;
-                    s_map    params;
-                    id_io_subc_label(subcCurrentLine, io, params, subcktName, label, subcircuits);
-                    if (sanityCheck && sanityCheckSubckts.count(i.first) != 0) {
-                        for (auto node : io) { increment_subcircuit_node_count(i.first, node); }
+        for (const auto& line : entry.second.lines) {
+            if (line.first.front().front() != 'X') {
+                if (sanityCheck && sanityCheckSubckts.count(entry.first)) {
+                    for (size_t node = 1; node < std::min(size_t(3), line.first.size()); ++node) {
+                        increment_subcircuit_node_count(entry.first, line.first[node]);
                     }
-                    const Subcircuit& targetSubc = subcircuits.at(subcktName);
-                    // If not nested
-                    if (!targetSubc.containsSubckt) {
-                        Subcircuit subc = targetSubc;
-                        // Expand the IO nodes of the subcircuit for this instance
-                        expand_io(subc, params, io, label, subcktName, i.first);
-                        // Append the expanded lines in O(1) amortized time
-                        newLines.insert(newLines.end(),
-                                        std::make_move_iterator(subc.lines.begin()),
-                                        std::make_move_iterator(subc.lines.end()));
-                        // Reduce the total amount of subcircuits in this subcircuit by 1
-                        --subcircuit.subcktCounter;
-                        ++cc;
-                        // Reduce the total nested subcircuit count by 1
-                        --nestedSubcktCount;
-                        // If this subcircuit subcircuit counter becomes zero
-                        if (subcircuit.subcktCounter == 0) {
-                            // This subcircuit no longer contains subcircuits
-                            subcircuit.containsSubckt = false;
-                        }
-                    } else {
-                        newLines.push_back(std::move(subcircuit.lines[j]));
-                    }
-                } else {
-                    newLines.push_back(std::move(subcircuit.lines[j]));
                 }
+                continue;
             }
-            subcircuit.lines = std::move(newLines);
+            tokens_t io;
+            s_map parameters;
+            std::string type, label;
+            id_io_subc_label(line.first, io, parameters, type, label, subcircuits);
+            if (io.size() != subcircuits.at(type).io.size()) { Errors::input_errors(InputErrors::IO_MISMATCH, label); }
+            required.insert(type);
+            if (sanityCheck && sanityCheckSubckts.count(entry.first)) {
+                for (const auto& node : io) { increment_subcircuit_node_count(entry.first, node); }
+            }
         }
     }
-    // Let the user know subcircuit expansion is complete
-    if (!argMin) {
-        bar.complete();
-        std::cout << "\n";
+    while (!dependencies.empty()) {
+        tokens_t ready;
+        for (const auto& entry : dependencies) {
+            if (entry.second.empty()) { ready.push_back(entry.first); }
+        }
+        if (ready.empty()) {
+            tokens_t unresolved;
+            for (const auto& entry : dependencies) { unresolved.push_back(entry.first); }
+            Errors::netlist_errors(NetlistErrors::RECURSIVE_SUBCIRCUIT, Misc::vector_to_string(unresolved));
+        }
+        for (const auto& type : ready) { dependencies.erase(type); }
+        for (auto& entry : dependencies) {
+            for (const auto& type : ready) { entry.second.erase(type); }
+        }
     }
 }
 
 void Netlist::expand_maindesign() {
-    // std::vector<std::pair<std::string, std::string>> moddedLines;
-    ProgressBar bar;
-    if (!argMin) {
-        bar.create_thread();
-        bar.set_bar_width(30);
-        bar.fill_bar_progress_with("O");
-        bar.fill_bar_remainder_with(" ");
-        bar.set_status_text("Expanding Main Circuit");
-        bar.set_total((float) maindesign.size());
+    param_map parameters;
+    expand_design(parameters, false);
+}
+
+void Netlist::expand_maindesign(param_map& parameters) {
+    expand_design(parameters, true);
+}
+
+void Netlist::expand_design(param_map& parameters, bool scoped) {
+    expand_subcircuits();
+    std::unordered_map<std::string, std::vector<std::pair<std::string, Parameter>>> definitions;
+    std::vector<ParameterName> globals;
+    for (const auto& entry : parameters) {
+        if (!entry.first.subcircuit()) { globals.push_back(entry.first); }
+        else { definitions[*entry.first.subcircuit()].emplace_back(entry.first.name(), entry.second); }
     }
-    size_t totalExpLines = 0;
-    for (const auto& line : maindesign) {
-        if (!line.empty() && line.front().at(0) == 'X') {
-            for (size_t k = 1; k < line.size(); ++k) {
-                auto it = subcircuits.find(line[k]);
-                if (it != subcircuits.end()) {
-                    totalExpLines += it->second.lines.size();
-                    break;
-                }
+    parse_parameters(parameters, globals);
+    const auto parsedModels = models_new;
+    if (scoped) { models_new.clear(); }
+    for (const auto& entry : parsedModels) {
+        if (scoped && !entry.second && !models.count({entry.first.modelName(), std::nullopt})) { models_new.push_back(entry); }
+    }
+    std::unordered_map<std::string, std::vector<tokens_t>> localModels;
+    for (const auto& entry : models) {
+        if (entry.first.second) { localModels[*entry.first.second].push_back(entry.second); }
+        else if (scoped) { Model::parse_model({entry.second, std::nullopt}, models_new, parameters); }
+    }
+    struct Frame {
+        const Subcircuit* definition = nullptr;
+        tokens_t io;
+        std::string path;
+        string_o scope;
+        size_t next = 0;
+        size_t first = 0;
+        s_map componentOverrides;
+    };
+    std::vector<Frame> stack(1);
+    expNetlist.clear();
+    nodeAliases.clear();
+    scopeTypes.clear();
+    mainNodeCounts.clear();
+    while (!stack.empty()) {
+        auto& frame = stack.back();
+        const auto size = frame.definition ? frame.definition->lines.size() : maindesign.size();
+        if (frame.next == size) {
+            // Legacy component-value overrides apply after child expansion,
+            // preserving an outer instance's precedence over an inner one.
+            for (size_t i = frame.first; !frame.componentOverrides.empty() && i < expNetlist.size(); ++i) {
+                auto& tokens = expNetlist[i].first;
+                if (frame.componentOverrides.count(tokens.front())) { insert_parameter(tokens, frame.componentOverrides); }
             }
-        } else {
-            ++totalExpLines;
+            stack.pop_back();
+            continue;
         }
-    }
-    expNetlist.reserve(totalExpLines);
-    // Loop through the identified main design, line by line
-    for (auto i = 0; i < maindesign.size(); ++i) {
-        std::string subcktName, label;
-        // If not minimal printing
-        if (!argMin) {
-            // Report progress
-            bar.update((float) i);
+        auto tokens = frame.definition ? frame.definition->lines[frame.next++].first : maindesign[frame.next++];
+        if (tokens.front().front() != 'X') {
+            const tokens_t empty;
+            const auto& formal = frame.definition ? frame.definition->io : empty;
+            expand_line(tokens, formal, frame.io, frame.path, frame.scope);
+            expNetlist.emplace_back(std::move(tokens), frame.scope);
+            continue;
         }
-        // If the line denotes a subcircuit
-        if (maindesign.at(i).front().at(0) == 'X') {
-            // Variable to store io and parameters
-            tokens_t io;
-            s_map    params;
-            id_io_subc_label(maindesign.at(i), io, params, subcktName, label, subcircuits);
-            if (sanityCheck) {
-                for (auto node : io) { increment_maindesign_node_count(node); }
+        tokens_t io;
+        s_map assignments;
+        std::string type, label;
+        id_io_subc_label(tokens, io, assignments, type, label, subcircuits);
+        const auto& definition = subcircuits.at(type);
+        if (io.size() != definition.io.size()) { Errors::input_errors(InputErrors::IO_MISMATCH, tokens.front()); }
+        if (sanityCheck && !frame.definition) {
+            for (const auto& node : io) { increment_maindesign_node_count(node); }
+        }
+        if (frame.definition) {
+            for (auto& node : io) { node = bind_node(node, frame.definition->io, frame.io, frame.path); }
+        }
+        Frame child;
+        child.definition = &definition;
+        child.io = std::move(io);
+        child.path = label + (frame.path.empty() ? "" : "|" + frame.path);
+        // Leading '|' distinguishes instance environments from type defaults.
+        child.scope = scoped ? "|" + child.path : type;
+        child.first = expNetlist.size();
+        std::vector<ParameterName> names;
+        const auto locals = definitions.find(type);
+        if (locals != definitions.end()) {
+            for (const auto& entry : locals->second) {
+                const ParameterName name(entry.first, child.scope);
+                parameters[name] = entry.second;
+                parameters[name].reset_value();
+                names.push_back(name);
             }
-            // Copy of subcircuit for this instance
-            Subcircuit subc = subcircuits.at(subcktName);
-            // Expand the appropriate IO nodes of the subcircuit for this instance
-            expand_io(subc, params, io, label, subcktName, std::nullopt);
-            // Add the expanded subcircuit lines to the expanded netlist
-            expNetlist.insert(expNetlist.end(),
-                              std::make_move_iterator(subc.lines.begin()),
-                              std::make_move_iterator(subc.lines.end()));
-            // If the line is not a subcircuit
-        } else {
-            // Add the line tokens to the expanded netlist
-            expNetlist.push_back(std::make_pair(maindesign.at(i), std::nullopt));
         }
-    }
-    if (hasInstScopes && parametersPtr != nullptr && !parametersPtr->empty()) {
-        parse_parameters(*parametersPtr);
-    }
-    // Let the user know main design expansion is complete
-    if (!argMin) {
-        bar.complete();
-        std::cout << "\n";
+        for (const auto& assignment : assignments) {
+            // Overrides are evaluated in the caller, before local shadowing.
+            if (!scoped) {
+                child.componentOverrides[assignment.first + "|" + child.path] = assignment.second;
+                continue;
+            }
+            const double value = parse_param(assignment.second, parameters, frame.scope);
+            const ParameterName name(assignment.first, child.scope);
+            auto& parameter = parameters[name];
+            // The bound value is fixed; reparsing must not capture a child
+            // variable with the same name as the caller expression.
+            parameter.set_expression(Misc::precise_to_string(value));
+            parameter.set_value(value);
+            const bool declared = locals != definitions.end()
+                && std::any_of(locals->second.begin(), locals->second.end(), [&](const auto& entry) { return entry.first == assignment.first; });
+            if (!declared) {
+                child.componentOverrides[assignment.first + "|" + child.path] = Misc::precise_to_string(value);
+            }
+        }
+        parse_parameters(parameters, names);
+        if (scoped) {
+            for (const auto& entry : localModels[type]) { Model::parse_model({entry, child.scope}, models_new, parameters); }
+        }
+        for (const auto& entry : parsedModels) {
+            if (scoped && entry.second == string_o(type) && !models.count({entry.first.modelName(), type})) {
+                models_new.emplace_back(entry.first, child.scope);
+            }
+        }
+        for (size_t pin = 0; pin < definition.io.size(); ++pin) {
+            nodeAliases[definition.io[pin] + "|" + child.path] = child.io[pin];
+        }
+        if (child.scope) { scopeTypes[*child.scope] = type; }
+        stack.push_back(std::move(child));
     }
     subcktTotal = subcircuits.size();
     subcircuits.clear();

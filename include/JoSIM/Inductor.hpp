@@ -39,6 +39,7 @@ using mutualinductors = std::vector<std::pair<int64_t, double>>;
 class Inductor : public BasicComponent {
   private:
     JoSIM::AnalysisType at_;
+    size_t              selfIndex_ = 0;
 
   public:
     double                In2_ = 0.0, In3_ = 0.0, In4_ = 0.0;
@@ -46,6 +47,11 @@ class Inductor : public BasicComponent {
     double                spread_       = 1.0;
     double                phiOffset_    = 0.0;
     std::optional<double> icCurrent_;
+    double                alpha_ = 0.0;
+    // Total linkage at n-2 before assembly, including mutual flux, in Wb.
+    double                previousFlux_ = 0.0;
+    // This step's BDF2 history contribution, in Wb.
+    double                fluxHistory_ = 0.0;
     mutualinductors       mutualInductances_;
 
     Inductor(const std::pair<tokens_t, string_o>& s,
@@ -62,6 +68,10 @@ class Inductor : public BasicComponent {
     void add_mutualInductance(const double& m, const AnalysisType& at, const double& h, const int64_t& ci);
 
     const mutualinductors& get_mutualInductance() const noexcept { return mutualInductances_; }
+
+    double flux(double current) const;
+    double differential_inductance(double current) const;
+    bool linearize(double current, double timestep);
 
     void                  update_timestep(const double& factor) override;
 

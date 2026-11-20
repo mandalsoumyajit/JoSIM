@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -409,6 +410,9 @@ void IV::setup_iv(const tokens_t& i, Input& iObj) {
                 rfAmp_opt = parse_param(val, iObj.parameters);
             } else if (key == "RF_FREQ" || key == "FREQ" || key == "FRF") {
                 rfFreq_opt = parse_param(val, iObj.parameters);
+            } else if (key != "GTJJ") {
+                // GTJJ belongs to the classic model form handled below; anything else is a mistake (upstream 3.0).
+                Errors::control_errors(ControlErrors::INVALID_IV_COMMAND, "Unknown IV option: " + tok);
             }
         } else if (tok == "HYST") {
             hasKeywords = true;
@@ -454,12 +458,57 @@ void IV::setup_iv(const tokens_t& i, Input& iObj) {
         }
     }
 
-    // Fast path for classic 3-argument model .iv (100% compatible with legacy .iv <model> <maxC> <outfile>)
-    if (isModel && !hasKeywords) {
-        if (outFile.empty()) {
-            Errors::control_errors(ControlErrors::INVALID_IV_COMMAND, Misc::vector_to_string(i));
-            return;
+    // Classic model IV: .iv <model> <Imax> <file> [STEP=|ISTEP= TSTEP= TSTOP= TSTART= GTJJ=]. Upstream 3.x semantics
+    // (each point from a fresh zero state, the sweep ends exactly at +-Imax, averaging from TSTART, gate bias);
+    // the points run in parallel (fork).
+    bool classicKeys = true;
+    for (size_t idx = 1; idx < i.size(); ++idx) {
+        const size_t eqPos = i[idx].find('=');
+        if (eqPos == std::string::npos) { continue; }
+        std::string key = i[idx].substr(0, eqPos);
+        std::transform(key.begin(), key.end(), key.begin(), ::toupper);
+        if (key != "STEP" && key != "ISTEP" && key != "TSTEP" && key != "TSTOP" && key != "TSTART" && key != "GTJJ") {
+            classicKeys = false;
         }
+    }
+    if (isModel && modelSpec.empty() && pos.size() == 3 && classicKeys) {
+        if (!std::isfinite(maxC) || maxC <= 0.0) {
+            Errors::control_errors(ControlErrors::INVALID_IV_COMMAND, "IV Imax must be > 0: " + Misc::vector_to_string(i));
+        }
+        std::optional<double> gtjj;
+        std::optional<double> step;
+        double                tstep = 0.05E-12;
+        double                tstop = 500E-12;
+        std::optional<double> tstart;
+        for (size_t k = 1; k < i.size(); ++k) {
+            const std::string& opt = i.at(k);
+            if (opt.rfind("GTJJ=", 0) == 0) {
+                gtjj = parse_param(opt.substr(5), iObj.parameters);
+            } else if (opt.rfind("STEP=", 0) == 0) {
+                step = parse_param(opt.substr(5), iObj.parameters);
+            } else if (opt.rfind("ISTEP=", 0) == 0) {
+                step = parse_param(opt.substr(6), iObj.parameters);
+            } else if (opt.rfind("TSTEP=", 0) == 0) {
+                tstep = parse_param(opt.substr(6), iObj.parameters);
+            } else if (opt.rfind("TSTOP=", 0) == 0) {
+                tstop = parse_param(opt.substr(6), iObj.parameters);
+            } else if (opt.rfind("TSTART=", 0) == 0) {
+                tstart = parse_param(opt.substr(7), iObj.parameters);
+            }
+        }
+        if (gtjj && !std::isfinite(gtjj.value())) {
+            Errors::control_errors(ControlErrors::INVALID_IV_COMMAND, "GTJJ must be a finite voltage");
+        }
+        const double currentIncrement = step.value_or(25E-7); // default 2.5e-6 A
+        if (!std::isfinite(currentIncrement) || currentIncrement <= 0.0) {
+            Errors::control_errors(ControlErrors::INVALID_IV_COMMAND, "IV STEP must be > 0: " + Misc::vector_to_string(i));
+        }
+        // Bare IV output names are relative to the main input file.
+        auto path = std::filesystem::path(outFile);
+        if (!path.has_parent_path() && iObj.fileParentPath) {
+            path = std::filesystem::path(iObj.fileParentPath.value()).append(outFile);
+        }
+        iObj.ensure_safe_output(path.string());
         Input ivInp = iObj;
         ivInp.controls.clear();
         ivInp.argMargins    = false;
@@ -468,22 +517,55 @@ void IV::setup_iv(const tokens_t& i, Input& iObj) {
         ivInp.assertions.clear();
         ivInp.measurements.clear();
         ivInp.jitterSpecs.clear();
-        tokens_t jj              = {"B01", "1", "0", modelName, "AREA=1"};
-        tokens_t ib              = {"IB01", "0", "1", "PWL(0", "0", "10P", "0", "50P", "2.5U)"};
-        ivInp.netlist.expNetlist = {std::make_pair(jj, subc), std::make_pair(ib, std::nullopt)};
-        ivInp.transSim.tstep(0.05E-12);
-        ivInp.transSim.tstop(500E-12);
+        // A type-level model IV uses that definition's defaults, independently of
+        // any instantiated copies and their overrides. Resolve only this scope.
+        std::vector<ParameterName> defaultNames;
+        if (subc) {
+            for (const auto& parameter : ivInp.parameters) {
+                if (parameter.first.subcircuit() == subc && !parameter.second.get_value()) {
+                    defaultNames.push_back(parameter.first);
+                }
+            }
+            parse_parameters(ivInp.parameters, defaultNames);
+        }
+        if (!Model::find_model(modelName, ivInp.netlist.models_new, subc) || subc) {
+            Model::parse_model({ivInp.netlist.models.at({modelName, subc}), subc}, ivInp.netlist.models_new,
+                               ivInp.parameters);
+        }
+        tokens_t ib = {"IB01", "0", "1", "PWL(0", "0", "10P", "0", "50P", "2.5U)"};
+        if (gtjj) {
+            tokens_t          jj = {"B01", "1", "0", modelName, "AREA=1", "GC=GTVG"};
+            std::stringstream gtjj_value;
+            gtjj_value << std::scientific << std::uppercase << gtjj.value();
+            tokens_t vgc = {"VGTC", "GTVG", "0", "DC", gtjj_value.str()};
+            ivInp.netlist.expNetlist
+                    = {std::make_pair(jj, subc), std::make_pair(vgc, std::nullopt), std::make_pair(ib, std::nullopt)};
+        } else {
+            tokens_t jj              = {"B01", "1", "0", modelName, "AREA=1"};
+            ivInp.netlist.expNetlist = {std::make_pair(jj, subc), std::make_pair(ib, std::nullopt)};
+        }
+        const double averageStart = tstart.value_or(tstop / 2);
+        if (!std::isfinite(tstep) || tstep <= 0 || !std::isfinite(tstop) || !std::isfinite(averageStart)
+            || averageStart < 50E-12 || averageStart >= tstop) {
+            Errors::control_errors(ControlErrors::INVALID_IV_COMMAND,
+                                   "IV timing requires finite TSTEP > 0 and TSTOP > TSTART >= 50ps");
+        }
+        ivInp.transSim.tstep(tstep);
+        ivInp.transSim.tstop(tstop);
+        ivInp.transSim.prstart(averageStart);
+        ivInp.transSim.prstep(tstep);
+        ivInp.transSim.prfirwindow(0);
+        ivInp.transSim.validate_output();
+        if (ivInp.argVerb) {
+            std::cout << "Model IV " << modelName << ": requested timestep (s): " << Misc::precise_to_string(tstep)
+                      << "; stop (s): " << Misc::precise_to_string(tstop)
+                      << "; average start (s): " << Misc::precise_to_string(averageStart) << "\n";
+        }
         ivInp.argAnal = JoSIM::AnalysisType::Voltage;
         ivInp.argMin  = true;
-        auto iv_data  = generate_iv(maxC, ivInp);
-
-        auto path = std::filesystem::path(outFile);
-        if (!path.has_parent_path() && iObj.fileParentPath) {
-            path = std::filesystem::path(iObj.fileParentPath.value()).append(outFile);
-        }
+        auto iv_data  = generate_iv(maxC, currentIncrement, ivInp);
         write_iv(iv_data, path.string());
-        const double dI = (maxC < 25e-6) ? (maxC / 100.0) : 2.5e-6;
-        analyze_iv_curve(iv_data, nameId, modelName, "MODEL", 5.0e-6, dI, 0.0, 0.0, iObj.parameters);
+        analyze_iv_curve(iv_data, nameId, modelName, "MODEL", 5.0e-6, currentIncrement, 0.0, 0.0, iObj.parameters);
         return;
     }
 
@@ -597,6 +679,7 @@ void IV::setup_iv(const tokens_t& i, Input& iObj) {
     const int64_t                          nPts        = static_cast<int64_t>(points.size());
     const double                           avgStartFrac = std::clamp(tAvg / tstop, 0.1, 0.85);
 
+    std::exception_ptr pointError;
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -623,15 +706,23 @@ void IV::setup_iv(const tokens_t& i, Input& iObj) {
 #pragma omp for schedule(dynamic, 2)
 #endif
         for (int64_t idx = 0; idx < nPts; ++idx) {
-            locMat.nz = baseNz;
-            locInp.transSim.tstep(tstep);
-            locMat.sourcegen.at(static_cast<size_t>(srcIdx)).ampValues({0.0, points[idx].first, points[idx].second});
-            Simulation sim(locInp, locMat);
-            const double vAvg = compute_steady_voltage(
-                sim, locInp.argAnal, posIdx, negIdx, tstep, avgStartFrac, rfFreq, false);
-            iv_data[static_cast<size_t>(idx)] = std::make_pair(vAvg, points[idx].second);
+            try {
+                locMat.nz = baseNz;
+                locInp.transSim.tstep(tstep);
+                locMat.sourcegen.at(static_cast<size_t>(srcIdx)).ampValues({0.0, points[idx].first, points[idx].second});
+                Simulation sim(locInp, locMat);
+                const double vAvg = compute_steady_voltage(
+                    sim, locInp.argAnal, posIdx, negIdx, tstep, avgStartFrac, rfFreq, false);
+                iv_data[static_cast<size_t>(idx)] = std::make_pair(vAvg, points[idx].second);
+            } catch (...) {
+#ifdef _OPENMP
+#pragma omp critical(josim_iv_error)
+#endif
+                if (!pointError) { pointError = std::current_exception(); }
+            }
         }
     }
+    if (pointError) { std::rethrow_exception(pointError); }
 
     if (!outFile.empty()) {
         auto path = std::filesystem::path(outFile);
@@ -817,6 +908,7 @@ void IV::setup_squid(const tokens_t& i, Input& iObj) {
         }
     }
 
+    std::exception_ptr pointError;
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -873,28 +965,36 @@ void IV::setup_squid(const tokens_t& i, Input& iObj) {
 #pragma omp for schedule(dynamic, 2)
 #endif
         for (int64_t p = 0; p < totalPts; ++p) {
-            const size_t fIdx = static_cast<size_t>(p) / nCurr;
-            const size_t cIdx = static_cast<size_t>(p) % nCurr;
-            const double phi  = fluxGrid[fIdx];
-            const double ib   = currGrid[cIdx];
+            try {
+                const size_t fIdx = static_cast<size_t>(p) / nCurr;
+                const size_t cIdx = static_cast<size_t>(p) % nCurr;
+                const double phi  = fluxGrid[fIdx];
+                const double ib   = currGrid[cIdx];
 
-            locMat.nz = baseNz;
-            locInp.transSim.tstep(tstep);
-            locMat.sourcegen.at(static_cast<size_t>(biasSrcIdx)).ampValues({0.0, ib, ib});
-            if (fluxIsCurrentSource && fluxSrcIdx >= 0) {
-                locMat.sourcegen.at(static_cast<size_t>(fluxSrcIdx)).ampValues({0.0, phi, phi});
-            } else {
-                for (const auto& entry : indDevMap) {
-                    auto& ind      = std::get<Inductor>(locMat.components.devices[static_cast<size_t>(entry.first)]);
-                    ind.phiOffset_ = entry.second.first + 2.0 * Constants::PI * entry.second.second * phi;
+                locMat.nz = baseNz;
+                locInp.transSim.tstep(tstep);
+                locMat.sourcegen.at(static_cast<size_t>(biasSrcIdx)).ampValues({0.0, ib, ib});
+                if (fluxIsCurrentSource && fluxSrcIdx >= 0) {
+                    locMat.sourcegen.at(static_cast<size_t>(fluxSrcIdx)).ampValues({0.0, phi, phi});
+                } else {
+                    for (const auto& entry : indDevMap) {
+                        auto& ind      = std::get<Inductor>(locMat.components.devices[static_cast<size_t>(entry.first)]);
+                        ind.phiOffset_ = entry.second.first + 2.0 * Constants::PI * entry.second.second * phi;
+                    }
                 }
-            }
 
-            Simulation sim(locInp, locMat);
-            vSurface[static_cast<size_t>(p)] =
-                compute_steady_voltage(sim, locInp.argAnal, posIdx, negIdx, tstep, avgStartFrac, 0.0, false);
+                Simulation sim(locInp, locMat);
+                vSurface[static_cast<size_t>(p)] =
+                    compute_steady_voltage(sim, locInp.argAnal, posIdx, negIdx, tstep, avgStartFrac, 0.0, false);
+            } catch (...) {
+#ifdef _OPENMP
+#pragma omp critical(josim_iv_error)
+#endif
+                if (!pointError) { pointError = std::current_exception(); }
+            }
         }
     }
+    if (pointError) { std::rethrow_exception(pointError); }
 
     // Post-process 1D V(Phi) and 2D Ic(Phi) metrics
     SquidSummary sq;
@@ -1035,29 +1135,39 @@ void IV::setup_squid(const tokens_t& i, Input& iObj) {
 }
 
 std::vector<std::pair<double, double>> IV::generate_iv(double maxC, Input ivInp) {
-    const double                           currentIncrement = (maxC < 25e-6) ? (maxC / 100.0) : 25E-7;
-    double                                 currentCurr      = 0.0;
+    return generate_iv(maxC, (maxC < 25e-6) ? (maxC / 100.0) : 25E-7, std::move(ivInp));
+}
+
+std::vector<std::pair<double, double>> IV::generate_iv(double maxC, double currentIncrement, Input ivInp) {
+    // Up to +Imax, back to 0, down to -Imax and back to 0; each leg ends exactly on its target (upstream 3.x).
+    // A point ramps from the previous leg's end (0 or +-Imax) to its current, from a fresh zero state.
+    auto step_towards = [](double cur, double target, double step) {
+        return (cur < target) ? std::min(cur + step, target) : std::max(cur - step, target);
+    };
     std::vector<std::pair<double, double>> points;
-    while (currentCurr <= maxC) {
-        currentCurr += currentIncrement;
+    double                                 currentCurr = 0.0;
+    while (currentCurr < maxC) {
+        currentCurr = step_towards(currentCurr, maxC, currentIncrement);
         points.emplace_back(0.0, currentCurr);
     }
-    while (currentCurr >= 0) {
-        currentCurr -= currentIncrement;
+    while (currentCurr > 0.0) {
+        currentCurr = step_towards(currentCurr, 0.0, currentIncrement);
         points.emplace_back(maxC, currentCurr);
     }
-    while (currentCurr >= -maxC) {
-        currentCurr -= currentIncrement;
+    while (currentCurr > -maxC) {
+        currentCurr = step_towards(currentCurr, -maxC, currentIncrement);
         points.emplace_back(0.0, currentCurr);
     }
-    while (currentCurr <= 0) {
-        currentCurr += currentIncrement;
+    while (currentCurr < 0.0) {
+        currentCurr = step_towards(currentCurr, 0.0, currentIncrement);
         points.emplace_back(-maxC, currentCurr);
     }
 
     std::vector<std::pair<double, double>> iv_data(points.size());
     const int64_t                          nPts = static_cast<int64_t>(points.size());
+    const double                           tstep = ivInp.transSim.tstep();
 
+    std::exception_ptr pointError;
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
@@ -1066,32 +1176,57 @@ std::vector<std::pair<double, double>> IV::generate_iv(double maxC, Input ivInp)
         locInp.argPar = false;
         locInp.argGpu = false;
         locInp.argMin = true;
-        Matrix locMat;
-        locMat.create_matrix(locInp);
-        const auto baseNz = locMat.nz;
-
 #ifdef _OPENMP
 #pragma omp for schedule(dynamic, 4)
 #endif
         for (int64_t idx = 0; idx < nPts; ++idx) {
-            locMat.nz = baseNz;
-            locInp.transSim.tstep(0.05E-12);
-            locMat.sourcegen.back().ampValues({0.0, points[idx].first, points[idx].second});
-            iv_data[static_cast<size_t>(idx)] = do_simulate(locInp, locMat);
+            try {
+                // The bias source is the last netlist line: PWL(0 0 10P <from> 50P <to>).
+                auto& bias = locInp.netlist.expNetlist.back().first;
+                bias.at(6) = Misc::precise_to_string(points[idx].first);
+                bias.at(8) = Misc::precise_to_string(points[idx].second) + ")";
+                locInp.transSim.tstep(tstep);
+                Matrix locMat;
+                locMat.create_matrix(locInp);
+                iv_data[static_cast<size_t>(idx)] = do_simulate(locInp, locMat);
+            } catch (...) {
+#ifdef _OPENMP
+#pragma omp critical(josim_iv_error)
+#endif
+                if (!pointError) { pointError = std::current_exception(); }
+            }
         }
     }
+    if (pointError) { std::rethrow_exception(pointError); }
     return iv_data;
 }
 
 std::pair<double, double> IV::do_simulate(Input& ivInp, Matrix& ivMat) {
     // Simulate the iv curve
-    Simulation ivSim(ivInp, ivMat);
+    Simulation   ivSim(ivInp, ivMat);
     // Add the results to the stack
-    double&    current  = ivSim.results.xVector.back().value().back();
-    auto&      voltVect = ivSim.results.xVector.front().value();
-    double     voltage  = 0;
-    for (auto i = voltVect.size() / 2; i < voltVect.size(); ++i) { voltage += voltVect.at(i); }
-    voltage = voltage / (voltVect.size() / 2);
+    double       current      = ivMat.sourcegen.back().ampValues().back();
+    auto&        voltVect     = ivSim.results.xVector.front().value();
+    const double averageStart = ivInp.transSim.prstart();
+    if (!std::isfinite(averageStart) || averageStart < 0) {
+        Errors::control_errors(ControlErrors::INVALID_IV_COMMAND, "Invalid IV average start");
+    }
+    // Direct legacy callers with prstart=0 retain the latter-half convention.
+    const size_t start = averageStart == 0
+                                 ? voltVect.size() / 2
+                                 : static_cast<size_t>(std::lower_bound(ivSim.results.timeAxis.begin(),
+                                                                        ivSim.results.timeAxis.end(), averageStart)
+                                                       - ivSim.results.timeAxis.begin());
+    const size_t count   = voltVect.size() - start;
+    double       voltage = 0;
+    if (count < 2) { Errors::control_errors(ControlErrors::INVALID_IV_COMMAND, "IV requires at least two averaging samples"); }
+    for (size_t idx = start; idx < voltVect.size(); ++idx) { voltage += voltVect.at(idx); }
+    voltage /= static_cast<double>(count);
+    if (ivInp.argVerb) {
+        std::cout << "Model IV point: current (A): " << Misc::precise_to_string(current)
+                  << "; effective timestep (s): " << Misc::precise_to_string(ivInp.transSim.tstep())
+                  << "; average samples: " << count << "\n";
+    }
     return std::make_pair(voltage, current);
 }
 
@@ -1104,6 +1239,7 @@ void IV::write_iv(std::vector<std::pair<double, double>>& iv_data, const std::st
         outfile << "V,I\n";
         for (auto i : iv_data) { outfile << i.first << "," << i.second << "\n"; }
         outfile.close();
+        if (!outfile) { Errors::output_errors(OutputErrors::WRITE_FAILED, path.string()); }
     } else {
         Errors::output_errors(OutputErrors::CANNOT_OPEN_FILE, path.string());
     }

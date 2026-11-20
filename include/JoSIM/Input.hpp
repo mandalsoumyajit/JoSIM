@@ -261,6 +261,7 @@ class Input {
     std::optional<OutputFile>                    cli_output_file;
     std::vector<OutputFile>                      output_files;
     std::optional<std::string>                   fileParentPath;
+    std::vector<std::string>                     inputFiles;
     AnalysisType                                                 argAnal;
     int64_t                                                      argVerb;
     bool                                                         argMin;
@@ -322,11 +323,16 @@ class Input {
     std::optional<std::string>                                   eventsFile;
     std::optional<std::pair<std::string, std::optional<double>>> saveStateFile;
     std::optional<std::string>                                   loadStateFile;
+    // Keep only print-grid steps in results (the fork's in-loop decimation). Inputs built from the command line
+    // (josim-cli, libjosim_c) decimate, since only print points reach their output; a library caller building
+    // an Input directly gets every internal step, as upstream documents.
+    bool                                                         argDecimate = false;
 
     Input(AnalysisType at = AnalysisType::Phase, int64_t verb = 0, bool min = false, bool par = false)
         : argAnal(at), argVerb(verb), argMin(min), argPar(par) {};
 
     Input(CliOptions& cli_options) {
+        argDecimate                = true;
         argAnal                    = cli_options.analysis_type;
         argVerb                    = cli_options.verbose;
         argMin                     = cli_options.minimal;
@@ -390,8 +396,10 @@ class Input {
     void                  parse_tokens_lines(std::vector<tokens_t>& fileLines);
     void                  syntax_check_controls(std::vector<tokens_t>& controls);
     void                  parse_options_and_state_controls();
+    void                  ensure_safe_output(const std::string& filename) const;
 
   private:
+    std::vector<std::string> activeIncludes_;
     std::optional<uint64_t> find_seed_option() const;
 };
 } // namespace JoSIM

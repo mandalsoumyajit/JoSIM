@@ -40,18 +40,29 @@ Capacitor::Capacitor(const std::pair<tokens_t, string_o>& s,
                      Spread&                              spread,
                      int64_t&                             bi) {
     double spr = 1.0;
-    for (size_t idx = 4; idx < s.first.size(); ++idx) {
-        const auto& i = s.first.at(idx);
-        if (i.rfind("SPREAD=", 0) == 0) {
-            spr = parse_param(i.substr(7), iObj.parameters, s.second);
-        } else if (i.rfind("IC=", 0) == 0) {
-            icVoltage_ = parse_param(i.substr(3), iObj.parameters, s.second);
-        } else if (i.rfind("V0=", 0) == 0) {
-            icVoltage_ = parse_param(i.substr(3), iObj.parameters, s.second);
-        } else if (i.rfind("PHI0=", 0) == 0) {
-            icPhase_ = parse_param(i.substr(5), iObj.parameters, s.second);
-        } else if (i.rfind("IC_PHI=", 0) == 0) {
-            icPhase_ = parse_param(i.substr(7), iObj.parameters, s.second);
+    // IC= is upstream's initial voltage (needs DST); V0=, PHI0= and IC_PHI= are the fork's .ic-style
+    // initial conditions, applied after startup.
+    const auto attributes = parameter_assignments(s.first, 4);
+    for (const auto& attribute : attributes) {
+        if (attribute.first == "IC") {
+            const double voltage = parse_param(attribute.second, iObj.parameters, s.second);
+            if (!std::isfinite(voltage)) {
+                Errors::invalid_component_errors(ComponentErrors::INVALID_COMPONENT_DECLARATION,
+                    s.first.front() + ": capacitor IC must be finite");
+            }
+            initialVoltage_ = voltage;
+        } else if (attribute.first == "SPREAD") {
+            spr = parse_param(attribute.second, iObj.parameters, s.second);
+        } else if (attribute.first == "V0") {
+            icVoltage_ = parse_param(attribute.second, iObj.parameters, s.second);
+        } else if (attribute.first == "PHI0" || attribute.first == "IC_PHI") {
+            icPhase_ = parse_param(attribute.second, iObj.parameters, s.second);
+        }
+    }
+    if (initialVoltage_) {
+        if (iObj.transSim.startup()) {
+            Errors::invalid_component_errors(ComponentErrors::INVALID_COMPONENT_DECLARATION,
+                s.first.front() + ": capacitor IC requires .TRAN ... DST");
         }
     }
     at_ = iObj.argAnal;
@@ -67,6 +78,10 @@ Capacitor::Capacitor(const std::pair<tokens_t, string_o>& s,
     nominalValue_      = parse_param(s.first.at(3), iObj.parameters, s.second);
     spread_            = spr;
     netlistInfo.value_ = spread.spread_value(nominalValue_, Spread::CAP, spread_);
+    if (initialVoltage_ && (!std::isfinite(netlistInfo.value_) || netlistInfo.value_ <= 0)) {
+        Errors::invalid_component_errors(ComponentErrors::INVALID_COMPONENT_DECLARATION,
+            s.first.front() + ": capacitor IC requires finite positive capacitance");
+    }
     // Set the node configuration type
     indexInfo.nodeConfig_   = ncon;
     // Set current index and increment it

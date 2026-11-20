@@ -53,6 +53,8 @@ class JJ : public BasicComponent {
     int64_t state_   = 0;
     double  h_       = 0.0;
 
+    std::optional<int64_t>  gateIndex_;
+    double                  gatePn1_ = 0.0, gatePn2_ = 0.0;
     int64_t                 variableIndex_ = 0;
     int64_t                 nzBackIndex_   = 0;
     double                  area_          = 1.0;
@@ -72,6 +74,7 @@ class JJ : public BasicComponent {
     double                  cTerm_ = 0.0;
     JoSIM::AnalysisType     at_;
     std::optional<Function> thermalNoise;
+    std::optional<Function> icNoise;
 
     JJ(const std::pair<tokens_t, string_o>& s,
        const NodeConfig&                    ncon,
@@ -91,6 +94,8 @@ class JJ : public BasicComponent {
     void   set_model(const tokens_t& t, const vector_pair_t<Model, string_o>& models, const string_o& subc);
 
     bool   update_value(const double& v);
+    double supercurrent(double phase, double scale = 1.0) const;
+    double conductance() const;
 
     void   step_back() override {
         pn2_ = pn4_;

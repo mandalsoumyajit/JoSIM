@@ -74,7 +74,7 @@ class JJ : public BasicComponent {
     double                  cTerm_ = 0.0;
     JoSIM::AnalysisType     at_;
     std::optional<Function> thermalNoise;
-    std::optional<Function> icNoise;
+    CopyBox<Function>       icNoise; // ICNOISE=, out of line (keeps the junction array compact)
 
     JJ(const std::pair<tokens_t, string_o>& s,
        const NodeConfig&                    ncon,

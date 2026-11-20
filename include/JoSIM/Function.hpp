@@ -4,6 +4,7 @@
 #define JOSIM_FUNCTION_HPP
 
 #include "Input.hpp"
+#include "JoSIM/CopyBox.hpp"
 
 #include <memory>
 #include <optional>
@@ -60,7 +61,7 @@ class Function {
     std::vector<double>        miscValues_;
     size_t                     lastIdx_ = 0;
     std::shared_ptr<void>      cusSpline_;
-    std::optional<PNoiseState> pnoise_;
+    CopyBox<PNoiseState>       pnoise_; // colored-noise state, out of line (keeps Function small)
 
     void                       parse_pwl(const tokens_t& t, const Input& iObj, const string_o& s);
     void                       parse_pulse(const tokens_t& t, const Input& iObj, const string_o& s);

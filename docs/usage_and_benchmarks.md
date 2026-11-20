@@ -431,12 +431,13 @@ josim-cli -A "B2|X3:COUNT=2" -A "B2|X3:TD=100p PER=20p BITS=100000010000" test/e
      L2a 5 4 2p FLUX=0.25
      L2b 5 6 2p FLUX=-0.25
      ```
-2. **Initial Conditions (`.ic`, `--ic`, and Component `PHI0=`, `IC_V=`, `IC=`):**
+2. **Initial Conditions (`.ic`, `--ic`, and Component `PHI0=`, `IC_V=`, `V0=`):**
+   - On a capacitor, `IC=` now has upstream 3.1 semantics (an initial voltage that requires `.tran ... DST`; see [the merge notes](upstream-3.1-merge.md)); use `V0=` for the fork's post-startup initial condition.
    - Set initial node voltages/phases or device states at $t = 0$:
      ```spice
      .ic P(7)=2.8 V(1)=0.5m I(L1)=0.1m
      B3 7 0 jjmod area=1.0 PHI0=2.8 PHIOFF=0.0
-     C1 1 0 1p IC=0.5m
+     C1 1 0 1p V0=0.5m
      ```
 3. **Topological $\beta_L$ Superconducting Loop Auditor (`.check_loops` / `.option checkloops` / `--check-loops[=<file>]`):**
    - Automatically discovers all fundamental superconducting loops in the `L + B` graph, reports $L_{\text{loop}}$, $I_{c,\min}$, $\beta_L = \frac{2\pi L_{\text{loop}} I_{c,\min}}{\Phi_0}$, net flux offset $|\Phi_{\text{offset}}|/\Phi_0$, and loop classification (`DEGENERATE_0L` [$L_{\text{loop}} \approx 0$], `SUB_CRITICAL` [$\beta_L < 0.05$], `NON_STORAGE` [$\beta_L < 0.5\pi$], `JTL_STAGE` [$0.5\pi \le \beta_L \le 1.5\pi$ non-quantizing JTL propagation loop], `STORAGE_QUANT` [$\beta_L > 1.5\pi$ quantizing storage loop], `MULTI_FLUX_TRAP` [$\beta_L > 3\pi$]), and populates `LOOP_COUNT`, `LOOP_STORAGE_COUNT`, `LOOP_DEGENERATE_COUNT`, `BETA_L_<JJ>`, `L_LOOP_<JJ>`, and `FLUX_LOOP_<JJ>` for `.meas` verification:

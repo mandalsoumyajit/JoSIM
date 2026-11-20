@@ -192,7 +192,13 @@ void Netlist::expand_design(param_map& parameters, bool scoped) {
         size_t next = 0;
         size_t first = 0;
         s_map componentOverrides;
+        // No instance parameter anywhere on the path from the main design (fork: lets local models be shared).
+        bool plain = true;
     };
+    // Fork: local models parsed once per subcircuit type for plain instances. Their expressions can only see
+    // global parameters, so every plain instance would parse them to the same values (and parse_model is costly:
+    // a flow deck instances ~100 local models ~700 times).
+    std::unordered_map<std::string, std::vector<Model>> plainTypeModels;
     std::vector<Frame> stack(1);
     expNetlist.clear();
     nodeAliases.clear();
@@ -268,7 +274,18 @@ void Netlist::expand_design(param_map& parameters, bool scoped) {
             }
         }
         parse_parameters(parameters, names);
-        if (scoped) {
+        child.plain = frame.plain && locals == definitions.end() && assignments.empty();
+        if (scoped && child.plain) {
+            auto cached = plainTypeModels.find(type);
+            if (cached == plainTypeModels.end()) {
+                std::vector<std::pair<Model, string_o>> parsed;
+                for (const auto& entry : localModels[type]) { Model::parse_model({entry, child.scope}, parsed, parameters); }
+                std::vector<Model> shared;
+                for (auto& model : parsed) { shared.push_back(std::move(model.first)); }
+                cached = plainTypeModels.emplace(type, std::move(shared)).first;
+            }
+            for (const auto& model : cached->second) { models_new.emplace_back(model, child.scope); }
+        } else if (scoped) {
             for (const auto& entry : localModels[type]) { Model::parse_model({entry, child.scope}, models_new, parameters); }
         }
         for (const auto& entry : parsedModels) {

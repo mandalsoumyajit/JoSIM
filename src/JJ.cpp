@@ -433,48 +433,57 @@ double JJ::supercurrent(double phase, double scale) const {
         }
         return scale * model.ic() * s;
     }
-    double sin2_half_phi = 0.0;
-    for (int harm = 0; harm < (int) harmonics.size(); ++harm) {
-        sin2_half_phi += harmonics.at(harm)
-                         * std::sin((harm + 1) * (phase - model_.phiOff()) / 2.0);
+    int error = 0;
+    const double value = tdep_supercurrent(harmonics.data(), static_cast<int>(harmonics.size()), phase,
+                                           model.phiOff(), model.d(), model.t(), del_, model.rn(), &error);
+    if (error == 1) {
+        Errors::model_errors(ModelErrors::BAD_MODEL_DEFINITION,
+            netlistInfo.label_ + ": D and CPR give a negative square-root argument at this phase");
     }
-    sin2_half_phi  = sin2_half_phi * sin2_half_phi;
-
-    double sin_phi = 0.0;
-    for (int harm = 0; harm < (int) harmonics.size(); ++harm) {
-        sin_phi += harmonics.at(harm) * std::sin((harm + 1) * (phase - model_.phiOff()));
+    if (error == 2) {
+        Errors::model_errors(ModelErrors::BAD_MODEL_DEFINITION,
+            netlistInfo.label_ + ": zero-temperature CPR is singular at this phase");
     }
+    return scale * value;
+}
 
-    const double term = model.d() * sin2_half_phi;
+double JJ::tdep_supercurrent(const double* cpr, int cprLen, double phase, double phiOff, double d, double t,
+                             double del, double rn, int* error) {
+    double sin2_half_phi = 0.0, sin_phi = 0.0;
+    for (int harm = 0; harm < cprLen; ++harm) {
+        sin2_half_phi += cpr[harm] * std::sin((harm + 1) * (phase - phiOff) / 2.0);
+        sin_phi       += cpr[harm] * std::sin((harm + 1) * (phase - phiOff));
+    }
+    sin2_half_phi = sin2_half_phi * sin2_half_phi;
+    const double term = d * sin2_half_phi;
     double radicand = 1.0 - term;
-    if (harmonics.size() == 1) {
-        const double beta = model.d() * harmonics.front() * harmonics.front();
+    if (cprLen == 1) {
+        const double beta = d * cpr[0] * cpr[0];
         if (std::isfinite(beta)) {
-            const double cosine = std::cos((phase - model.phiOff()) / 2.0);
+            const double cosine = std::cos((phase - phiOff) / 2.0);
             // Equivalent form without loss of 1-sin^2 near the zero-T cusp.
             radicand = (1.0 - beta) + beta * cosine * cosine;
         }
     }
     if (!std::isfinite(term)
         || radicand < -8 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(term))) {
-        Errors::model_errors(ModelErrors::BAD_MODEL_DEFINITION,
-            netlistInfo.label_ + ": D and CPR give a negative square-root argument at this phase");
+        if (error) { *error = 1; }
+        return std::numeric_limits<double>::quiet_NaN();
     }
     const double sqrt_part = std::sqrt(std::max(0.0, radicand));
     double ratio;
-    if (model.t() == 0) {
+    if (t == 0) {
         if (sqrt_part <= 8 * std::numeric_limits<double>::epsilon()) {
-            Errors::model_errors(ModelErrors::BAD_MODEL_DEFINITION,
-                netlistInfo.label_ + ": zero-temperature CPR is singular at this phase");
+            if (error) { *error = 2; }
+            return std::numeric_limits<double>::quiet_NaN();
         }
         ratio = 1.0 / sqrt_part;
     } else {
-        const double alpha = del_ / (2.0 * Constants::BOLTZMANN * model.t());
+        const double alpha = del / (2.0 * Constants::BOLTZMANN * t);
         // tanh(alpha*q)/q -> alpha as q -> 0. Avoid 0*infinity at D=1.
         ratio = sqrt_part == 0 ? alpha : std::tanh(alpha * sqrt_part) / sqrt_part;
     }
-    const double pref = ((Constants::PI * del_) / (2.0 * Constants::EV * model_.rn())) * ratio;
-    return scale * (pref * sin_phi);
+    return ((Constants::PI * del) / (2.0 * Constants::EV * rn)) * ratio * sin_phi;
 }
 
 double JJ::conductance() const {

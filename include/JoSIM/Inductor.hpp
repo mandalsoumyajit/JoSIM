@@ -42,6 +42,7 @@ class Inductor : public BasicComponent {
     size_t              selfIndex_ = 0;
 
   public:
+    size_t              self_index() const noexcept { return selfIndex_; }
     double                In2_ = 0.0, In3_ = 0.0, In4_ = 0.0;
     double                nominalValue_ = 0.0;
     double                spread_       = 1.0;

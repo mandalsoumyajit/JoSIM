@@ -671,7 +671,9 @@ static void full_cycle_step_guard(bool thermal) {
     matrix.create_matrix(input);
     find_relevant_traces(input, matrix);
     Simulation simulation(input, matrix);
-    require(input.transSim.tstep() < requested / 2.0, "A full Josephson cycle bypassed timestep reduction");
+    // Fork: a step too coarse for a junction is refined locally (rollback sub-steps) on the requested grid.
+    require(input.transSim.tstep() < requested / 2.0 || simulation.step_halvings() > 0,
+            "A full Josephson cycle bypassed timestep reduction");
     const auto source_index = matrix.components.currentsources.front().sourceIndex_;
     const auto& captured = simulation.results.sourceCurrents.at(source_index).value();
     require(captured.size() == simulation.results.timeAxis.size(), "Retry retained samples from an abandoned run");

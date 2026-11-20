@@ -107,7 +107,6 @@ add_library(
   src/Resistor.cpp
   src/Rng.cpp
   src/Simulation.cpp
-  src/SimulationReference.cpp
   src/Transient.cpp
   src/TransmissionLine.cpp
   src/VCCS.cpp

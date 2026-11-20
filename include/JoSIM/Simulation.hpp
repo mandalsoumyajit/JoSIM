@@ -9,6 +9,7 @@
 #include "JoSIM/LUSolve.hpp"
 #include "JoSIM/Matrix.hpp"
 #include "JoSIM/Misc.hpp"
+#include "JoSIM/Rng.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -465,6 +466,12 @@ struct RollingCheckpoint {
     std::vector<TxScalarState>                 txScalars;
     std::vector<TransmissionLine::TxHistEntry> txHistFlat;
     std::vector<InLoopEventTracker>            eventTrackers;
+    std::vector<double>                        gateHist;   // per junction: gatePn1_, gatePn2_
+    std::vector<double>                        psHist;     // per phase source: pn1_, pn2_
+    std::vector<double>                        nlFlux;     // per nonlinear inductor: previousFlux_
+    bool                                       hasNoise = false;
+    Rng::NoiseStreamState                      noiseStream;
+    std::vector<Function::NoiseSnapshot>       noiseFns;
 };
 
 class Simulation {
@@ -500,9 +507,18 @@ class Simulation {
     bool                hasResistorThermalNoise_ = false;
     bool                hasIndFluxOffset_        = false;
     bool                hasInitialConditions_    = false;
-    // Deck uses devices only upstream 3.x models (GC=/ICNOISE= junctions, ALPHA= inductors, capacitor IC=,
-    // colored noise): it runs on trans_sim_reference.
-    bool                needsMnaOnly_            = false;
+    // Deck uses what only the MNA loop models (GC=/ICNOISE= junctions, ALPHA= inductors, capacitor IC=, noise
+    // waveforms in sources): the nodal, partitioned and GPU solvers are not used.
+    bool                mnaOnly_                 = false;
+    // Some junction has a gate (GC=) or critical-current noise (ICNOISE=); jjScale_ holds this step's scale.
+    bool                jjScaled_                = false;
+    std::vector<double> jjScale_;
+    // Some waveform draws noise (thermal noise, NOISE/PNOISE/FNOISE/ICNOISE): rollback checkpoints keep its state.
+    bool                hasNoiseState_           = false;
+    // A capacitor has IC= (upstream initial state; the run starts from it at t = 0).
+    bool                hasCapacitorIC_          = false;
+    // The matrix this simulation was set up on (its sources are among the noise generators a checkpoint keeps).
+    Matrix*             matrix_                  = nullptr;
     // Startup steps ran before t = 0 in this transient (phase-source histories exist).
     bool                startupRan_              = false;
     // Index of the first simulated step (-startup when startup ran, else 0).
@@ -516,7 +532,9 @@ class Simulation {
     int                 subSteps_                = 1;
     int                 subStepIdx_              = 0;
     bool                capacitorIC_ = false;
+    // Positions in inductors_ of the nonlinear (ALPHA=) inductors, and the CSR index of each one's self term.
     std::vector<int64_t> nonlinearInductors_;
+    std::vector<int64_t> nonlinearNz_;
     int                 nonlinearRetries_ = 0;
     std::string         nonlinearFailure_;
     RollingCheckpoint   ckpt_[2];
@@ -603,19 +621,13 @@ class Simulation {
 
     bool initialize_capacitors(Matrix& mObj);
     void factorize(Matrix& mObj);
-    bool solve_step(Matrix& mObj);
-    // Reference MNA path (SimulationReference.cpp): upstream 3.1's transient loop and step helpers.
-    void trans_sim_reference(Matrix& mObj);
-    void ref_setup_b(Matrix& mObj, int64_t i, double step, double factor = 1);
-    void ref_handle_cs(Matrix& mObj, double& step, const int64_t& i);
-    void ref_handle_resistors(Matrix& mObj, double& step);
-    void ref_handle_inductors(Matrix& mObj, double factor = 1);
-    void ref_handle_capacitors(Matrix& mObj);
-    void ref_handle_jj(Matrix& mObj, int64_t& i, double& step, double factor = 1);
-    void ref_handle_vs(Matrix& mObj, const int64_t& i, double& step, double factor = 1);
-    void ref_handle_ps(Matrix& mObj, const int64_t& i, double& step, double factor = 1);
-    void ref_handle_ccvs(Matrix& mObj);
-    void ref_handle_vccs(Matrix& mObj);
+    // One MNA step's solve: LU solve, junction corrector, and Newton iterations for nonlinear inductors.
+    void solve_step(Matrix& mObj);
+    bool solve_nonlinear(Matrix& mObj);
+    void linearize_inductor(Matrix& mObj, size_t k, double current);
+    void sync_initial_state(Matrix& mObj);
+    double junction_scale(JJ& temp, double step);
+    template <typename Fn> void for_each_noise(Matrix& mObj, Fn&& fn);
     void setup(Input& iObj, Matrix& mObj);
     void apply_initial_conditions(Matrix& mObj);
     void save_nodal_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx);
@@ -686,6 +698,8 @@ class Simulation {
 
     Simulation() = default;
     Simulation(Input& iObj, Matrix& mObj);
+    // Global step halvings plus local rollbacks (a step too coarse for a junction or a nonlinear solve).
+    int64_t      step_halvings() const noexcept { return stepHalvings_; }
     ~Simulation() { free_lu(); }
 
     void         cosim_initialize(Input& iObj, Matrix& mObj);

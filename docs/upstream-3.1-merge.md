@@ -35,13 +35,33 @@ Spectre DPI, ngspice code model), PAT/SFQ sources, nTron/hTron devices and the f
 - **Build.** C++17/C11, pinned SuiteSparse archive, CMake package export (with the OpenMP dependency), upstream's
   regression suites.
 
-## The reference MNA path
+## Upstream devices in the fork's loop
 
-Decks that use what only upstream models -- `GC=` or `ICNOISE=` junctions, `ALPHA=` inductors, capacitor `IC=`,
-PNOISE/FNOISE/ICNOISE sources, NOISE-driven voltage or phase sources, or temperature-dependent junction models
-(`T=`, `TC=`, `D=`) -- run on `trans_sim_reference` (`src/SimulationReference.cpp`): upstream's transient loop and step
-helpers on the device state in the matrix components, with the fork's transmission-line and nanowire handlers. These
-decks do not use the nodal, partitioned, GPU or Monte Carlo paths.
+There is one MNA loop, the fork's (`Simulation::trans_sim`, with rollback sub-steps, print-grid decimation and
+events-only output). Upstream's devices run in it:
+
+- **Gate-controlled and Ic-noise junctions** (`GC=`, `ICNOISE=`): `junction_scale` scales the supercurrent in the
+  junction handler and the corrector; the gate's phase history is checkpointed and rescaled with the sub-steps.
+- **Temperature-dependent junctions** (`T=`, `TC=`, `D=`): one formula, `JJ::tdep_supercurrent` (upstream's
+  zero-temperature and transparent limits), in the MNA, nodal, partitioned and Monte Carlo loops. These decks use the
+  nodal solver again, as in 05f6494. The CUDA kernels keep the fork's form, which differs only at those limits.
+- **Nonlinear inductors** (`ALPHA=`): the branch is in flux form in `handle_inductors`, and `solve_step` runs
+  upstream's damped Newton iteration on those rows after the LU solve. A failed solve asks for a shorter step, which
+  the loop answers with a local rollback (global step reduction when the deck has no junctions).
+- **Capacitor `IC=`** (needs `DST`): `initialize_capacitors` solves the initial state, the loop's device arrays take
+  its histories, and the run starts from it at t = 0.
+- **Noise waveforms in sources** (NOISE, PNOISE, FNOISE, ICNOISE): a phase source differences the samples it applied
+  (a noise waveform cannot be re-sampled at earlier times); identical waveforms are not shared between sources.
+
+The nodal, partitioned and GPU solvers do not model gates, Ic noise, nonlinear inductors, capacitor `IC=` or noise
+waveforms in sources; decks with them run on the MNA loop (as decks with `.ic`, flux offsets or nanowires already
+did). Monte Carlo batches run for them on the serial batch loop, except with capacitor `IC=`.
+
+**Rollback and noise.** A rollback checkpoint keeps the noise stream (`Rng::save_noise`) and every noise
+generator's state (thermal noise, Ic noise, noise sources), so a rolled-back interval redraws the same noise. Before
+this, the generators had already advanced past the checkpoint and extrapolated backwards over the re-simulated
+interval: in a test deck the noise there came out ~25 times too large (rms 22.7 against 0.90 elsewhere; 736e609 and
+earlier). Source samples recorded for output are truncated with the rest of the results on a rollback.
 
 ## NEB
 
@@ -81,6 +101,12 @@ Seeded noise waveforms differ from 05f6494's draw for draw.
 Every deck keeps every switching event; the events-only extractor lists exactly the events in the waveforms. Each
 output has one more row (the corrected grid keeps the last print point). Sample differences are in the last digits
 (Josephson scale). Runs were paired side by side; differences of 1-3 % are within their spread.
+
+Folding the upstream devices into the fork's loop (the commit after 94c5a18) leaves these decks unchanged: on the
+example decks in `test/` and r10forig (nodal, MNA, voltage mode, events-only) and the RL thermal-bath decks, every
+output is byte-identical to 7bbcde7, and r10forig runs in the same time with and without thermal noise (laptop,
+three alternating rounds). Decks that use the upstream devices match 7bbcde7's former reference path to the printed
+precision and run 1-2.5 times faster.
 
 ## Upstream tests adapted to fork behavior
 

@@ -95,6 +95,11 @@ class JJ : public BasicComponent {
 
     bool   update_value(const double& v);
     double supercurrent(double phase, double scale = 1.0) const;
+    // Temperature-dependent (Ambegaokar-Baratoff with transparency D) supercurrent for unit scale; returns NaN
+    // where the model is undefined (negative square-root argument, or the zero-temperature cusp), and sets
+    // *error to 1 or 2 for those cases. Shared by the MNA, nodal and Monte Carlo loops.
+    static double tdep_supercurrent(const double* cpr, int cprLen, double phase, double phiOff, double d, double t,
+                                    double del, double rn, int* error = nullptr);
     double conductance() const;
 
     void   step_back() override {

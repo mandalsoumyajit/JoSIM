@@ -103,6 +103,16 @@ double Rng::normal01_noise() {
     return normal01_(noise(), noise_state_());
 }
 
+void Rng::save_noise(NoiseStreamState& s) {
+    s.engine = noise();
+    s.normal = noise_state_();
+}
+
+void Rng::restore_noise(const NoiseStreamState& s) {
+    noise()        = s.engine;
+    noise_state_() = s.normal;
+}
+
 double Rng::normal_spread(double mean, double sigma) {
     if (sigma == 0.0) { return mean; }
 

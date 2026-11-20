@@ -299,8 +299,8 @@ bool Simulation::initialize_capacitors(Matrix& matrix) {
     };
     for (const auto& device : components.currentsources) {
         inject(device, sources[device.sourceIndex_], slopes[device.sourceIndex_]);
-        if (!results.sourceCurrents.empty() && results.sourceCurrents[device.sourceIndex_]) {
-            results.sourceCurrents[device.sourceIndex_]->push_back(sources[device.sourceIndex_]);
+        if (device.sourceIndex_ < static_cast<int64_t>(lastSrcVal_.size())) {
+            lastSrcVal_[device.sourceIndex_] = sources[device.sourceIndex_];
         }
     }
     const auto resistor = [&](double resistance, int64_t current, int_o positive, int_o negative) {
@@ -546,10 +546,6 @@ bool Simulation::initialize_capacitors(Matrix& matrix) {
             }
         }
     }
-    for (size_t i = 0; i < results.xVector.size(); ++i) {
-        if (results.xVector[i]) { results.xVector[i]->push_back(x_[i]); }
-    }
-    results.timeAxis.push_back(0.0);
     needsLU_ = true;
     return true;
 }

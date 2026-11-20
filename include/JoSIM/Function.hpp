@@ -101,8 +101,26 @@ class Function {
     std::vector<double>&       ampValues() noexcept { return ampValues_; }
     const std::vector<double>& ampValues() const noexcept { return ampValues_; }
     FunctionType               fType() const noexcept { return fType_; }
+    // Noise waveforms draw from the noise stream as time advances: each instance is its own process, and an
+    // earlier time can only be revisited by restoring a snapshot taken there (rollback).
+    bool                       stateful() const noexcept {
+        return fType_ == FunctionType::NOISE || fType_ == FunctionType::PNOISE || fType_ == FunctionType::FNOISE
+               || fType_ == FunctionType::ICNOISE;
+    }
+    struct NoiseSnapshot {
+        std::vector<double> misc;
+        std::vector<double> y;
+    };
+    void                       save_noise(NoiseSnapshot& s) const {
+        s.misc = miscValues_;
+        if (pnoise_) { s.y = pnoise_->y; } else { s.y.clear(); }
+    }
+    void                       restore_noise(const NoiseSnapshot& s) {
+        miscValues_ = s.misc;
+        if (pnoise_) { pnoise_->y = s.y; }
+    }
     bool                       same_waveform_as(const Function& o) const noexcept {
-        return fType_ == o.fType_ && fType_ != FunctionType::NOISE && cusSpline_ == o.cusSpline_
+        return fType_ == o.fType_ && !stateful() && cusSpline_ == o.cusSpline_
                && timeValues_ == o.timeValues_ && ampValues_ == o.ampValues_ && miscValues_ == o.miscValues_;
     }
 

@@ -125,7 +125,7 @@ void Simulation::cosim_initialize(Input& iObj, Matrix& mObj) {
             }
             if (!nonZeroInit) {
                 for (auto& src : mObj.sourcegen) {
-                    if (src.value(-stepSize_) != 0.0 || src.value(0.0) != 0.0) {
+                    if (src.stateful() || src.value(-stepSize_) != 0.0 || src.value(0.0) != 0.0) {
                         nonZeroInit = true;
                         break;
                     }
@@ -138,8 +138,7 @@ void Simulation::cosim_initialize(Input& iObj, Matrix& mObj) {
                 firstStepIdx_ = -startup;
                 for (int64_t i = -startup; i < 0; ++i) {
                     setup_b(mObj, i, i * stepSize_);
-                    solve_lu(mObj);
-                    if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
+                    solve_step(mObj);
                 }
             }
         }
@@ -168,8 +167,7 @@ void Simulation::cosim_initialize(Input& iObj, Matrix& mObj) {
 void Simulation::cosim_step_one(Matrix& mObj, int64_t stepIdx, double stepTime) {
     needsTR_ = false;
     setup_b(mObj, stepIdx, stepTime);
-    solve_lu(mObj);
-    if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
+    solve_step(mObj);
 }
 
 void Simulation::cosim_record_step(const Matrix& mObj, int64_t stepIdx, double stepTime) {
@@ -268,6 +266,7 @@ void Simulation::factorize(Matrix& mObj) {
 
 void Simulation::setup(Input& iObj, Matrix& mObj) {
     // Simulation setup
+    matrix_ = &mObj;
     input_                   = &iObj;
     simSize_                 = iObj.transSim.simsize();
     // Per-step schedules and histories are sized by the step count: refuse an impossible one up front
@@ -485,49 +484,65 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
         gpu_   = false;
     }
 
-    // Devices that only upstream 3.x models run on the reference MNA path (trans_sim_reference), with the
-    // device state in mObj.components: gate-controlled and Ic-noise junctions, nonlinear inductors, capacitor IC=
-    // and colored-noise sources.
-    nonlinearInductors_.clear();
-    nonlinearFailure_ = "junction phase advance or nonlinear convergence";
-    for (auto index : mObj.components.inductorIndices) {
-        if (std::get<Inductor>(mObj.components.devices[index]).alpha_ > 0) { nonlinearInductors_.push_back(index); }
-    }
-    needsMnaOnly_ = !nonlinearInductors_.empty();
+    // Upstream 3.x devices (GC=/ICNOISE= junctions, ALPHA= inductors, capacitor IC=, noise waveforms in sources)
+    // run in the MNA loop below; the nodal, partitioned and GPU solvers do not model them and are not used.
+    jjScaled_ = false;
     for (const auto& jj : jjs_) {
-        if (jj.gateIndex_ || jj.icNoise || jj.model_.tDep()) { needsMnaOnly_ = true; }
+        if (jj.gateIndex_ || jj.icNoise) { jjScaled_ = true; }
     }
+    jjScale_.assign(jjScaled_ ? jjs_.size() : 0, 1.0);
+    nonlinearInductors_.clear();
+    nonlinearNz_.clear();
+    nonlinearFailure_ = "junction phase advance or nonlinear convergence";
+    {
+        // CSR position of each nonlinear inductor's self term: Matrix::create_nz lays out the node connections,
+        // then every device's nonzeros in device order.
+        int64_t offset = 0;
+        for (const auto& row : mObj.nc) { offset += static_cast<int64_t>(row.size()); }
+        std::unordered_map<int64_t, int64_t> selfNz;
+        for (size_t d = 0; d < mObj.components.devices.size(); ++d) {
+            std::visit(
+                    [&](const auto& device) {
+                        if constexpr (std::is_same_v<std::decay_t<decltype(device)>, Inductor>) {
+                            if (device.alpha_ > 0) {
+                                selfNz[static_cast<int64_t>(d)] = offset + static_cast<int64_t>(device.self_index());
+                            }
+                        }
+                        offset += static_cast<int64_t>(device.matrixInfo.nonZeros_.size());
+                    },
+                    mObj.components.devices[d]);
+        }
+        for (size_t k = 0; k < mObj.components.inductorIndices.size(); ++k) {
+            auto found = selfNz.find(mObj.components.inductorIndices[k]);
+            if (found == selfNz.end()) { continue; }
+            if (found->second >= static_cast<int64_t>(mObj.nz.size())
+                || mObj.nz[found->second] != inductors_[k].matrixInfo.nonZeros_.at(inductors_[k].self_index())) {
+                Errors::simulation_errors(SimulationErrors::INVALID_MATRIX, "Nonlinear inductor matrix entry not found");
+            }
+            nonlinearInductors_.push_back(static_cast<int64_t>(k));
+            nonlinearNz_.push_back(found->second);
+        }
+    }
+    hasCapacitorIC_ = false;
     for (const auto& cap : capacitors_) {
-        if (cap.initialVoltage_) { needsMnaOnly_ = true; }
+        if (cap.initialVoltage_) { hasCapacitorIC_ = true; }
     }
+    bool statefulSource = false;
     for (const auto& src : mObj.sourcegen) {
-        const auto type = src.fType();
-        if (type == FunctionType::PNOISE || type == FunctionType::FNOISE || type == FunctionType::ICNOISE) {
-            needsMnaOnly_ = true;
-        }
+        if (src.stateful()) { statefulSource = true; }
     }
-    // Voltage and phase sources difference their own earlier samples (BDF2); the fork re-evaluates the waveform
-    // at earlier times, which a NOISE() source cannot do, so these use upstream's sample histories.
-    for (const auto& vs : vsources_) {
-        if (mObj.sourcegen[vs.sourceIndex_].fType() == FunctionType::NOISE) { needsMnaOnly_ = true; }
+    hasNoiseState_ = hasJJThermalNoise_ || hasResistorThermalNoise_ || statefulSource;
+    for (const auto& jj : jjs_) {
+        if (jj.icNoise) { hasNoiseState_ = true; }
     }
-    for (const auto& ps : psources_) {
-        if (mObj.sourcegen[ps.sourceIndex_].fType() == FunctionType::NOISE) { needsMnaOnly_ = true; }
-    }
-    // An explicit NOISE() source cannot be re-evaluated for output, and only the MNA loop records what it applied.
-    for (const auto& src : mObj.sourcegen) {
-        if (src.fType() == FunctionType::NOISE) {
-            nodal_ = false;
-            gpu_   = false;
-        }
-    }
-    if (needsMnaOnly_) {
+    mnaOnly_ = jjScaled_ || !nonlinearInductors_.empty() || hasCapacitorIC_ || statefulSource;
+    if (mnaOnly_) {
         nodal_ = false;
         gpu_   = false;
-        if (mcRuns_ > 1 || iObj.argMcRuns > 1) {
-            std::cout << "JoSIM: Monte Carlo batches are not available with GC=, ICNOISE=, ALPHA=, capacitor IC= or "
-                         "colored noise; running one trial.\n";
-        }
+    }
+    // The initial state of capacitor IC= is solved for the nominal devices; Monte Carlo trials would start from it.
+    if (hasCapacitorIC_ && (mcRuns_ > 1 || iObj.argMcRuns > 1)) {
+        std::cout << "JoSIM: Monte Carlo batches are not available with capacitor IC=; running one trial.\n";
         mcRuns_ = 1;
     }
 
@@ -541,7 +556,7 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     const bool autoMcEventsOnly = (mcRuns_ > 1) && (iObj.argMargins || iObj.argSens)
                                   && !iObj.cli_output_file.has_value() && iObj.output_files.empty()
                                   && iObj.measurements.empty() && !iObj.argSweep;
-    eventsOnly_ = (iObj.argEventsOnly || autoMcEventsOnly) && !mObj.relevantTraces.empty() && !needsMnaOnly_
+    eventsOnly_ = (iObj.argEventsOnly || autoMcEventsOnly) && !mObj.relevantTraces.empty()
                   && (iObj.transSim.prfirwindow() <= 0.0) && (atyp_ == AnalysisType::Phase) && !gpu_
                   && (mcRuns_ <= 1 || nodal_);
     eventMetrics_  = iObj.argEventMetrics;
@@ -549,7 +564,7 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     keepStep_.clear();
     results.printIndices.clear();
     int64_t reserveSteps = simSize_;
-    if (iObj.argDecimate && !needsMnaOnly_ && iObj.transSim.prfirwindow() <= 0.0
+    if (iObj.argDecimate && iObj.transSim.prfirwindow() <= 0.0
         && (eventsOnly_ || prstart_ > 0.0 || prstep_ > stepSize_ * (1.0 + 1e-9))) {
         bool needsFullHistoryPhase = false;
         bool needsBDF2Lookback     = false;
@@ -677,7 +692,7 @@ void Simulation::setup(Input& iObj, Matrix& mObj) {
     }
 
     init_event_trackers(mObj);
-    if (!hasIndFluxOffset_ && !hasInitialConditions_ && nanowires_.empty() && !needsMnaOnly_) {
+    if (!hasIndFluxOffset_ && !hasInitialConditions_ && nanowires_.empty() && !mnaOnly_) {
         setup_partitions(mObj);
     }
 }
@@ -3749,6 +3764,20 @@ void Simulation::rescale_nodal_timestep(double oldH, double newH, bool hasPrevSt
 #endif
 }
 
+// Every waveform that draws noise, in a fixed order (rollback checkpoints).
+template <typename Fn> void Simulation::for_each_noise(Matrix& mObj, Fn&& fn) {
+    for (auto& src : mObj.sourcegen) {
+        if (src.stateful()) { fn(src); }
+    }
+    for (auto& jj : jjs_) {
+        if (jj.thermalNoise) { fn(jj.thermalNoise.value()); }
+        if (jj.icNoise) { fn(jj.icNoise.value()); }
+    }
+    for (auto& res : resistors_) {
+        if (res.thermalNoise) { fn(res.thermalNoise.value()); }
+    }
+}
+
 void Simulation::save_mna_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx) {
     ckpt.valid     = true;
     ckpt.stepIdx   = stepIdx;
@@ -3841,6 +3870,31 @@ void Simulation::save_mna_checkpoint(RollingCheckpoint& ckpt, int64_t stepIdx) {
         }
     }
     if (!eventTrackers_.empty()) { ckpt.eventTrackers = eventTrackers_; }
+    ckpt.gateHist.clear();
+    if (jjScaled_) {
+        for (const auto& jj : jjs_) {
+            ckpt.gateHist.push_back(jj.gatePn1_);
+            ckpt.gateHist.push_back(jj.gatePn2_);
+        }
+    }
+    ckpt.psHist.clear();
+    for (const auto& ps : psources_) {
+        ckpt.psHist.push_back(ps.pn1_);
+        ckpt.psHist.push_back(ps.pn2_);
+    }
+    ckpt.nlFlux.clear();
+    for (auto k : nonlinearInductors_) { ckpt.nlFlux.push_back(inductors_[k].previousFlux_); }
+    // Noise generators and the noise stream: a rolled-back interval redraws the same noise.
+    ckpt.hasNoise = hasNoiseState_ && matrix_ != nullptr;
+    if (ckpt.hasNoise) {
+        Rng::save_noise(ckpt.noiseStream);
+        size_t n = 0;
+        for_each_noise(*matrix_, [&](Function& fn) {
+            if (ckpt.noiseFns.size() <= n) { ckpt.noiseFns.emplace_back(); }
+            fn.save_noise(ckpt.noiseFns[n++]);
+        });
+        ckpt.noiseFns.resize(n);
+    }
 }
 
 void Simulation::restore_mna_checkpoint(Matrix& mObj, const RollingCheckpoint& ckpt) {
@@ -3960,8 +4014,36 @@ void Simulation::restore_mna_checkpoint(Matrix& mObj, const RollingCheckpoint& c
                 if (vecOpt && vecOpt->size() > ckpt.keptCount) { vecOpt->resize(ckpt.keptCount); }
             }
         }
+        for (auto& vecOpt : results.sourceCurrents) {
+            if (vecOpt && vecOpt->size() > ckpt.keptCount) { vecOpt->resize(ckpt.keptCount); }
+        }
     }
     if (!eventTrackers_.empty()) { eventTrackers_ = ckpt.eventTrackers; }
+    if (ckpt.gateHist.size() == 2 * jjs_.size()) {
+        for (size_t i = 0; i < jjs_.size(); ++i) {
+            jjs_[i].gatePn1_ = ckpt.gateHist[2 * i];
+            jjs_[i].gatePn2_ = ckpt.gateHist[2 * i + 1];
+        }
+    }
+    if (ckpt.psHist.size() == 2 * psources_.size()) {
+        for (size_t i = 0; i < psources_.size(); ++i) {
+            psources_[i].pn1_ = ckpt.psHist[2 * i];
+            psources_[i].pn2_ = ckpt.psHist[2 * i + 1];
+        }
+    }
+    if (ckpt.nlFlux.size() == nonlinearInductors_.size()) {
+        for (size_t j = 0; j < nonlinearInductors_.size(); ++j) {
+            inductors_[nonlinearInductors_[j]].previousFlux_ = ckpt.nlFlux[j];
+        }
+    }
+    if (ckpt.hasNoise) {
+        Rng::restore_noise(ckpt.noiseStream);
+        size_t n = 0;
+        for_each_noise(mObj, [&](Function& fn) {
+            if (n < ckpt.noiseFns.size()) { fn.restore_noise(ckpt.noiseFns[n]); }
+            ++n;
+        });
+    }
     if (stepSize_ != ckpt.stepSize) { rescale_mna_timestep(mObj, stepSize_, ckpt.stepSize, false); }
     subSteps_ = ckpt.subSteps;
     stepSize_ = ckpt.stepSize;
@@ -4058,6 +4140,26 @@ void Simulation::rescale_mna_timestep(Matrix& mObj, double oldH, double newH, bo
                 nw.In4_             = (1.0 - 3.0 * r) * iPrev + 3.0 * r * oldIn2;
             }
         }
+        for (auto& jj : jjs_) {
+            if (!jj.gateIndex_ || atyp_ != AnalysisType::Phase) { continue; }
+            const double g0 = x_[jj.gateIndex_.value()];
+            const double g1 = jj.gatePn1_, g2 = jj.gatePn2_;
+            jj.gatePn1_     = interp_quad(g0, g1, g2, r);
+            jj.gatePn2_     = interp_quad(g0, g1, g2, 2.0 * r);
+        }
+        for (size_t p = 0; p < psources_.size(); ++p) {
+            auto& ps = psources_[p];
+            if (!mObj.sourcegen[ps.sourceIndex_].stateful() && !capacitorIC_) { continue; }
+            ps.pn2_ = (1.0 - r) * ps.pn1_ + r * ps.pn2_;
+        }
+        for (auto k : nonlinearInductors_) {
+            auto&  ind       = inductors_[k];
+            double totalFlux = ind.flux(x_[ind.indexInfo.currentIndex_.value()]);
+            for (const auto& m : ind.get_mutualInductance()) {
+                totalFlux += m.second * x_[inductors_[m.first].indexInfo.currentIndex_.value()];
+            }
+            ind.previousFlux_ = (1.0 - r) * totalFlux + r * ind.previousFlux_;
+        }
         for (auto& cap : capacitors_) {
             const double pn1P = read_node_diff(cap.indexInfo);
             if (atyp_ == AnalysisType::Voltage) {
@@ -4114,6 +4216,10 @@ void Simulation::rescale_mna_timestep(Matrix& mObj, double oldH, double newH, bo
                 if (mObj.ci[k] >= nNodes) { mObj.nz[k] /= r; }
             }
         }
+    }
+    for (size_t j = 0; j < nonlinearInductors_.size(); ++j) {
+        auto& ind = inductors_[nonlinearInductors_[j]];
+        ind.matrixInfo.nonZeros_[ind.self_index()] = mObj.nz[nonlinearNz_[j]];
     }
     for (auto& cap : capacitors_) {
         const double scale = (atyp_ == AnalysisType::Voltage) ? r : (r * r);
@@ -7282,29 +7388,12 @@ void Simulation::trans_sim_mc(Matrix& mObj) {
                                 ic_sin_phi += jj.ic * (jj.cpr[harm] * std::sin((harm + 1) * (jj.phi0 - jj.phiOff)));
                             }
                         }
-                        if (!jj.tDep) {
-                            bPtr[jj.curIdx] = jj.curNzVal
-                                              * (ic_sin_phi - (((2.0 * jj.c) / stepSize_) * jj.vn1)
-                                                 + ((jj.c / (2.0 * stepSize_)) * jj.vn2) + jj.it);
-                        } else {
-                            double sin2_half_phi = 0.0;
-                            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
-                                sin2_half_phi += jj.cpr[harm] * std::sin((harm + 1) * (jj.phi0 - jj.phiOff) / 2.0);
-                            }
-                            sin2_half_phi  = sin2_half_phi * sin2_half_phi;
-                            double sin_phi = 0.0;
-                            for (int32_t harm = 0; harm < jj.cprLen; ++harm) {
-                                sin_phi += jj.cpr[harm] * std::sin((harm + 1) * (jj.phi0 - jj.phiOff));
-                            }
-                            const double sqrt_part = std::sqrt(1.0 - jj.d * sin2_half_phi);
-                            bPtr[jj.curIdx]
-                                    = jj.curNzVal
-                                      * ((((Constants::PI * jj.del) / (2.0 * Constants::EV * jj.rn))
-                                          * (sin_phi / sqrt_part)
-                                          * std::tanh(jj.del / (2.0 * Constants::BOLTZMANN * jj.t) * sqrt_part))
-                                         - (((2.0 * jj.c) / stepSize_) * jj.vn1)
-                                         + ((jj.c / (2.0 * stepSize_)) * jj.vn2) + jj.it);
+                        if (jj.tDep) {
+                            ic_sin_phi = JJ::tdep_supercurrent(jj.cpr, jj.cprLen, jj.phi0, jj.phiOff, jj.d, jj.t, jj.del, jj.rn);
                         }
+                        bPtr[jj.curIdx] = jj.curNzVal
+                                          * (ic_sin_phi - (((2.0 * jj.c) / stepSize_) * jj.vn1)
+                                             + ((jj.c / (2.0 * stepSize_)) * jj.vn2) + jj.it);
                         jj.vn2 = jj.vn1;
                     }
                     if (anyNeedsTR) { break; }
@@ -7927,24 +8016,12 @@ void Simulation::trans_sim_mc_nodal(Matrix& mObj) {
                     }
                 }
                 double bCur = 0.0;
-                if (gj.tDep == 0) {
-                    bCur = gj.curNzVal
-                           * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
-                              + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
-                } else {
-                    double sin2_half_phi = 0.0;
-                    double sin_phi       = 0.0;
-                    for (int harm = 0; harm < gj.cprLen; ++harm) {
-                        sin2_half_phi += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff) / 2.0);
-                        sin_phi       += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff));
-                    }
-                    sin2_half_phi          = sin2_half_phi * sin2_half_phi;
-                    const double sqrt_part = std::sqrt(1.0 - gj.d * sin2_half_phi);
-                    bCur                   = gj.curNzVal
-                           * ((((Constants::PI * gj.del) / (2.0 * Constants::EV * gj.rn)) * (sin_phi / sqrt_part)
-                               * std::tanh(gj.del / (2.0 * Constants::BOLTZMANN * gj.t) * sqrt_part))
-                              - (((2.0 * gj.c) / stepSize_) * vn1) + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                if (gj.tDep != 0) {
+                    ic_sin_phi = JJ::tdep_supercurrent(gj.cpr, gj.cprLen, phi0, gj.phiOff, gj.d, gj.t, gj.del, gj.rn);
                 }
+                bCur = gj.curNzVal
+                       * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
+                          + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
                 if (needTrialB) { trialB[gj.curIdx] = bCur; }
                 gj.vn2            = vn1;
                 const double gCur = -1.0 / gj.curNzVal;
@@ -8859,24 +8936,12 @@ void Simulation::trans_sim_nodal(Matrix& mObj) {
                         }
                     }
                     double bCur = 0.0;
-                    if (gj.tDep == 0) {
-                        bCur = gj.curNzVal
-                               * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
-                                  + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
-                    } else {
-                        double sin2_half_phi = 0.0;
-                        double sin_phi       = 0.0;
-                        for (int harm = 0; harm < gj.cprLen; ++harm) {
-                            sin2_half_phi += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff) / 2.0);
-                            sin_phi       += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff));
-                        }
-                        sin2_half_phi          = sin2_half_phi * sin2_half_phi;
-                        const double sqrt_part = std::sqrt(1.0 - gj.d * sin2_half_phi);
-                        bCur                   = gj.curNzVal
-                               * ((((Constants::PI * gj.del) / (2.0 * Constants::EV * gj.rn)) * (sin_phi / sqrt_part)
-                                   * std::tanh(gj.del / (2.0 * Constants::BOLTZMANN * gj.t) * sqrt_part))
-                                  - (((2.0 * gj.c) / stepSize_) * vn1) + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                    if (gj.tDep != 0) {
+                        ic_sin_phi = JJ::tdep_supercurrent(gj.cpr, gj.cprLen, phi0, gj.phiOff, gj.d, gj.t, gj.del, gj.rn);
                     }
+                    bCur = gj.curNzVal
+                           * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
+                              + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
                     b_[gj.curIdx]     = bCur;
                     gj.vn2            = vn1;
                     const double gCur = -1.0 / gj.curNzVal;
@@ -8957,24 +9022,12 @@ void Simulation::trans_sim_nodal(Matrix& mObj) {
                         }
                     }
                     double bCur = 0.0;
-                    if (gj.tDep == 0) {
-                        bCur = gj.curNzVal
-                               * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
-                                  + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
-                    } else {
-                        double sin2_half_phi = 0.0;
-                        double sin_phi       = 0.0;
-                        for (int harm = 0; harm < gj.cprLen; ++harm) {
-                            sin2_half_phi += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff) / 2.0);
-                            sin_phi       += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff));
-                        }
-                        sin2_half_phi          = sin2_half_phi * sin2_half_phi;
-                        const double sqrt_part = std::sqrt(1.0 - gj.d * sin2_half_phi);
-                        bCur                   = gj.curNzVal
-                               * ((((Constants::PI * gj.del) / (2.0 * Constants::EV * gj.rn)) * (sin_phi / sqrt_part)
-                                   * std::tanh(gj.del / (2.0 * Constants::BOLTZMANN * gj.t) * sqrt_part))
-                                  - (((2.0 * gj.c) / stepSize_) * vn1) + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                    if (gj.tDep != 0) {
+                        ic_sin_phi = JJ::tdep_supercurrent(gj.cpr, gj.cprLen, phi0, gj.phiOff, gj.d, gj.t, gj.del, gj.rn);
                     }
+                    bCur = gj.curNzVal
+                           * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
+                              + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
                     b_[gj.curIdx]     = bCur;
                     gj.vn2            = vn1;
                     const double gCur = -1.0 / gj.curNzVal;
@@ -9674,24 +9727,12 @@ void Simulation::trans_sim_nodal_omp_windowed(Matrix& mObj) {
                         }
                     }
                     double bCur = 0.0;
-                    if (gj.tDep == 0) {
-                        bCur = gj.curNzVal
-                               * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
-                                  + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
-                    } else {
-                        double sin2_half_phi = 0.0;
-                        double sin_phi       = 0.0;
-                        for (int harm = 0; harm < gj.cprLen; ++harm) {
-                            sin2_half_phi += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff) / 2.0);
-                            sin_phi       += gj.cpr[harm] * std::sin((harm + 1) * (phi0 - gj.phiOff));
-                        }
-                        sin2_half_phi          = sin2_half_phi * sin2_half_phi;
-                        const double sqrt_part = std::sqrt(1.0 - gj.d * sin2_half_phi);
-                        bCur                   = gj.curNzVal
-                               * ((((Constants::PI * gj.del) / (2.0 * Constants::EV * gj.rn)) * (sin_phi / sqrt_part)
-                                   * std::tanh(gj.del / (2.0 * Constants::BOLTZMANN * gj.t) * sqrt_part))
-                                  - (((2.0 * gj.c) / stepSize_) * vn1) + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
+                    if (gj.tDep != 0) {
+                        ic_sin_phi = JJ::tdep_supercurrent(gj.cpr, gj.cprLen, phi0, gj.phiOff, gj.d, gj.t, gj.del, gj.rn);
                     }
+                    bCur = gj.curNzVal
+                           * (ic_sin_phi - (((2.0 * gj.c) / stepSize_) * vn1)
+                              + ((gj.c / (2.0 * stepSize_)) * gj.vn2) + gj.it);
                     b_[gj.curIdx]     = bCur;
                     gj.vn2            = vn1;
                     const double gCur = -1.0 / gj.curNzVal;
@@ -10152,30 +10193,13 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
                     }
                     temp.cTerm_ = -(((2.0 * model.c()) / stepSize_) * temp.vn1_)
                                   + ((model.c() / (2.0 * stepSize_)) * temp.vn2_);
-                    if (!model.tDep()) {
-                        b_[temp.indexInfo.currentIndex_.value()]
-                                = (temp.matrixInfo.nonZeros_.back())
-                                  * (ic_sin_phi - (((2.0 * model.c()) / stepSize_) * temp.vn1_)
-                                     + ((model.c() / (2.0 * stepSize_)) * temp.vn2_) + temp.it_);
-                    } else {
-                        double sin2_half_phi = 0.0;
-                        for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                            sin2_half_phi += cpr[harm] * std::sin((harm + 1) * (temp.phi0_ - phiOff) / 2.0);
-                        }
-                        sin2_half_phi  = sin2_half_phi * sin2_half_phi;
-                        double sin_phi = 0.0;
-                        for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                            sin_phi += cpr[harm] * std::sin((harm + 1) * (temp.phi0_ - phiOff));
-                        }
-                        double sqrt_part = std::sqrt(1.0 - model.d() * sin2_half_phi);
-                        b_[temp.indexInfo.currentIndex_.value()]
-                                = (temp.matrixInfo.nonZeros_.back())
-                                  * ((((Constants::PI * temp.del_) / (2.0 * Constants::EV * model.rn()))
-                                      * (sin_phi / sqrt_part)
-                                      * std::tanh(temp.del_ / (2.0 * Constants::BOLTZMANN * model.t()) * sqrt_part))
-                                     - (((2.0 * model.c()) / stepSize_) * temp.vn1_)
-                                     + ((model.c() / (2.0 * stepSize_)) * temp.vn2_) + temp.it_);
+                    if (model.tDep()) {
+                        ic_sin_phi = JJ::tdep_supercurrent(cpr.data(), static_cast<int>(cpr.size()), temp.phi0_, phiOff, model.d(), model.t(), temp.del_, model.rn());
                     }
+                    b_[temp.indexInfo.currentIndex_.value()]
+                            = (temp.matrixInfo.nonZeros_.back())
+                              * (ic_sin_phi - (((2.0 * model.c()) / stepSize_) * temp.vn1_)
+                                 + ((model.c() / (2.0 * stepSize_)) * temp.vn2_) + temp.it_);
                     temp.vn2_ = temp.vn1_;
                 }
                 if (windowNeedsTR) { break; }
@@ -10538,15 +10562,12 @@ void Simulation::trans_sim(Matrix& mObj) {
     b_.assign(std::max(mObj.rp.size(), x_.size()), 0.0);
     startupRan_   = false;
     firstStepIdx_ = 0;
-    if (needsMnaOnly_) {
-        trans_sim_reference(mObj);
-        return;
-    }
+    capacitorIC_  = false;
     if (loadStateFile_.has_value()) {
         load_state(loadStateFile_.value(), mObj);
     } else {
         if (startup_) {
-            bool nonZeroInit = hasJJThermalNoise_ || hasResistorThermalNoise_ || hasIndFluxOffset_;
+            bool nonZeroInit = hasNoiseState_ || hasIndFluxOffset_;
             if (!nonZeroInit) {
                 for (const auto& jj : jjs_) {
                     if (jj.model_.phiOff() != 0.0) {
@@ -10557,7 +10578,7 @@ void Simulation::trans_sim(Matrix& mObj) {
             }
             if (!nonZeroInit) {
                 for (auto& src : mObj.sourcegen) {
-                    if (src.value(-stepSize_) != 0.0 || src.value(0.0) != 0.0) {
+                    if (src.stateful() || src.value(-stepSize_) != 0.0 || src.value(0.0) != 0.0) {
                         nonZeroInit = true;
                         break;
                     }
@@ -10578,8 +10599,8 @@ void Simulation::trans_sim(Matrix& mObj) {
                     setup_b(mObj, i, i * stepSize_);
                     if (needsTR_) { return; }
                     // Solve Ax=b, storing the results in x_
-                    solve_lu(mObj);
-                    if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
+                    solve_step(mObj);
+                    if (needsTR_) { return; }
                     for (auto& history : results.phaseBefore) {
                         const auto   node  = x_[history.first];
                         const double phase = atyp_ == AnalysisType::Phase
@@ -10591,6 +10612,17 @@ void Simulation::trans_sim(Matrix& mObj) {
                         history.second[0] = phase;
                     }
                 }
+            }
+        }
+        // Capacitor IC= (upstream 3.1, needs DST): the run starts from the solved initial state at t = 0.
+        if (hasCapacitorIC_) {
+            const size_t xSize = x_.size();
+            capacitorIC_       = initialize_capacitors(mObj);
+            x_.resize(xSize, 0.0); // the initial state covers the matrix rows; the loop's vector is one longer
+            if (capacitorIC_) {
+                sync_initial_state(mObj);
+                refactor_lu(mObj);
+                needsLU_ = false;
             }
         }
         if (hasInitialConditions_) {
@@ -10606,7 +10638,7 @@ void Simulation::trans_sim(Matrix& mObj) {
         return;
     }
     if (mcRuns_ > 1 && !usePartitions_ && nanowires_.empty() && !hasJJThermalNoise_ && !hasResistorThermalNoise_
-        && correctorIter_ == 0 && !saveStateFile_.has_value()) {
+        && !mnaOnly_ && correctorIter_ == 0 && !saveStateFile_.has_value()) {
         nodal_      = false;
         eventsOnly_ = false;
         setup_partitions(mObj);
@@ -10795,8 +10827,8 @@ void Simulation::trans_sim(Matrix& mObj) {
                 const double step = static_cast<double>(i) * stepSize_;
                 setup_b(mObj, i, step);
                 if (needsTR_) { break; }
-                solve_lu(mObj);
-                if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
+                solve_step(mObj);
+                if (needsTR_) { break; }
                 if (!useDecimation_ || keepStep_[i] != 0) {
                     for (int64_t tIdx = 0; tIdx < nBaseTraces; ++tIdx) {
                         const int64_t globR = traceGlobRows[tIdx];
@@ -10971,7 +11003,8 @@ void Simulation::trans_sim(Matrix& mObj) {
         }
 
         double        step     = static_cast<double>(i) * baseStepSize_;
-        const int64_t subStart = (i == 0) ? (subSteps_ - 1) : 0;
+        // With capacitor IC= the state at t = 0 is the solved initial state (no step is taken there).
+        const int64_t subStart = (i == 0) ? (capacitorIC_ ? subSteps_ : subSteps_ - 1) : 0;
         for (int64_t sub = subStart; sub < subSteps_; ++sub) {
             subStepIdx_ = (i == 0) ? 0 : sub;
             step        = (subSteps_ == 1 || i == 0)
@@ -10983,8 +11016,8 @@ void Simulation::trans_sim(Matrix& mObj) {
             setup_b(mObj, i, step);
             if (needsTR_) { break; }
             // Solve Ax=b, storing the results in x_
-            solve_lu(mObj);
-            if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
+            solve_step(mObj);
+            if (needsTR_) { break; }
         }
         subStepIdx_ = 0;
 
@@ -11046,6 +11079,9 @@ void Simulation::trans_sim(Matrix& mObj) {
                         for (auto& vecOpt : results.xVector) {
                             if (vecOpt && vecOpt->size() > newKeptLen) { vecOpt->resize(newKeptLen); }
                         }
+                    }
+                    for (auto& vecOpt : results.sourceCurrents) {
+                        if (vecOpt && vecOpt->size() > newKeptLen) { vecOpt->resize(newKeptLen); }
                     }
                     subSteps_     = newSubSteps;
                     subStepEndIdx = (rollbackMode_ >= 2 || localRollbacks > 8)
@@ -11153,6 +11189,166 @@ void Simulation::trans_sim(Matrix& mObj) {
     }
 }
 
+void Simulation::solve_step(Matrix& mObj) {
+    solve_lu(mObj);
+    if (correctorIter_ > 0 && !jjs_.empty()) { corrector_jj(mObj); }
+    if (!nonlinearInductors_.empty()) { solve_nonlinear(mObj); }
+}
+
+void Simulation::linearize_inductor(Matrix& mObj, size_t j, double current) {
+    auto& temp = inductors_[nonlinearInductors_[j]];
+    if (temp.linearize(current, stepSize_)) {
+        mObj.nz[nonlinearNz_[j]] = temp.matrixInfo.nonZeros_[temp.self_index()];
+        needsLU_                 = true;
+    }
+}
+
+// Newton iterations on the nonlinear inductor rows (upstream 3.1's solve_step): setup_b sampled the sources and
+// shifted the histories once; only the nonlinear rows and the trial solution change here. A failure asks for a
+// shorter step (needsTR_), which the loop answers with a rollback, or else a global step reduction.
+bool Simulation::solve_nonlinear(Matrix& mObj) {
+    const auto failed = [&](const std::string& message) {
+        nonlinearFailure_ = message;
+        needsTR_          = true;
+        return false;
+    };
+    const double scale    = atyp_ == AnalysisType::Voltage ? 1.5 / stepSize_ : 1.0 / Constants::SIGMA;
+    const auto   evaluate = [&](const std::vector<double>& values, std::vector<double>& residuals,
+                              std::vector<double>* tolerances) {
+        residuals.clear();
+        if (tolerances) { tolerances->clear(); }
+        for (auto k : nonlinearInductors_) {
+            const auto&  device     = inductors_[k];
+            const double current    = values[*device.indexInfo.currentIndex_];
+            const double self       = device.flux(current);
+            const double inductance = device.differential_inductance(current);
+            double node = ((device.indexInfo.posIndex_ ? values[*device.indexInfo.posIndex_] : 0.0)
+                           - (device.indexInfo.negIndex_ ? values[*device.indexInfo.negIndex_] : 0.0));
+            if (atyp_ == AnalysisType::Phase) { node -= device.phiOffset_; }
+            node /= scale;
+            double mutualFlux = 0.0, magnitude = std::abs(node) + std::abs(self) + std::abs(device.fluxHistory_);
+            for (const auto& mutual : device.get_mutualInductance()) {
+                const double flux = mutual.second * values[*inductors_[mutual.first].indexInfo.currentIndex_];
+                mutualFlux += flux;
+                magnitude  += std::abs(flux);
+            }
+            const double residual = node - self - mutualFlux - device.fluxHistory_;
+            if (!std::isfinite(residual) || !std::isfinite(magnitude) || !std::isfinite(scale * inductance)) {
+                return false;
+            }
+            residuals.push_back(residual);
+            if (tolerances) { tolerances->push_back(1e-26 + 1e-12 * magnitude); }
+        }
+        return true;
+    };
+    const auto norm = [](const std::vector<double>& residuals, const std::vector<double>& tolerances) {
+        double maximum = 0.0;
+        for (size_t i = 0; i < residuals.size(); ++i) {
+            maximum = std::max(maximum, std::abs(residuals[i]) / tolerances[i]);
+        }
+        return maximum;
+    };
+    if (!std::all_of(x_.begin(), x_.end(), [](double v) { return std::isfinite(v); })) {
+        return failed("non-finite nonlinear flux or differential inductance");
+    }
+    std::vector<double> trial = x_, next(x_.size()), residuals, tolerances, nextResiduals;
+    for (int iteration = 0; iteration <= 40; ++iteration) {
+        if (!evaluate(trial, residuals, &tolerances)) {
+            return failed("non-finite nonlinear flux or differential inductance");
+        }
+        const double previous = norm(residuals, tolerances);
+        if (previous <= 1.0) {
+            x_ = std::move(trial);
+            return true;
+        }
+        if (iteration == 40) { return failed("nonlinear inductor Newton iteration limit reached"); }
+        for (size_t j = 0; j < nonlinearInductors_.size(); ++j) {
+            auto&         device  = inductors_[nonlinearInductors_[j]];
+            const int64_t row     = *device.indexInfo.currentIndex_;
+            const double  current = trial[row];
+            b_[row] = scale * (device.fluxHistory_ + device.flux(current) - device.differential_inductance(current) * current);
+            if (atyp_ == AnalysisType::Phase) { b_[row] += device.phiOffset_; }
+            if (!std::isfinite(b_[row])) { return failed("non-finite nonlinear inductor linearization"); }
+            linearize_inductor(mObj, j, current);
+        }
+        if (needsLU_) {
+            refactor_lu(mObj);
+            needsLU_ = false;
+        }
+        solve_lu(mObj); // candidate in x_
+        bool   accepted = false;
+        double damping  = 1.0;
+        for (int backtrack = 0; backtrack <= 16; ++backtrack, damping *= 0.5) {
+            for (size_t i = 0; i < next.size(); ++i) { next[i] = (1.0 - damping) * trial[i] + damping * x_[i]; }
+            if (!std::all_of(next.begin(), next.end(), [](double v) { return std::isfinite(v); })) { continue; }
+            if (evaluate(next, nextResiduals, nullptr)) {
+                const double nextNorm = norm(nextResiduals, tolerances);
+                if (nextNorm <= 1.0 || nextNorm < previous * (1.0 - 1e-4 * damping)) {
+                    trial.swap(next);
+                    accepted = true;
+                    break;
+                }
+            }
+        }
+        if (!accepted) { return failed("nonlinear inductor Newton damping did not reduce the flux residual"); }
+    }
+    return failed("nonlinear inductor solve did not converge");
+}
+
+// initialize_capacitors() solves the initial state on the matrix's device objects; the loop's device arrays take
+// the histories it wrote.
+void Simulation::sync_initial_state(Matrix& mObj) {
+    const auto& c = mObj.components;
+    for (size_t k = 0; k < c.capacitorIndices.size(); ++k) {
+        const auto& d     = std::get<Capacitor>(c.devices[c.capacitorIndices[k]]);
+        capacitors_[k].pn2_ = d.pn2_;
+        capacitors_[k].pn3_ = d.pn3_;
+        capacitors_[k].pn4_ = d.pn4_;
+    }
+    for (size_t k = 0; k < c.inductorIndices.size(); ++k) {
+        const auto& d              = std::get<Inductor>(c.devices[c.inductorIndices[k]]);
+        inductors_[k].In2_          = d.In2_;
+        inductors_[k].previousFlux_ = d.previousFlux_;
+    }
+    for (size_t k = 0; k < c.junctionIndices.size(); ++k) {
+        const auto& d = std::get<JJ>(c.devices[c.junctionIndices[k]]);
+        auto&       j = jjs_[k];
+        j.pn2_        = d.pn2_;
+        j.pn3_        = d.pn3_;
+        j.vn2_        = d.vn2_;
+        j.vn3_        = d.vn3_;
+        j.gatePn1_    = d.gatePn1_;
+        j.gatePn2_    = d.gatePn2_;
+        if (j.state_ != d.state_) {
+            j.state_                      = d.state_;
+            j.matrixInfo.nonZeros_.back() = d.matrixInfo.nonZeros_.back();
+            mObj.nz[j.nzBackIndex_]        = j.matrixInfo.nonZeros_.back();
+        }
+    }
+    for (size_t k = 0; k < c.resistorIndices.size(); ++k) {
+        resistors_[k].pn2_ = std::get<Resistor>(c.devices[c.resistorIndices[k]]).pn2_;
+    }
+    for (size_t k = 0; k < c.vsIndices.size(); ++k) {
+        vsources_[k].pn2_ = std::get<VoltageSource>(c.devices[c.vsIndices[k]]).pn2_;
+    }
+    for (size_t k = 0; k < c.psIndices.size(); ++k) {
+        const auto& d     = std::get<PhaseSource>(c.devices[c.psIndices[k]]);
+        psources_[k].pn1_ = d.pn1_;
+        psources_[k].pn2_ = d.pn2_;
+    }
+    for (size_t k = 0; k < c.ccvsIndices.size(); ++k) {
+        ccvss_[k].pn2_ = std::get<CCVS>(c.devices[c.ccvsIndices[k]]).pn2_;
+    }
+    for (size_t k = 0; k < c.vccsIndices.size(); ++k) {
+        vccss_[k].pn2_ = std::get<VCCS>(c.devices[c.vccsIndices[k]]).pn2_;
+    }
+    for (size_t k = 0; k < c.txIndices.size(); ++k) {
+        const auto& d    = std::get<TransmissionLine>(c.devices[c.txIndices[k]]);
+        txlines_[k].n1_1_ = d.n1_1_;
+        txlines_[k].n1_2_ = d.n1_2_;
+    }
+}
+
 void Simulation::reduce_step(Input& iObj, Matrix& mObj) {
     if (fixedStep_) {
         Errors::simulation_errors(SimulationErrors::PHASEGUESS_TOO_LARGE,
@@ -11193,7 +11389,7 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
     const int64_t nInd = (atyp_ == AnalysisType::Voltage) ? static_cast<int64_t>(inductors_.size()) : 0;
     const int64_t nCap = static_cast<int64_t>(capacitors_.size());
     if (parallel_ && !hasJJThermalNoise_ && !hasResistorThermalNoise_ && nanowires_.empty() && factor == 1.0
-        && (nJJ + nRes + nInd * 4 + nCap >= 32768)) {
+        && !jjScaled_ && nonlinearInductors_.empty() && (nJJ + nRes + nInd * 4 + nCap >= 32768)) {
         const int64_t bSize        = static_cast<int64_t>(b_.size());
         const bool    checkPhase   = (static_cast<double>(i) / static_cast<double>(simSize_) > 0.01);
         bool          localNeedsTR = false;
@@ -11273,29 +11469,13 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
                     }
                 }
                 temp.cTerm_ = -(((2 * model.c()) / stepSize_) * temp.vn1_) + ((model.c() / (2.0 * stepSize_)) * temp.vn2_);
-                if (!model.tDep()) {
-                    b_[temp.indexInfo.currentIndex_.value()]
-                            = temp.matrixInfo.nonZeros_.back()
-                              * (ic_sin_phi - (((2 * model.c()) / stepSize_) * temp.vn1_)
-                                 + ((model.c() / (2.0 * stepSize_)) * temp.vn2_) + temp.it_);
-                } else {
-                    double sin2_half_phi = 0.0;
-                    for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                        sin2_half_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff) / 2);
-                    }
-                    sin2_half_phi  = sin2_half_phi * sin2_half_phi;
-                    double sin_phi = 0.0;
-                    for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                        sin_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff));
-                    }
-                    double sqrt_part                         = sqrt(1 - model.d() * sin2_half_phi);
-                    b_[temp.indexInfo.currentIndex_.value()] = temp.matrixInfo.nonZeros_.back()
-                                                               * ((((Constants::PI * temp.del_) / (2 * Constants::EV * model.rn()))
-                                                                   * (sin_phi / sqrt_part)
-                                                                   * tanh(temp.del_ / (2 * Constants::BOLTZMANN * model.t()) * sqrt_part))
-                                                                  - (((2 * model.c()) / stepSize_) * temp.vn1_)
-                                                                  + ((model.c() / (2.0 * stepSize_)) * temp.vn2_) + temp.it_);
+                if (model.tDep()) {
+                    ic_sin_phi = JJ::tdep_supercurrent(cpr.data(), static_cast<int>(cpr.size()), temp.phi0_, phiOff, model.d(), model.t(), temp.del_, model.rn());
                 }
+                b_[temp.indexInfo.currentIndex_.value()]
+                        = temp.matrixInfo.nonZeros_.back()
+                          * (ic_sin_phi - (((2 * model.c()) / stepSize_) * temp.vn1_)
+                             + ((model.c() / (2.0 * stepSize_)) * temp.vn2_) + temp.it_);
                 temp.vn2_ = temp.vn1_;
             }
 
@@ -11361,8 +11541,7 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
                     for (const auto& m : temp.get_mutualInductance()) {
                         const Inductor& mi   = inductors_[m.first];
                         const int64_t   mCur = mi.indexInfo.currentIndex_.value();
-                        const double    mIn2 = (static_cast<int64_t>(m.first) < idx) ? x_[mCur] : mi.In2_;
-                        bVal                += (-((2.0 * m.second) / h) * x_[mCur] + (m.second / (2.0 * h)) * mIn2);
+                        bVal                += (-((2.0 * m.second) / h) * x_[mCur] + (m.second / (2.0 * h)) * mi.In2_);
                     }
                     b_[curIdx] = bVal;
                 }
@@ -11400,17 +11579,18 @@ void Simulation::setup_b(Matrix& mObj, int64_t i, double step, double factor) {
     if (needsTR_) { return; }
     // Handle superconducting nanowires / cryotrons
     handle_nanowires(mObj, i, step, factor);
-    // Re-factorize the LU if any jj or nanowire transitions
-    if (needsLU_) {
-        refactor_lu(mObj);
-        needsLU_ = false;
-    }
     // Handle current sources
     handle_cs(mObj, step, i);
     // Handle resistors
     handle_resistors(mObj, step);
     // Handle inductors
     handle_inductors(mObj, factor);
+    if (needsTR_) { return; }
+    // Re-factorize the LU if any jj, nanowire or nonlinear inductor changed its matrix entry
+    if (needsLU_) {
+        refactor_lu(mObj);
+        needsLU_ = false;
+    }
     // Handle capacitors
     handle_capacitors(mObj);
     // Handle voltage sources
@@ -11533,6 +11713,22 @@ void Simulation::handle_inductors(Matrix& mObj, double factor) {
                 }
             }
         }
+        // Nonlinear branch: sigma dphi = Phi(I) + sum M Im, linearized at the present current (upstream 3.1).
+        for (size_t j = 0; j < nonlinearInductors_.size(); ++j) {
+            auto&         temp    = inductors_[nonlinearInductors_[j]];
+            const int64_t row     = temp.indexInfo.currentIndex_.value();
+            const double  current = x_[row];
+            const double  rhs     = (temp.flux(current) - temp.differential_inductance(current) * current)
+                                   / Constants::SIGMA;
+            if (!std::isfinite(rhs)) {
+                nonlinearFailure_ = temp.netlistInfo.label_ + ": flux or differential inductance exceeds the numerical range";
+                needsTR_          = true;
+                return;
+            }
+            temp.fluxHistory_ = 0.0;
+            b_[row]           = temp.phiOffset_ + rhs;
+            linearize_inductor(mObj, j, current);
+        }
         return;
     }
     const double h = stepSize_ * factor;
@@ -11547,6 +11743,29 @@ void Simulation::handle_inductors(Matrix& mObj, double factor) {
             b_[curIdx]   += (-((2 * m.second) / h) * x_[mi.indexInfo.currentIndex_.value()]
                            + (m.second / (2.0 * h)) * mi.In2_);
         }
+    }
+    // Nonlinear branch: BDF2 on the total flux, Phi(I) linearized at the present current (upstream 3.1).
+    for (size_t j = 0; j < nonlinearInductors_.size(); ++j) {
+        auto&         temp      = inductors_[nonlinearInductors_[j]];
+        const int64_t row       = temp.indexInfo.currentIndex_.value();
+        const double  current   = x_[row];
+        const double  flux      = temp.flux(current);
+        const double  slope     = temp.differential_inductance(current);
+        double        totalFlux = flux;
+        for (const auto& m : temp.get_mutualInductance()) {
+            totalFlux += m.second * x_[inductors_[m.first].indexInfo.currentIndex_.value()];
+        }
+        temp.fluxHistory_  = -(4.0 / 3.0) * totalFlux + (1.0 / 3.0) * temp.previousFlux_;
+        temp.previousFlux_ = totalFlux;
+        const double scale = 1.5 / h;
+        const double rhs   = scale * (temp.fluxHistory_ + flux - slope * current);
+        if (!std::isfinite(rhs) || !std::isfinite(scale * slope)) {
+            nonlinearFailure_ = temp.netlistInfo.label_ + ": flux or differential inductance exceeds the numerical range";
+            needsTR_          = true;
+            return;
+        }
+        b_[row] = rhs;
+        linearize_inductor(mObj, j, current);
     }
     // Shift the current histories only after every branch has read them, so coupled branches all use the same
     // preceding samples (upstream 3.1; the shift used to happen inside the loop above).
@@ -11629,7 +11848,7 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
     const bool    checkPhase = !cosimMode_ && ((double) i / (double) simSize_ > 0.01);
 
 #ifdef _OPENMP
-    if (parallel_ && !hasJJThermalNoise_ && nJJ >= 8192) {
+    if (parallel_ && !hasJJThermalNoise_ && !jjScaled_ && nJJ >= 8192) {
         const int nThreads     = std::min<int>(8, std::min<int>(omp_get_max_threads(), static_cast<int>(nJJ / 4096)));
         bool      localNeedsTR = false;
         bool      localNeedsLU = false;
@@ -11703,31 +11922,13 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
             }
             temp.cTerm_ = -(((2 * model.c()) / (stepSize_)) * temp.vn1_)
                           + ((model.c() / (2.0 * (stepSize_))) * temp.vn2_);
-            if (!model.tDep()) {
-                b_[temp.indexInfo.currentIndex_.value()]
-                        = (temp.matrixInfo.nonZeros_.back())
-                          * (ic_sin_phi - (((2 * model.c()) / (stepSize_)) * temp.vn1_)
-                             + ((model.c() / (2.0 * (stepSize_))) * temp.vn2_) + temp.it_);
-            } else {
-                double sin2_half_phi = 0.0;
-                for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                    sin2_half_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff) / 2);
-                }
-                sin2_half_phi  = sin2_half_phi * sin2_half_phi;
-                double sin_phi = 0.0;
-                for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                    sin_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff));
-                }
-                double sqrt_part                         = sqrt(1 - model.d() * sin2_half_phi);
-                b_[temp.indexInfo.currentIndex_.value()] = (temp.matrixInfo.nonZeros_.back())
-                                                           * (((((Constants::PI * temp.del_) / (2 * Constants::EV * model.rn()))
-                                                                * (sin_phi / sqrt_part)
-                                                                * tanh(temp.del_ / (2 * Constants::BOLTZMANN * model.t())
-                                                                       * sqrt_part))
-                                                               - (((2 * model.c()) / stepSize_) * temp.vn1_)
-                                                               + ((model.c() / (2.0 * stepSize_)) * temp.vn2_)
-                                                               + temp.it_));
+            if (model.tDep()) {
+                ic_sin_phi = JJ::tdep_supercurrent(cpr.data(), static_cast<int>(cpr.size()), temp.phi0_, phiOff, model.d(), model.t(), temp.del_, model.rn());
             }
+            b_[temp.indexInfo.currentIndex_.value()]
+                    = (temp.matrixInfo.nonZeros_.back())
+                      * (ic_sin_phi - (((2 * model.c()) / (stepSize_)) * temp.vn1_)
+                         + ((model.c() / (2.0 * (stepSize_))) * temp.vn2_) + temp.it_);
             temp.vn2_ = temp.vn1_;
         }
         if (localNeedsTR) {
@@ -11829,44 +12030,39 @@ void Simulation::handle_jj(Matrix& mObj, int64_t& i, double& step, double factor
         }
         temp.cTerm_ = -(((2 * model.c()) / (stepSize_)) * temp.vn1_)
                       + ((model.c() / (2.0 * (stepSize_))) * temp.vn2_);
-        if (!model.tDep()) {
-            // -(hR / h + 2RC) * (Ic sin (φ0) - 2C / h Vp1 + C/2h Vp2 + It)
-            b_[temp.indexInfo.currentIndex_.value()]
-                    = (temp.matrixInfo.nonZeros_.back())
-                      * (ic_sin_phi - (((2 * model.c()) / (stepSize_)) * temp.vn1_)
-                         + ((model.c() / (2.0 * (stepSize_))) * temp.vn2_) + temp.it_);
-        } else {
-            double sin2_half_phi = 0.0;
-            for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                sin2_half_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff) / 2);
-            }
-            sin2_half_phi  = sin2_half_phi * sin2_half_phi;
-            double sin_phi = 0.0;
-            for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                sin_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff));
-            }
-            double sqrt_part                            = sqrt(1 - model.d() * sin2_half_phi);
-            b_[temp.indexInfo.currentIndex_.value()] =
-                    // -(hR / h + 2RC) *(
-                    (temp.matrixInfo.nonZeros_.back())
-                    * ((
-                               // (π * Δ / 2 * e * Rn)
-                               ((Constants::PI * temp.del_) / (2 * Constants::EV * model.rn()))
-                               // * (sin(φ0 - φ) / √(1 - D * sin²((φ0 - φ) / 2))
-                               * (sin_phi / sqrt_part)
-                               // * tanh(Δ / (2 * kB * T) * √(1 - D * sin²((φ0 - φ) / 2)))
-                               * tanh(temp.del_ / (2 * Constants::BOLTZMANN * model.t()) * sqrt_part))
-                       // - 2C / h Vp1
-                       - (((2 * model.c()) / stepSize_) * temp.vn1_)
-                       // + C/2h Vp2
-                       + ((model.c() / (2.0 * stepSize_)) * temp.vn2_)
-                       // + It)
-                       + temp.it_);
+        if (model.tDep()) { ic_sin_phi = temp.supercurrent(temp.phi0_); }
+        if (jjScaled_) {
+            jjScale_[idx]  = junction_scale(temp, step);
+            ic_sin_phi    *= jjScale_[idx];
         }
+        // -(hR / h + 2RC) * (Ic sin (φ0) - 2C / h Vp1 + C/2h Vp2 + It)
+        b_[temp.indexInfo.currentIndex_.value()]
+                = (temp.matrixInfo.nonZeros_.back())
+                  * (ic_sin_phi - (((2 * model.c()) / (stepSize_)) * temp.vn1_)
+                     + ((model.c() / (2.0 * (stepSize_))) * temp.vn2_) + temp.it_);
 
         // ---- Final history update (as in your original code) ----
         temp.vn2_ = temp.vn1_;
     }
+}
+
+// Supercurrent scale of a junction for this step (upstream 3.1): a gate-controlled junction (GC=) is suppressed
+// linearly by the gate node's voltage over GWIDTH, and ICNOISE= adds a fractional critical-current fluctuation.
+double Simulation::junction_scale(JJ& temp, double step) {
+    double gateFactor = 1.0;
+    if (temp.gateIndex_) {
+        const double signal  = x_[temp.gateIndex_.value()];
+        double       voltage = signal;
+        if (atyp_ == AnalysisType::Phase) {
+            voltage       = Constants::SIGMA * (3.0 * signal - 4.0 * temp.gatePn1_ + temp.gatePn2_) / (2.0 * stepSize_);
+            temp.gatePn2_ = temp.gatePn1_;
+            temp.gatePn1_ = signal;
+        }
+        gateFactor = std::clamp(1.0 - std::abs(voltage) / temp.model_.gwidth(), 0.0, 1.0);
+    }
+    double dIc = temp.icNoise ? temp.icNoise.value().value(step) : 0.0;
+    if (dIc < -0.99) { dIc = -0.99; }
+    return gateFactor * (1.0 + dIc);
 }
 
 void Simulation::corrector_jj(Matrix& mObj) {
@@ -11915,26 +12111,10 @@ void Simulation::corrector_jj(Matrix& mObj) {
                     ic_sin_phi += ic * (cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff)));
                 }
             }
-            if (!model.tDep()) {
-                b_[temp.indexInfo.currentIndex_.value()]
-                        = (temp.matrixInfo.nonZeros_.back()) * (ic_sin_phi + temp.cTerm_ + temp.it_);
-            } else {
-                double sin2_half_phi = 0.0;
-                for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                    sin2_half_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff) / 2);
-                }
-                sin2_half_phi  = sin2_half_phi * sin2_half_phi;
-                double sin_phi = 0.0;
-                for (int harm = 0; harm < static_cast<int>(cpr.size()); ++harm) {
-                    sin_phi += cpr[harm] * sin((harm + 1) * (temp.phi0_ - phiOff));
-                }
-                double sqrt_part = sqrt(1 - model.d() * sin2_half_phi);
-                b_[temp.indexInfo.currentIndex_.value()]
-                        = (temp.matrixInfo.nonZeros_.back())
-                          * ((((Constants::PI * temp.del_) / (2 * Constants::EV * model.rn())) * (sin_phi / sqrt_part)
-                              * tanh(temp.del_ / (2 * Constants::BOLTZMANN * model.t()) * sqrt_part))
-                             + temp.cTerm_ + temp.it_);
-            }
+            if (model.tDep()) { ic_sin_phi = temp.supercurrent(temp.phi0_); }
+            if (jjScaled_) { ic_sin_phi *= jjScale_[idx]; }
+            b_[temp.indexInfo.currentIndex_.value()]
+                    = (temp.matrixInfo.nonZeros_.back()) * (ic_sin_phi + temp.cTerm_ + temp.it_);
         }
         if (maxDiff <= correctorTol_ && !corrNeedsLU) { break; }
         if (corrNeedsLU) { refactor_lu(mObj); }
@@ -11977,6 +12157,19 @@ void Simulation::handle_ps(Matrix& mObj, const int64_t& i, double& step, double 
     // that step is zero, as in upstream 3.0 (3ec0525); without startup this is the fork's original step count.
     const int64_t totalStep = (i < 0) ? (i - firstStepIdx_) : (-firstStepIdx_ + i * subSteps_ + subStepIdx_);
     for (auto& temp : psources_) {
+        auto& src = mObj.sourcegen[temp.sourceIndex_];
+        if (src.stateful() || capacitorIC_) {
+            // A noise waveform cannot be re-sampled at earlier times, and after capacitor IC= the source's history
+            // before t = 0 is the solved initial state: difference the samples it applied (upstream).
+            const double phase = src.value(step);
+            b_[temp.indexInfo.currentIndex_.value()]
+                    = (atyp_ == AnalysisType::Phase)
+                              ? phase
+                              : (Constants::SIGMA / (stepSize_ * factor)) * (1.5 * phase - 2.0 * temp.pn1_ + 0.5 * temp.pn2_);
+            temp.pn2_ = temp.pn1_;
+            temp.pn1_ = phase;
+            continue;
+        }
         if (atyp_ == AnalysisType::Phase) {
             // φn
             b_[temp.indexInfo.currentIndex_.value()] = mObj.sourcegen[temp.sourceIndex_].value(step);

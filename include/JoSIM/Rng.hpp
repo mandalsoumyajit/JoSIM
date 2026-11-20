@@ -31,6 +31,17 @@ class Rng {
         double spare    = 0.0;
     };
 
+  public:
+    // The noise stream's full state, so a rolled-back interval redraws the same noise.
+    struct NoiseStreamState {
+        std::mt19937_64 engine;
+        BMState         normal;
+    };
+    static void             save_noise(NoiseStreamState& s);
+    static void             restore_noise(const NoiseStreamState& s);
+
+  private:
+
     static BMState&               noise_state_();
     static double                 normal01_(std::mt19937_64& eng, BMState& st);
 

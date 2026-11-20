@@ -65,6 +65,23 @@ Seeded noise waveforms differ from 05f6494's draw for draw.
   histories now carry through startup (upstream 3.0).
 - **Voltage-mode mutual inductors**: coupled branches read the same preceding currents.
 
+## Regression on the flow's bench decks (exxact, one thread, 05f6494 `-n` vs 7bbcde7 `-n`, 2026-11-19)
+
+| Deck | Events | Worst event shift | Wall s, waveforms (05f6494 / merge) | Wall s, events-only | Peak MB, waveforms |
+|---|---:|---:|---|---|---|
+| dff | 9 | 0.000 fs | 0.32 / 0.19 | 0.31 / 0.15 | 13 / 13 |
+| xadd4 | 56 | 0.000 fs | 11.77 / 11.63 | 9.78 / 9.92 | 146 / 149 |
+| r10f1n | 4 | 0.000 fs | 27.45 / 28.20 | 28.66 / 27.92 | 253 / 257 |
+| r10forig | 4 | 0.000 fs | 3.51 / 3.50 | 3.57 / 3.49 | 243 / 247 |
+| r5cal | 211 | 0.001 fs | 82.23 / 84.97 | 83.39 / 83.70 | 209 / 214 |
+| coupler | 12,784 | 0.061 fs | 35.86 / 35.96 | 11.23 / 11.05 | 1404 / 1407 |
+| adder | 11,920 | 0.000 fs | 82.07 / 81.62 | 22.95 / 22.94 | 1719 / 1722 |
+| r12p15 (Q5 macro) | 5,912 | 0.002 fs | 1373.8 / 1385.0 | 1390.3 / 1398.6 | 771 / 775 |
+
+Every deck keeps every switching event; the events-only extractor lists exactly the events in the waveforms. Each
+output has one more row (the corrected grid keeps the last print point). Sample differences are in the last digits
+(Josephson scale). Runs were paired side by side; differences of 1-3 % are within their spread.
+
 ## Upstream tests adapted to fork behavior
 
 - `regression_cli.py`: `-p` is valid (the fork's OpenMP solvers); the help lists more long options; a step too coarse

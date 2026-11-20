@@ -7,6 +7,12 @@
 
 JoSIM was developed under IARPA contract SuperTools (via the U.S. Army Research Office grant W911NF-17-1-0120).
 
+This is an enhanced fork of [`JoeyDelp/JoSIM`](https://github.com/JoeyDelp/JoSIM): upstream JoSIM **3.1.0** plus the
+fork's solvers (nodal, partitioned OpenMP, CUDA, batched Monte Carlo), analyses and co-simulation. `josim-cli -v`
+reports `v3.1.0.<commit>`.
+
+[![Build and test JoSIM](https://github.com/mandalsoumyajit/JoSIM/actions/workflows/build-release.yml/badge.svg?branch=master)](https://github.com/mandalsoumyajit/JoSIM/actions/workflows/build-release.yml)
+
 JoSIM is a SPICE-syntax circuit simulator created to simulate superconducting integrated circuits containing Josephson junctions (`B`), superconducting nanowires/cryotrons (`N`), coupled inductors (`L`, `K`), and passive transmission lines (`T`). It reads a standard SPICE deck, constructs the Modified Nodal Analysis (MNA) or reduced Nodal Admittance system $Ax=b$, and solves it using SuiteSparse KLU on CPU or `cuSolverRF` / warp-parallel kernels on NVIDIA GPUs. JoSIM builds a command-line executable (`josim-cli`), a C++/C shared library (`libjosim` / `libjosim_c`), a Python interface (`pyjosim`), and native SPICE co-simulation adapters (`josim_cosim.cm` for `ngspice`, `libjosim_spectre_dpi.so` for Cadence Spectre, and `josim-cosim-server`).
 
 Referencing: [JoSIM — Superconductor SPICE Simulator](https://ieeexplore.ieee.org/document/8633946/)
@@ -32,6 +38,8 @@ The documentation is organized by workflow so you can jump directly to netlist s
 | [**`cosim/README.md`**](cosim/README.md) | **Co-Simulation Adapters & Example Decks Directory:** Layout and quick-start commands for `cosim/ngspice/examples/`, `cosim/spectre/examples/`, and `cosim/ltspice/examples/`. |
 | [**`docs/gpu_architecture.md`**](docs/gpu_architecture.md) | **Parallel & GPU Solver Architecture:** Mathematical formulation and scaling benchmarks for Windowed PTL Block-Parallel (`-p`, `-g`), Batched Monte Carlo (`-b`), Monolithic `cuSolverRF` (`-g 3`), and Schur-Complement Nodal Admittance (`-n`, `-g 4`). |
 | [**`docs/comp_stamps.md`**](docs/comp_stamps.md) & [**`docs/tech_disc.md`**](docs/tech_disc.md) | **MNA Formulation & Component Stamps:** Detailed derivations of JoSIM's phase-mode and voltage-mode Modified Nodal Analysis stamps and BDF2 integration. |
+| [**`docs/noise_sources.md`**](docs/noise_sources.md), [**`docs/gate_junctions.md`**](docs/gate_junctions.md), [**`docs/model_limits.md`**](docs/model_limits.md) | **Upstream 3.1 guides:** thermal and colored noise (`.neb` is the noise bandwidth), gate-controlled junctions (`GC=`), initial states and model limits (capacitor `IC=`, `ALPHA=` inductors, `BETA_C`). |
+| [**`docs/compatibility.md`**](docs/compatibility.md) & [**`docs/upstream-3.1-merge.md`**](docs/upstream-3.1-merge.md) | **Updating & the 3.1 Merge:** what changed for decks from earlier fork builds, how upstream's devices run in the fork's loop, and the regression, benchmark and coverage results. |
 
 ---
 
@@ -58,14 +66,18 @@ See [**`docs/cosimulation.md`**](docs/cosimulation.md) and [**`cosim/README.md`*
 
 ---
 
-## Inherited Upstream (`v2.7`) vs. New in This Fork (`v2.8`)
+## Upstream Base and the Fork's Additions
 
-This repository is an enhanced fork of [`JoeyDelp/JoSIM`](https://github.com/JoeyDelp/JoSIM) branched from upstream **`v2.7` (commit `02a34ee`)**. It preserves 100% numerical equivalence with upstream `v2.7` while adding the following capabilities (see [**`docs/usage_and_benchmarks.md`**](docs/usage_and_benchmarks.md) for full details):
+This repository branched from upstream **`v2.7` (commit `02a34ee`)** and has merged upstream **`v3.1.0` (commit
+`febd56f`)**. On decks without noise the merge keeps every switching event of the earlier fork builds (worst shift
+0.061 fs on the production bench decks) at the same speed and memory; see [**`docs/upstream-3.1-merge.md`**](docs/upstream-3.1-merge.md)
+and, for changes that can affect existing decks, [**`docs/compatibility.md`**](docs/compatibility.md).
 
-- **Inherited from Upstream `v2.7` (`02a34ee`):**
-  - SPICE netlist parser, RCSJ Josephson junction physics (`RTYPE=0/1`, Haberkorn tunneling, multi-harmonic CPR, `.temp`/`.neb` thermal noise), transmission lines (`T`), mutual inductances (`K`), and controlled sources.
-  - Phase-mode (`-a 1`, default) and Voltage-mode (`-a 0`) Modified Nodal Analysis (MNA) with 2nd-order Gear (BDF2) integration, serial SuiteSparse KLU solve, single-run `.spread`, `.iv`, and ASCII text output (`.csv`, `.dat`, `.raw`).
-- **New in This Fork (`v2.8`):**
+- **From upstream (`v2.7`, then `v3.1.0`):**
+  - SPICE netlist parser, RCSJ Josephson junction physics (`RTYPE=0/1`, Haberkorn tunneling, multi-harmonic CPR, temperature-dependent `T=`/`TC=`/`D=`), transmission lines (`T`), mutual inductances (`K`), and controlled sources.
+  - Phase-mode (`-a 1`, default) and Voltage-mode (`-a 0`) Modified Nodal Analysis (MNA) with 2nd-order Gear (BDF2) integration, SuiteSparse KLU, single-run `.spread`, `.iv`, and ASCII text output (`.csv`, `.dat`, `.raw`).
+  - From 3.0/3.1: thermal noise with `.neb` as the noise bandwidth, colored noise (`PNOISE`, `FNOISE`) and critical-current noise (`ICNOISE=`), gate-controlled junctions (`GC=`), nonlinear inductors (`ALPHA=`), capacitor initial voltages (`IC=` with `.tran ... DST`), per-instance subcircuit parameters, a strict expression evaluator, an exact print grid, and stricter input checks. These devices run in the fork's own MNA loop (with its rollback, decimation and events-only output); the nodal, partitioned and GPU solvers fall back to that loop for the ones they do not model.
+- **Added by the fork:**
   1. **Schur-Complement Nodal Admittance & Fill-Aware Series $R+L$ Chain Elimination (`-n` CPU & `-g 4` GPU, `.option nodal[=1|2|auto]`):** Eliminates internal branch rows (`JJ`, `R`, `C`, uncoupled `L`, `T`, grounded `V`/`P`) *plus* internal degree-2 nodes along series $R+L$, $R+R$, and $L+L$ damping/bias chains into a **2.25x–5.16x smaller** nodal matrix $A_{\text{red}}$ while automatically comparing factored LU fill ($\text{nnz}(L+U)$) to avoid fill growth on heavily mutual-coupled meshes, reconstructing `.print` traces on the fly (**2.2x–3.2x faster** on 1 thread for production macros; **3.1x–4.4x** on 2D JJ grids).
   2. **Per-Partition Nodal PTL Block-Parallel Solver & Short-PTL Coarsening (`-p -n` OpenMP & `-g` CUDA GPU):** Combines Nodal matrix reduction (`-n`) with PTL block-parallel windowing (`-p`), automatically coarsening passive PTL-via islands and ultra-short PTLs ($k < 4$) while decoupling $A_{\text{red}}$ across transmission lines (`T`) and shared Dirichlet supply rails into $P$ tiny independent KLU blocks (e.g. `47,425 -> 9,195` eqns coarsened from `583` to `126` blocks on `adder`, $W = 3 \to 5$, max block `164` eqns; `38,826 -> 9,870` eqns across `464` blocks on `coupler`, max block `30` eqns) and advancing them in parallel across the causal delay window $W = \min_{p_1 \neq p_2}(T_d / \Delta t)$ (**up to `75.3x` OpenMP speedup** and **`21.5x` GPU speedup**), with optional quiescent partition bypass (`.option bypass`).
   3. **Sub-Timestep PTL Lumped $\pi$-Replacement (`.option lumpptl`, `.option minptl`):** Automatically replaces lossless transmission lines whose delay $T_d$ is smaller than a timestep ($T_d < 0.5\Delta t$ by default, e.g. `1 fs` PTL stubs in `r10forig`) with their exact matched lumped $L$-$C$ $\pi$-equivalent ($L_{\text{eq}} = Z_0 T_d$, $C_{\text{port}} = T_d / (2 Z_0)$) before step-size clamping, eliminating artificial $40\times$ global timestep crushing (**`591.3x` speedup vs `v2.6.5` / `79.8x` vs `v2.7` on `r10forig`**).
@@ -84,7 +96,7 @@ This repository is an enhanced fork of [`JoeyDelp/JoSIM`](https://github.com/Joe
 
 *Test Platform: Dual-socket AMD EPYC 7413 (2 × 24 cores / 96 threads), 512 GB RAM, NVIDIA RTX A6000 (48 GB VRAM).*
 
-End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5`, upstream `v2.7` (`02a34ee`), and this fork (`v2.8` with `.npy` output):
+End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5`, upstream `v2.7` (`02a34ee`), and this fork with `.npy` output (measured on fork `05f6494`; the 3.1 merge is within run-to-run spread of it on these decks):
 
 | Deck (Scale & Partitions) | `v2.6.5` (CSV) | `v2.7` (CSV) | **Fork 1T (`-n`)** | **Fork OMP (`-p -n`)** | **Speedup vs `v2.6.5` (`v2.7`)** |
 | :--- | ---: | ---: | ---: | ---: | :---: |
@@ -112,8 +124,8 @@ End-to-end wall-clock runtime (and peak RSS memory) comparing official `v2.6.5`,
 | **Critical Operating Margin Finder & Centering** | `josim-cli -M "@DEVICES|X0" --margin-file=m.csv deck.cir`<br>`josim-cli --sens="@DEVICES CENTER" --sens-file=s.csv deck.cir` | Ranks every device's operating margin (`-M`, `.assert` slots or `-T`) and OAAT sensitivity / centering (`--sens`, `@JJ_IC`) in one batched pass. |
 | **SPICE Co-Simulation (`ngspice` / `LTspice` / `Spectre`)** | `python3 scripts/josim_cosim.py --config job.json`<br>`cosim/spectre/run_spectre_cosim.sh --netlist a.cir --scs b.scs` | **$4.6\times\text{–}37.5\times$ (`ngspice`)** and **$2.1\times\text{–}7.1\times$ (`Spectre 25.1`, 1000-JJ & PTL macros)** faster than Verilog-A `seeqc_jj3.va`. |
 
-- **New CLI Flags (`v2.8`):** `-n` (`--nodal`), `-p` (`--parallel`), `-e [file]` (`--events=`), `-E [spec]` (`--event-metrics=`), `-S <spec>` (`--sweep=`), `-M [spec]` (`--margins=`), `-F <file>` (`--margin-file=`), `-T <tol>` (`--margin-tol=`), `--margin-traces=<spec>`, `--verify-events=<file>`, `-A <spec>` (`--assert=`), `--meas=<spec>`, `--meas-file=<file>`, `--ic=<spec>`, `--check-loops[=<file>]`, `-J [spec]` (`--jitter=`), `--jitter-file=<file>`, `--iv=<spec>`, `--squid=<spec>`, `--sens[=<spec>]`, `--sens-file=<file>`, `-g [1|2|3|4]` (`--gpu=`), `-b <N>` (`--batch=<N>`), `-c [N]` (`--corrector=`), `-f` (`--fixed-step`), and `-o <file.npy|.bin|.rawb>`.
-- **New Netlist `.option` & Controls (`v2.8`):** `.option nodal[=1|2|auto]`, `.option events[=file|all]`, `.option eventsonly[=file]`, `.option eventmetrics[=spec]`, `.option eventpulse`, `.sweep <target[,target2,...]> ...`, `.option sweep=<spec>`, `.option sweepall`, `.margins`, `.option margintraces=<spec>`, `.verify_events`, `.assert` / `.vec`, `.meas` / `.measure`, `.ic`, `.check_loops`, `.jitter` / `.ber`, `.iv` (model/circuit/Shapiro), `.squid` (1D/2D), `.sens` / `.sensitivity`, `.model ... ntron/htron/snspd/nanowire`, `.option lumpptl[=0|1]`, `.option nolumpptl`, `.option minptl=<val>`, `.option rollback[=0|1|2|window|stay]`, `.option norollback`, `.option gpu[=1|2|3|4]`, `.option bypass`, `.option bypasstol=<val>`, `.option mc=<N>`, `.option mcall`, `.option txinterp`, `.option kcutoff=<val>`, `.option corrector=<N>`, `.option fixedstep`, `.option warnstep`, `.savestate`, and `.loadstate`.
+- **The fork's CLI flags:** `-n` (`--nodal`), `-p` (`--parallel`), `-e [file]` (`--events=`), `-E [spec]` (`--event-metrics=`), `-S <spec>` (`--sweep=`), `-M [spec]` (`--margins=`), `-F <file>` (`--margin-file=`), `-T <tol>` (`--margin-tol=`), `--margin-traces=<spec>`, `--verify-events=<file>`, `-A <spec>` (`--assert=`), `--meas=<spec>`, `--meas-file=<file>`, `--ic=<spec>`, `--check-loops[=<file>]`, `-J [spec]` (`--jitter=`), `--jitter-file=<file>`, `--iv=<spec>`, `--squid=<spec>`, `--sens[=<spec>]`, `--sens-file=<file>`, `-g [1|2|3|4]` (`--gpu=`), `-b <N>` (`--batch=<N>`), `-c [N]` (`--corrector=`), `-f` (`--fixed-step`), and `-o <file.npy|.bin|.rawb>`.
+- **The fork's netlist `.option`s & controls:** `.option nodal[=1|2|auto]`, `.option events[=file|all]`, `.option eventsonly[=file]`, `.option eventmetrics[=spec]`, `.option eventpulse`, `.sweep <target[,target2,...]> ...`, `.option sweep=<spec>`, `.option sweepall`, `.margins`, `.option margintraces=<spec>`, `.verify_events`, `.assert` / `.vec`, `.meas` / `.measure`, `.ic`, `.check_loops`, `.jitter` / `.ber`, `.iv` (model/circuit/Shapiro), `.squid` (1D/2D), `.sens` / `.sensitivity`, `.model ... ntron/htron/snspd/nanowire`, `.option lumpptl[=0|1]`, `.option nolumpptl`, `.option minptl=<val>`, `.option rollback[=0|1|2|window|stay]`, `.option norollback`, `.option gpu[=1|2|3|4]`, `.option bypass`, `.option bypasstol=<val>`, `.option mc=<N>`, `.option mcall`, `.option txinterp`, `.option kcutoff=<val>`, `.option corrector=<N>`, `.option fixedstep`, `.option warnstep`, `.savestate`, and `.loadstate`.
 - **Loading Binary & Event Outputs in Python:**
   ```python
   import numpy as np
@@ -130,7 +142,15 @@ For the complete CLI and `.option` reference tables and full benchmark suites ac
 
 ## Changelog
 
-### v2.8 (Enhanced Fork)
+### 3.1 merge (fork `master`, November 2026)
+- **Upstream JoSIM 3.1.0 merged** (`febd56f`): noise sources and NEB as noise bandwidth, gate-controlled and Ic-noise junctions, nonlinear inductors, capacitor `IC=`, temperature-dependent junction limits, per-instance subcircuit parameters, strict expressions, exact print grid, stricter CLI, upstream's regression suites and CI (coverage, documentation, packaging).
+- **One transient loop:** upstream's devices run in the fork's MNA loop; there is no separate solver.
+- **Rollback replays the same noise:** checkpoints keep the noise stream and every noise generator (before, a rollback extrapolated noise backwards over the re-simulated interval).
+- **Fixes:** `-p` with coupled inductors in voltage analysis; `-b` with the corrector, thermal noise or a state file on a partitioned deck.
+- **`regression::fork_modes`:** 25 tests that check every solver mode, output format and analysis against the plain MNA loop; line coverage of the coverage build 60.5 % -> 78.5 %, held by the coverage policy as the fork's reference.
+- **Behaviour changes for existing decks** (exact print grid, last-digit Josephson constant, NEB, capacitor `IC=`/`V0=`, stricter input): [`docs/compatibility.md`](docs/compatibility.md).
+
+### v2.8 (Enhanced Fork, before the 3.1 merge)
 - **Schur-Complement Nodal Admittance & Series $R+L$ Chain Reduction Solver** on CPU (`-n`, `.option nodal`, `-p -n`) and GPU (`-g 4`, `.option gpu=4`), **Quiescent Partition Bypass** (`.option bypass`), and NUMA-aware OpenMP scaling.
 - **Multi-Step Windowed PTL Block-Parallel Solver & Short-PTL Coarsening** for OpenMP CPU (`-p`, `-p -n`) and CUDA GPU (`-g`), plus automatic **Sub-Timestep PTL Lumped $\pi$-Replacement** (`.option lumpptl`, `.option minptl`).
 - **Fully GPU-Resident `cuSolverRF` Monolithic Solver** (`-g 3`, `-g 4`, `.option gpu=3/4`) and **Unified GPU Auto-Dispatcher** (`-g`).

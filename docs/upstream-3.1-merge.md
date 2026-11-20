@@ -1,7 +1,9 @@
 # Upstream JoSIM 3.1.0 merged into the fork
 
-Branch `merge-upstream-3.1.0`: the fork (upstream v2.7 + 34 commits, 05f6494) with the NOISE grid fix (736e609)
-merged with upstream `febd56f` (3.1.0 plus one unreleased commit, 79 commits after v2.7).
+The fork (upstream v2.7 + 34 commits, 05f6494) with the NOISE grid fix (736e609) merged with upstream `febd56f`
+(3.1.0 plus one unreleased commit, 79 commits after v2.7), on branch `merge-upstream-3.1.0` and in `master` since
+2026-11-20. Later commits on it fold upstream's devices into the fork's loop (5c3dcba), fix the manual for strict
+builds, add `regression::fork_modes` with two fixes and the fork's coverage reference, and update the documentation.
 
 ## What stays the fork's
 

@@ -412,7 +412,7 @@ Evaluated across all 6 circuits from the `spec2si-seeqc` benchmark suite (`xadd4
 
 ## 9. Series $R+L$ Elimination, Per-Partition Nodal PTL Solver (`-p -n`), Short-PTL Coarsening, Streaming Binary/Event I/O (`-e`, `-E`), Local Rollback (`.option rollback`), & Batched Sweeps (`.sweep`, `-S`)
 
-Building on the core solver modes, JoSIM `v2.8` includes 7 synergistic algorithmic and architectural enhancements documented in [`ENHANCEMENT_PLAN.md`](https://github.com/mandalsoumyajit/JoSIM/blob/master/ENHANCEMENT_PLAN.md) and [`docs/usage_and_benchmarks.md`](usage_and_benchmarks.md):
+Building on the core solver modes, The JoSIM fork includes 7 synergistic algorithmic and architectural enhancements documented in [`ENHANCEMENT_PLAN.md`](https://github.com/mandalsoumyajit/JoSIM/blob/master/ENHANCEMENT_PLAN.md) and [`docs/usage_and_benchmarks.md`](usage_and_benchmarks.md):
 
 | # | Algorithmic / Architectural Enhancement | Summary & Measured Impact (`2× AMD EPYC 7413, 512 GB RAM, RTX A6000`) |
 | :---: | :--- | :--- |

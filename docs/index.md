@@ -1,12 +1,14 @@
 # JoSIM - Superconducting Circuit Simulator
 
-Developers Manual for v2.8
+Developers manual for the fork ([mandalsoumyajit/JoSIM](https://github.com/mandalsoumyajit/JoSIM)) of upstream
+JoSIM 3.1.0.
 
 ## Project Status
 
-### Testing: v2.8 - Status: [![Build Status](https://joeydelp.visualstudio.com/JoSIM/_apis/build/status/JoSIM-CI-Devel?branchName=testing)](https://joeydelp.visualstudio.com/JoSIM/_build/latest?definitionId=1&branchName=testing)
+[![Build and test JoSIM](https://github.com/mandalsoumyajit/JoSIM/actions/workflows/build-release.yml/badge.svg?branch=master)](https://github.com/mandalsoumyajit/JoSIM/actions/workflows/build-release.yml)
 
-### Stable: v2.8 - Status: [![Build Status](https://joeydelp.visualstudio.com/JoSIM/_apis/build/status/JoeyDelp.JoSIM?branchName=master)](https://joeydelp.visualstudio.com/JoSIM/_build/latest?definitionId=3&branchName=master)
+The version string is `v3.1.0.<commit>` (`josim-cli -v`). Upstream's own manual and releases are at
+[JoeyDelp/JoSIM](https://github.com/JoeyDelp/JoSIM).
 
 ## Introduction
 
@@ -30,12 +32,16 @@ Below is a macro overview of the process performed by JoSIM. This is very basic 
 | [**`cosimulation.md`**](cosimulation.md) | **Superconducting / Semiconducting SPICE Co-Simulation & Python/C API:** Architecture block diagram, mathematical formulation, `pyjosim` / `libjosim_c` API, `ngspice` XSPICE, Cadence Spectre `CDS_VA_DPI`, `LTspice` Branin/PWL coordinators, and complete runnable example decks. |
 | [**`gpu_architecture.md`**](gpu_architecture.md) | **Parallel & GPU Solver Architecture:** Mathematical formulation and scaling benchmarks for Windowed PTL Block-Parallel (`-p`, `-g`), Batched Monte Carlo (`-b`), Monolithic `cuSolverRF` (`-g 3`), and Schur-Complement Nodal Admittance (`-n`, `-g 4`). |
 | [**`comp_stamps.md`**](comp_stamps.md) & [**`tech_disc.md`**](tech_disc.md) | **MNA Formulation & Component Stamps:** Detailed derivations of JoSIM's phase-mode and voltage-mode Modified Nodal Analysis stamps and BDF2 integration. |
+| [**`noise_sources.md`**](noise_sources.md), [**`gate_junctions.md`**](gate_junctions.md), [**`model_limits.md`**](model_limits.md), [**`squid_noise.md`**](squid_noise.md), [**`sweeps.md`**](sweeps.md) | **Upstream 3.1 guides:** thermal and colored noise (`.neb` as noise bandwidth), gate-controlled junctions, initial states and model limits (capacitor `IC=`, `ALPHA=` inductors, `BETA_C`), SQUID noise, and the circuit-sweep helper. |
+| [**`compatibility.md`**](compatibility.md) & [**`upstream-3.1-merge.md`**](upstream-3.1-merge.md) | **Updating and the 3.1 merge:** what changed for decks from earlier fork builds and from upstream 3.0, how upstream's devices run in the fork's loop, NEB, and the regression and coverage results. |
 
-## Inherited Upstream (`v2.7`) vs. New in This Fork (`v2.8`)
+## Upstream Base and the Fork's Additions
 
-This repository is an enhanced fork branched from upstream **`JoeyDelp/JoSIM` `v2.7` (commit `02a34ee`)**:
-- **Inherited from Upstream (`v2.7`):** Standard SPICE netlist syntax, RCSJ Josephson junction models (`RTYPE=0` and `RTYPE=1`, Haberkorn tunneling, multi-harmonic CPR, thermal noise `.temp`/`.neb`), Phase (`-a 1`) and Voltage (`-a 0`) Modified Nodal Analysis (MNA) with 2nd-order Gear (BDF2) integration, serial SuiteSparse KLU / SuperLU solving, and ASCII output formats (`.csv`, `.dat`, `.raw`).
-- **New in This Fork (`v2.8`):**
+This repository is an enhanced fork of upstream **`JoeyDelp/JoSIM`**, branched from `v2.7` (commit `02a34ee`) and
+merged with `v3.1.0` (commit `febd56f`); [Merging Upstream 3.1 into the Fork](upstream-3.1-merge.md) lists what came in
+and what changed for existing decks:
+- **From upstream:** Standard SPICE netlist syntax, RCSJ Josephson junction models (`RTYPE=0` and `RTYPE=1`, Haberkorn tunneling, multi-harmonic CPR, temperature-dependent `T=`/`TC=`/`D=`), thermal and colored noise (`.temp`/`.neb`, `NOISE`, `PNOISE`, `FNOISE`, `ICNOISE=`; [noise guide](noise_sources.md)), gate-controlled junctions (`GC=`; [guide](gate_junctions.md)), nonlinear inductors (`ALPHA=`) and capacitor initial voltages (`IC=`; [initial states](model_limits.md)), per-instance subcircuit parameters, Phase (`-a 1`) and Voltage (`-a 0`) Modified Nodal Analysis (MNA) with 2nd-order Gear (BDF2) integration, SuiteSparse KLU solving, and ASCII output formats (`.csv`, `.dat`, `.raw`). Upstream's devices run in the fork's own MNA loop.
+- **Added by the fork:**
   1. **Core Single-Thread & Memory Optimizations:** $O(1)$ hash-map lookups (`deviceMap`, `csMap`), in-place CSR updates + `klu_l_refactor` on `RTYPE=1` switching, self-contained PTL circular ring buffers (`hist_`), and in-loop `PRSTART`/`PRSTEP` decimation (**1.5x–3.4x faster single-thread MNA** and **2x–17.6x lower peak RAM**).
   2. **Multi-Step Windowed PTL Block-Parallel Solver (`-p` OpenMP & `-g` CUDA GPU):** Exact causal lookahead windowing across PTLs and independent channels (**up to `75.3x` OpenMP speedup** and **`21.47x` GPU speedup**).
   3. **Batched Monte Carlo (`.spread`) & Deterministic Parameter/Margin Sweep (`.sweep`, `-S`) Solver (`-b <N>`, `.option mc=<N>`, `.option mcall`):** Simultaneous multi-trial fabrication yield and parameter sweep execution with Welford ensemble statistics (**up to `83.7x` OpenMP speedup** and **`19.65x` GPU speedup**).
@@ -69,10 +75,9 @@ The JoSIM repository has the following layout. A quick description shows the pur
 
 ## Getting started
 
-Download and extract the archive for your operating system and architecture from
-[GitHub Releases](https://github.com/JoeyDelp/JoSIM/releases). The executable is
-in `bin/`. Add that directory to your `PATH`, or invoke the executable by its
-full path. The archive includes the C++ library and headers.
+This fork is built from source (below, or [Developing JoSIM](DEVELOPMENT.md)); clone
+`https://github.com/mandalsoumyajit/JoSIM.git`. Upstream's prebuilt archives (without the fork's solvers) are on
+[GitHub Releases](https://github.com/JoeyDelp/JoSIM/releases); their executable is in `bin/`.
 
 For example, from the repository root with a local build:
 
@@ -127,7 +132,7 @@ We are now ready to compile JoSIM
 JoSIM source can be directly downloaded from the repository as a compressed *.tar.gz* file or by cloning the repository. In either case, navigate to a directory where compilation will take place and extract the tarball or execute:
 
 ```bash
-git clone https://github.com/JoeyDelp/JoSIM.git
+git clone https://github.com/mandalsoumyajit/JoSIM.git
 cd JoSIM
 ```
 

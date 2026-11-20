@@ -27,9 +27,12 @@ cmake -S . -B build/dev -C build/dependencies/sources.cmake
 `sources.cmake` contains absolute paths. Regenerate it if the dependency
 directory is moved to another machine or location.
 
-The old SuperLU and OpenMP options are no longer supported. `SLU=ON` and
-`USING_OPENMP=ON` produce configuration errors. Independent simulations can
-be run in separate processes.
+SuperLU is no longer supported: `SLU=ON` produces a configuration error. The fork's OpenMP solvers build with
+`-DUSING_OPENMP=ON` (`-p`, `-p -n`, batched Monte Carlo) and its CUDA solvers with `-DUSING_CUDA=ON` (`-g`).
+
+The fork's own paths are tested by `regression::fork_modes` (`test/regression_fork_modes.py`), which checks each
+solver mode, output format and analysis against the plain MNA loop. Run it against an OpenMP build too: CI's coverage
+build has no OpenMP, so only an OpenMP build exercises the `-p` windowed loops.
 
 ## Install the library
 

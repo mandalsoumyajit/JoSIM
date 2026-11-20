@@ -1,6 +1,6 @@
 # Superconducting / Semiconducting SPICE Co-Simulation & In-Memory Python/C API
 
-JoSIM (`v2.8`) includes a modular **superconducting/semiconducting co-simulation framework** and an **in-memory C/Python API (`libjosim_c` / `pyjosim`)** for simulating hybrid cryogenic circuits that combine superconducting subsystems (**JoSIM**: RSFQ, AQFP, dc-SQUIDs, SNSPDs, and electrothermal `nTron`/`hTron` nanowires) with semiconducting Cryo-CMOS / SiGe / III-V circuits in **`ngspice`**, **ADI `LTspice`**, and **Cadence Spectre / APS / Spectre X**.
+The JoSIM fork includes a modular **superconducting/semiconducting co-simulation framework** and an **in-memory C/Python API (`libjosim_c` / `pyjosim`)** for simulating hybrid cryogenic circuits that combine superconducting subsystems (**JoSIM**: RSFQ, AQFP, dc-SQUIDs, SNSPDs, and electrothermal `nTron`/`hTron` nanowires) with semiconducting Cryo-CMOS / SiGe / III-V circuits in **`ngspice`**, **ADI `LTspice`**, and **Cadence Spectre / APS / Spectre X**.
 
 ---
 

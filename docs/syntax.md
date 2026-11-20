@@ -64,7 +64,7 @@ timestep floor and classical thermal-noise assumptions.
 
 The value of an inductor is in Henry.
 
-Optional static flux-bias and initial-condition modifiers (*[New in v2.8 Fork]*):
+Optional static flux-bias and initial-condition modifiers (*[Fork]*):
 - **`flux=<val>`** or **`phi0=<val>`**: Applies a static external magnetic flux offset across the inductor in units of $\Phi_0$ ($\Delta\phi_{\text{off}} = 2\pi \cdot \text{val}$ radians, equivalent to trapped flux or an inductively coupled DC flux bias without adding extra current source or `K` branches).
 - **`phi=<val>`**: Applies a static phase offset directly in radians.
 - **`ic=<val>`**: Sets an initial inductor branch current (in Amperes) at $t = 0$.
@@ -77,10 +77,13 @@ mutual coupling and examples.
 
 ### Capacitor
 
-**C**Label&emsp;$N^{+}$&emsp;$N^{-}$&emsp;**VALUE**&emsp;[ic=<**INITIAL_VOLTAGE**>]&emsp;[spread=<**SPREAD**>]
-**C**Label&emsp;$N^{+}$&emsp;$N^{-}$&emsp;**VALUE**&emsp;[**IC=**$V_0$]
+**C**Label&emsp;$N^{+}$&emsp;$N^{-}$&emsp;**VALUE**&emsp;[**IC=**$V_0$]&emsp;[v0=<**INITIAL_VOLTAGE**> | phi0=<**INITIAL_PHASE_RAD**>]&emsp;[spread=<**SPREAD**>]
 
-The value of a capacitor is in Farad. If **`ic=<val>`** is provided, the capacitor voltage is initialized to `<val>` Volts at $t = 0$.
+The value of a capacitor is in Farad.
+
+*[Fork]* **`v0=<val>`** sets the capacitor voltage to `<val>` volts at $t = 0$ (a node initial condition, like `.ic`;
+no `DST` needed); **`phi0=<rad>`** (alias `ic_phi=`) sets its phase. Fork builds before the 3.1 merge read `ic=` this
+way; `ic=` now has upstream's meaning below.
 
 `IC=` specifies the signed terminal voltage at t=0, in volts. It accepts
 parameter expressions and requires `.TRAN ... DST` and positive capacitance.
@@ -90,9 +93,10 @@ Source builds after 3.1.0 also support phase and linear controlled sources. See 
 
 ### Josephson Junction (JJ)
 
-**B**Label&emsp;$N^{+}$&emsp;$N^{-}$&emsp;*<PhaseNode\>*&emsp;**MODEL**&emsp;[area=<**AREA**\>]&emsp;[ic=<**IC**>]&emsp;[phi0=<**INIT_PHASE_RAD**>]&emsp;[phioff=<**PHASE_OFFSET_RAD**>]&emsp;[temp=<**TEMP**>]&emsp;[neb=<**FREQ**>]&emsp;[spread=<**SPREAD**>]
+**B**Label&emsp;$N^{+}$&emsp;$N^{-}$&emsp;*<PhaseNode\>*&emsp;**MODEL**&emsp;[area=<**AREA**\>]&emsp;[ic=<**IC**>]&emsp;[phi0=<**INIT_PHASE_RAD**>]&emsp;[phioff=<**PHASE_OFFSET_RAD**>]&emsp;[temp=<**TEMP**>]&emsp;[neb=<**FREQ**>]&emsp;[spread=<**SPREAD**>]&emsp;[gc=<**GATE_NODE**>]&emsp;[icnoise=<**PNOISE(...)**>]
 
-A Josephson junction has two electrical terminals. An optional third field is
+A Josephson junction has two electrical terminals. `icnoise=` adds a fractional critical-current fluctuation from a
+noise waveform (see the [noise guide](noise_sources.md)). An optional third field is
 normally an unused WRspice phase-node placeholder. A model explicitly specifying
 `GWIDTH` can instead use it as a gate, or use the explicit `GC=node` field. See
 the [gate-controlled junction guide](gate_junctions.md) for unambiguous syntax
@@ -152,7 +156,7 @@ By setting the **PHI** parameter of the model, the phase value is persistantly s
 
 The **CPR** parameter alters each individual harmonic of the junction supercurrent. It can either be a singular value or an array of *n* values encapsulated with curly braces. i.e *CPR={0.9, 0.1}* to set the current phase relationship to the following $I = I_C(0.9\sin(\phi) + 0.1\sin(2\phi))$. 
 
-### Superconducting Nanowire / Cryotron (`N` — `nTron`, `hTron`, `SNSPD`) — *[New in v2.8 Fork]*
+### Superconducting Nanowire / Cryotron (`N` — `nTron`, `hTron`, `SNSPD`) — *[Fork]*
 
 **N**Label&emsp;$N_{\text{drain}}$&emsp;$N_{\text{source}}$&emsp;[$N_{\text{gate}+}$&emsp;[$N_{\text{gate}-}$]]&emsp;**MODEL**&emsp;[area=<**AREA**>]&emsp;[ic=<**IC0**>]&emsp;[ig=<**IG0**>]&emsp;[ir=<**IR**>]&emsp;[rn=<**RN**>]&emsp;[l=<**LKIN**>]&emsp;[lg=<**LG**>]&emsp;[rg=<**RG**>]&emsp;[tau=<**TAU_TH**>]&emsp;[tau_hs=<**TAU_HS**>]&emsp;[alpha=<**ALPHA**>]&emsp;[gate=<**BRANCH_OR_ISRC**>]
 
@@ -185,7 +189,7 @@ Probing: `V(N1)`, `I(N1)`, `P(N1)` probe the nanowire channel; `I(N1|G)` or `I(N
 
 **INTERP** (optional, `1`, `TRUE`, or `YES`) enables linear fractional-step interpolation on this transmission line when **TD** is not an integer multiple of the simulation timestep $T_{STEP}$. Fractional delay interpolation can also be enabled globally for all transmission lines in the netlist using `.option txinterp` (or `.option fractx`). When disabled (the default), $\text{TD} / T_{STEP}$ is rounded to the nearest integer step count.
 
-**Lossy Wave Attenuation Parameters** (*[New in v2.8 Fork]*):
+**Lossy Wave Attenuation Parameters** (*[Fork]*):
 - **`db=<val>`** (or `loss_db=<val>`, `atten_db=<val>`): One-way wave attenuation in decibels ($\gamma = 10^{-|\text{val}|/20}$).
 - **`loss=<frac>`**: Fractional one-way amplitude loss ($\gamma = 1 - \text{frac}$).
 - **`atten=<val>`** (or `gamma=<val>`, `gain=<val>`): Direct one-way wave transmission factor ($\gamma \in [0, 1]$).
@@ -397,7 +401,7 @@ Notes:
 - The final value is held constant after the last timestep \(T_N\).
 - Duplicate or non-increasing time values are invalid and may result in errors.
 
-#### Digital Bit-Stream Pattern (`PAT`) — *[New in v2.8 Fork]*
+#### Digital Bit-Stream Pattern (`PAT`) — *[Fork]*
 
 **pat(**$V_0$&emsp;$V_1$&emsp;$T_D$&emsp;$T_R$&emsp;$T_F$&emsp;[*PW*]&emsp;*PER*&emsp;*PATTERN*&emsp;[RZ | NRZ]&emsp;[r=<**REPEAT**>]&emsp;[rb=<**START_BIT**>]**)**
 
@@ -406,7 +410,7 @@ Generates a Return-to-Zero (`RZ`, when `PW < PER` or `RZ` is specified) or Non-R
 - **`r=<N>`**: Number of times to repeat the pattern (`-1` or `INF` repeats indefinitely; default `1`).
 - **`rb=<idx>`**: 1-based bit index at which repeating begins (default `1`).
 
-#### Flux-Quantum Pulse-Train (`SFQ`) — *[New in v2.8 Fork]*
+#### Flux-Quantum Pulse-Train (`SFQ`) — *[Fork]*
 
 **sfq(**[$T_D$&emsp;[*PER*&emsp;[*FWHM*&emsp;[*PATTERN_OR_COUNT*]]]]&emsp;[times=<$t_1,t_2,\dots$>]&emsp;[amp=<**VAL**>]&emsp;[phi0=<**MULT**>]&emsp;[r=<**REPEAT**>]**)**
 
@@ -549,7 +553,7 @@ An example:
 
 If an inductor has a value of *2pH*, this is its nominal value. If a local spread of *0.2* is specified this means a random value can be chosen anywhere between *1.6pH* and *2.4pH*. If global inductor specific spread is specified as *0.3* and the local spread is not defined, the value can be anything within the range *1.4pH -  2.6pH*. Similarly if the global spread is defined as *0.5* then the value each time the simulation is run can be anywhere between *1pH* and *3pH*.
 
-#### Batched Monte Carlo Execution (`-b <N>`, `.option mc=<N>`, `.spread ... runs=<N>`) — *[New in v2.8 Fork]*
+#### Batched Monte Carlo Execution (`-b <N>`, `.option mc=<N>`, `.spread ... runs=<N>`) — *[Fork]*
 
 When `N > 1` Monte Carlo trials are requested via `-b <N>` (`--batch=<N>`), `.option mc=<N>` (`.option batch=<N>`), or `.spread ... runs=<N>`, JoSIM parses the netlist and performs symbolic graph partitioning **only once**, then executes all `N` independent fabrication-yield trials simultaneously in a single invocation using either:
 - **Multi-Core OpenMP (`-p` / `--parallel`)**: Distributes independent Monte Carlo trials and circuit partitions across CPU threads using deterministic per-trial seeds (`baseSeed ^ (b * 0x9E3779B97F4A7C15ULL)`).
@@ -563,7 +567,7 @@ By default, batched Monte Carlo outputs 4 ensemble statistics traces per request
 
 If `.option mcall` is specified, individual per-trial waveforms `<Trace>_MC0`, `<Trace>_MC1`, ..., `<Trace>_MC{N-1}` are also appended to the output file. In addition, a **Monte Carlo Robustness Summary** table is printed to standard output at the end of the run.
 
-### Deterministic Parameter & Margin Sweeps (`.sweep`) — *[New in v2.8 Fork]*
+### Deterministic Parameter & Margin Sweeps (`.sweep`) — *[Fork]*
 
 **.sweep**&emsp;*Target[,Target2,...]*&emsp;[*LIN | MARGIN | LIST*]&emsp;*Args...*
 
@@ -575,7 +579,7 @@ Executes a 1D (or 2D Cartesian when two `.sweep` cards are given) deterministic 
   - `.sweep <target> MARGIN <delta> [<count>]` (sweeps $[1-\delta, 1+\delta]$ around nominal)
   - `.sweep <target> LIST <v1> <v2> ... <vB>`
 
-### Critical Operating Margin Finder & Event Verifier (`.margins` / `.verify_events`) — *[New in v2.8 Fork]*
+### Critical Operating Margin Finder & Event Verifier (`.margins` / `.verify_events`) — *[Fork]*
 
 **.margins**&emsp;[*Targets...*]&emsp;[range=<**DELTA**> | min=<**LO**> max=<**HI**>]&emsp;[n=<**NPTS**> | step=<**STEP**>]&emsp;[tol=<**TIME_TOL**>]&emsp;[file=<**CSV_PATH**>]
 
@@ -583,7 +587,7 @@ Executes a 1D (or 2D Cartesian when two `.sweep` cards are given) deterministic 
 
 Packs a shared nominal trial (`Trial 0`) and all target perturbations (`@DEFAULT` = `@BIAS,@JJ,@IND,@RES`, or `@DEVICES` / `@DEVICES|X0` for per-device ranking) into a single batched pass, verifying the exact ordered `(polarity, time)` SFQ event sequence within $\pm\text{tol}$ (default `50p`) and reporting ranked operating margins and root-cause failure modes.
 
-### Digital Vector & SFQ Event Assertions (`.assert` / `.vec`) — *[New in v2.8 Fork]*
+### Digital Vector & SFQ Event Assertions (`.assert` / `.vec`) — *[Fork]*
 
 **.assert**&emsp;*TraceOrGlob*&emsp;**bits=***Pattern*&emsp;**td=***StartDelay*&emsp;**per=***BitPeriod*&emsp;[win=<**WINDOW**>]&emsp;[tol=<**TOL**>]
 
@@ -595,7 +599,7 @@ Packs a shared nominal trial (`Trial 0`) and all target perturbations (`@DEFAULT
 
 Verifies simulated SFQ switching events against digital specifications; exits with a non-zero status code if any assertion fails.
 
-### SPICE Measurements with Native SFQ Triggers (`.meas` / `.measure`) — *[New in v2.8 Fork]*
+### SPICE Measurements with Native SFQ Triggers (`.meas` / `.measure`) — *[Fork]*
 
 **.meas tran**&emsp;*MeasName*&emsp;**trig** *TrigTrace* [sfq=<*k|last*> | val=<*v*> [rise=<*k*>|fall=<*k*>|cross=<*k*>]] **targ** *TargTrace* [sfq=<*k|last*> | val=<*v*> ...]
 
@@ -609,7 +613,7 @@ Verifies simulated SFQ switching events against digital specifications; exits wi
 
 Evaluated measurement values are stored into `.param` scope (accessible to subsequent `.meas` expressions and `pyjosim`) and printed at the end of the run (or exported via `--meas-file=<csv>`).
 
-### Initial Conditions (`.ic`) & Topological $\beta_L$ Loop Auditor (`.check_loops`) — *[New in v2.8 Fork]*
+### Initial Conditions (`.ic`) & Topological $\beta_L$ Loop Auditor (`.check_loops`) — *[Fork]*
 
 **.ic**&emsp;[P(*node*)=*rad*]&emsp;[V(*node*)=*volts*]&emsp;[I(*Lname*)=*amps*] ...
 
@@ -617,13 +621,13 @@ Evaluated measurement values are stored into `.param` scope (accessible to subse
 
 `.check_loops` (or `--check-loops`) discovers all fundamental superconducting `B + L` loops, computes $L_{\text{loop}}$, $\beta_L = 2\pi L_{\text{loop}} I_{c,\min}/\Phi_0$, and net static flux offset $|\Phi_{\text{offset}}|/\Phi_0$, and exports `LOOP_COUNT`, `LOOP_STORAGE_COUNT`, `LOOP_DEGENERATE_COUNT`, `BETA_L_<JJ>`, `L_LOOP_<JJ>`, and `FLUX_LOOP_<JJ>` into `.param` scope.
 
-### Timing Jitter, Skew & Bit-Error-Rate Analyzer (`.jitter` / `.ber`) — *[New in v2.8 Fork]*
+### Timing Jitter, Skew & Bit-Error-Rate Analyzer (`.jitter` / `.ber`) — *[Fork]*
 
 **.jitter**&emsp;[*Name*]&emsp;*TargetTraceOrGlob*&emsp;[ref=<*RefTrace*> | per=<*ClockPeriod*> [td=<*Start*>] [bits=<*Pattern*>]]&emsp;[max_rms=<*t*>]&emsp;[max_pp=<*t*>]&emsp;[max_ber=<*b*>]&emsp;[strict]
 
 Computes sub-timestep SFQ propagation latency, RMS jitter ($\sigma_t$), peak-to-peak jitter, cycle-to-cycle jitter, and bit-error rate (BER), exporting `LATENCY_<Name>`, `JITTER_RMS_<Name>`, `JITTER_PP_<Name>`, `JITTER_C2C_<Name>`, `BER_<Name>`, and `ERRORS_<Name>` into `.param` scope.
 
-### Batched OAAT Sensitivity & Automated Margin Centering (`.sens` / `.sensitivity`) — *[New in v2.8 Fork]*
+### Batched OAAT Sensitivity & Automated Margin Centering (`.sens` / `.sensitivity`) — *[Fork]*
 
 **.sens**&emsp;[*Targets...*]&emsp;[delta=<*frac*>]&emsp;[metric=<*MeasName*>]&emsp;[center [min=<*lo*>] [max=<*hi*>] [step=<*st*>]]&emsp;[goal=<*target_val*>]&emsp;[file=<*path.csv|.json*>]
 
@@ -637,32 +641,32 @@ Simulator options can be configured in the netlist using the `.option` (or `.opt
 
 | Syntax | Origin | Description |
 | :--- | :---: | :--- |
-| `.option seed=<int>` | Inherited (`v2.7`) / Enhanced (`v2.8`) | Sets a deterministic RNG seed for **noise** and **spread** (also settable via `JOSIM_SEED` env var). |
-| `.option nodal[=1\|2\|auto]` | **New (`v2.8`)** | Enables the **Schur-Complement Nodal Admittance Solver** (`-n`): `auto` (fill-aware), `1` ($R+L$/$R+R$), `2` ($+L+L$). |
-| `.option events[=file]` | **New (`v2.8`)** | Extracts $2\pi$ SFQ switching events (`-e [file]`; use `.option eventsonly[=file]` for zero-allocation Events-Only mode). |
-| `.option eventmetrics[=spec]` | **New (`v2.8`)** | Selects SFQ pulse metrics (`-E [spec]`, alias: `.option eventpulse`): `pulse`, `all`, `t_peak`, `v_peak`, `fwhm`, `dt_pi`, `area`, `time=peak`. |
-| `.option lumpptl[=0\|1]` | **New (`v2.8`)** | Replaces sub-timestep lossless PTLs ($T_d < 0.5\Delta t$) with matched $L$-$C$ $\pi$-equivalents (disable: `.option nolumpptl`). |
-| `.option minptl=<val>` | **New (`v2.8`)** | Custom delay threshold $T_{d,\min}$ for `.option lumpptl`. |
-| `.option rollback[=0\|1\|2\|window\|stay]` | **New (`v2.8`)** | In-memory rolling checkpoint rollback on $>0.4\pi$ phase jumps (`1`/`window` default, `2`/`stay`, `0`/`.option norollback`). |
-| `.option gpu[=1\|2\|3\|4]` | **New (`v2.8`)** | Enables CUDA GPU solver (`-g [1\|2\|3\|4]`): `1` = Auto, `2` = Hybrid, `3` (`gpumono`/`cusolverrf`) = GPU-Resident Monolithic MNA, `4` (`gpunodal`) = GPU-Resident Monolithic Nodal. |
-| `.option bypass` | **New (`v2.8`)** | Skips `klu_l_tsolve` on quiescent PTL partitions during OpenMP windowed simulation (`-p`). Alias: `.option latency`. |
-| `.option bypasstol=<val>` | **New (`v2.8`)** | Activity threshold for `.option bypass` (default `1e-12`). |
-| `.option mc=<N>` | **New (`v2.8`)** | Executes `N` batched Monte Carlo (`.spread`) trials in one run (`-b <N>`, aliases: `batch`, `runs`). |
-| `.option mcall` | **New (`v2.8`)** | Appends individual trial waveforms (`<Trace>_MC0 .. MC{N-1}`) to batched Monte Carlo or `.sweep` output (alias: `sweepall`). |
-| `.option sweep=<spec>` | **New (`v2.8`)** | Configures a deterministic parameter/margin sweep (`-S <spec>`). |
-| `.option margins[=<spec>]` | **New (`v2.8`)** | Enables critical operating margin analysis (`-M`; also `marginfile=<f>`, `margintol=<t>`, `verifyevents=<f>`). |
-| `.option assert=<spec>` | **New (`v2.8`)** | Adds a digital SFQ event assertion (`-A <spec>`). |
-| `.option meas=<spec>` | **New (`v2.8`)** | Adds a `.meas` expression (`--meas=<spec>`, `measfile=<f>`). |
-| `.option ic=<spec>` | **New (`v2.8`)** | Adds an initial condition (`--ic=<spec>`). |
-| `.option checkloops[=strict]` | **New (`v2.8`)** | Enables the topological $\beta_L$ loop auditor (`--check-loops`, `loopfile=<f>`). |
-| `.option jitter[=<spec>]` | **New (`v2.8`)** | Enables SFQ timing jitter & BER analysis (`-J`, `jitterfile=<f>`). |
-| `.option sens[=<spec>]` | **New (`v2.8`)** | Enables batched OAAT sensitivity & margin centering (`--sens`, `sensfile=<f>`). |
-| `.option txinterp` | **New (`v2.8`)** | Linearly interpolates fractional transmission-line delays (or per-line `interp=1`; alias: `fractx`). |
-| `.option kcutoff=<val>` | **New (`v2.8`)** | Ignores mutual inductance entries (`K`) with $\|k\| < \text{val}$ during matrix setup (alias: `kmin`). |
-| `.option corrector=<N>` | **New (`v2.8`)** | Enables up to `N` implicit predictor-corrector JJ iterations per step (`-c <N>`). |
-| `.option correctortol=<v>` | **New (`v2.8`)** | Phase convergence threshold (radians, default `1e-3`) for `corrector`. |
-| `.option fixedstep` | **New (`v2.8`)** | Disables automatic timestep halving on $>0.4\pi$ phase jumps (`-f`). |
-| `.option warnstep` | **New (`v2.8`)** | Prints diagnostic warning naming the JJ and time that triggered step halving. |
+| `.option seed=<int>` | Upstream, extended in the fork | Sets a deterministic RNG seed for **noise** and **spread** (also settable via `JOSIM_SEED` env var). |
+| `.option nodal[=1\|2\|auto]` | **Fork** | Enables the **Schur-Complement Nodal Admittance Solver** (`-n`): `auto` (fill-aware), `1` ($R+L$/$R+R$), `2` ($+L+L$). |
+| `.option events[=file]` | **Fork** | Extracts $2\pi$ SFQ switching events (`-e [file]`; use `.option eventsonly[=file]` for zero-allocation Events-Only mode). |
+| `.option eventmetrics[=spec]` | **Fork** | Selects SFQ pulse metrics (`-E [spec]`, alias: `.option eventpulse`): `pulse`, `all`, `t_peak`, `v_peak`, `fwhm`, `dt_pi`, `area`, `time=peak`. |
+| `.option lumpptl[=0\|1]` | **Fork** | Replaces sub-timestep lossless PTLs ($T_d < 0.5\Delta t$) with matched $L$-$C$ $\pi$-equivalents (disable: `.option nolumpptl`). |
+| `.option minptl=<val>` | **Fork** | Custom delay threshold $T_{d,\min}$ for `.option lumpptl`. |
+| `.option rollback[=0\|1\|2\|window\|stay]` | **Fork** | In-memory rolling checkpoint rollback on $>0.4\pi$ phase jumps (`1`/`window` default, `2`/`stay`, `0`/`.option norollback`). |
+| `.option gpu[=1\|2\|3\|4]` | **Fork** | Enables CUDA GPU solver (`-g [1\|2\|3\|4]`): `1` = Auto, `2` = Hybrid, `3` (`gpumono`/`cusolverrf`) = GPU-Resident Monolithic MNA, `4` (`gpunodal`) = GPU-Resident Monolithic Nodal. |
+| `.option bypass` | **Fork** | Skips `klu_l_tsolve` on quiescent PTL partitions during OpenMP windowed simulation (`-p`). Alias: `.option latency`. |
+| `.option bypasstol=<val>` | **Fork** | Activity threshold for `.option bypass` (default `1e-12`). |
+| `.option mc=<N>` | **Fork** | Executes `N` batched Monte Carlo (`.spread`) trials in one run (`-b <N>`, aliases: `batch`, `runs`). |
+| `.option mcall` | **Fork** | Appends individual trial waveforms (`<Trace>_MC0 .. MC{N-1}`) to batched Monte Carlo or `.sweep` output (alias: `sweepall`). |
+| `.option sweep=<spec>` | **Fork** | Configures a deterministic parameter/margin sweep (`-S <spec>`). |
+| `.option margins[=<spec>]` | **Fork** | Enables critical operating margin analysis (`-M`; also `marginfile=<f>`, `margintol=<t>`, `verifyevents=<f>`). |
+| `.option assert=<spec>` | **Fork** | Adds a digital SFQ event assertion (`-A <spec>`). |
+| `.option meas=<spec>` | **Fork** | Adds a `.meas` expression (`--meas=<spec>`, `measfile=<f>`). |
+| `.option ic=<spec>` | **Fork** | Adds an initial condition (`--ic=<spec>`). |
+| `.option checkloops[=strict]` | **Fork** | Enables the topological $\beta_L$ loop auditor (`--check-loops`, `loopfile=<f>`). |
+| `.option jitter[=<spec>]` | **Fork** | Enables SFQ timing jitter & BER analysis (`-J`, `jitterfile=<f>`). |
+| `.option sens[=<spec>]` | **Fork** | Enables batched OAAT sensitivity & margin centering (`--sens`, `sensfile=<f>`). |
+| `.option txinterp` | **Fork** | Linearly interpolates fractional transmission-line delays (or per-line `interp=1`; alias: `fractx`). |
+| `.option kcutoff=<val>` | **Fork** | Ignores mutual inductance entries (`K`) with $\|k\| < \text{val}$ during matrix setup (alias: `kmin`). |
+| `.option corrector=<N>` | **Fork** | Enables up to `N` implicit predictor-corrector JJ iterations per step (`-c <N>`). |
+| `.option correctortol=<v>` | **Fork** | Phase convergence threshold (radians, default `1e-3`) for `corrector`. |
+| `.option fixedstep` | **Fork** | Disables automatic timestep halving on $>0.4\pi$ phase jumps (`-f`). |
+| `.option warnstep` | **Fork** | Prints diagnostic warning naming the JJ and time that triggered step halving. |
 
 Examples:
 ```cir
@@ -674,7 +678,7 @@ Examples:
 .option gpu=4
 ```
 
-### State Checkpointing (`.savestate` / `.loadstate`) — *[New in v2.8 Fork]*
+### State Checkpointing (`.savestate` / `.loadstate`) — *[Fork]*
 
 For large circuits that require a long initial bias-conditioning or settling window before applying data stimuli, JoSIM can serialize and restore the full simulator state (the MNA solution vector $\mathbf{x}$, all multi-step device history registers, and the complete circular delay ring buffers of all transmission lines) in a compact binary checkpoint file (`JOSIMSTA` v2):
 
@@ -754,7 +758,7 @@ Subcircuit parameters can be output using the `.`(period) or `|`(vertical bar) a
 
 i.e. **.print** v(14.X01) p(B01.X02)
 
-Wildcard globs (`*` matching zero or more characters, `?` matching a single character) are also supported in `.print`, `.plot`, and `.save` (*[New in v2.8 Fork]*), e.g.:
+Wildcard globs (`*` matching zero or more characters, `?` matching a single character) are also supported in `.print`, `.plot`, and `.save` (*[Fork]*), e.g.:
 
 **.print** P(B*|X0) V(*|X0) I(IB?|X*)
 
@@ -785,12 +789,12 @@ This indicates that every output request that follows this command needs to be s
 
 | Extension | Format | Origin | Description |
 | --------- | ------ | :---: | ----------- |
-| `.csv` | Comma-Separated Values (ASCII) | Inherited (`v2.7`) | Standard comma-separated text table with header row (`time,...`). |
-| `.dat` | Space-Separated Values (ASCII) | Inherited (`v2.7`) | Standard space-separated text table with header row. |
-| `.raw` or no extension | SPICE3 Raw (ASCII) | Inherited (`v2.7`) | Standard ASCII SPICE rawfile (`Values:` section). |
-| `.bin` | Native JoSIM Binary (`JOSIMBIN`) | **New in Fork (`v2.8`)** | High-speed column-major IEEE-754 `float64` binary format with self-describing trace metadata header. ~37x faster to write and ~38% smaller than `.csv`. |
-| `.npy` | NumPy Structured Array (`.npy`) | **New in Fork (`v2.8`)** | Standard NumPy v1.0/v2.0 structured array with named `<f8` columns, directly loadable via `numpy.load()` or `scripts/josim_io.py`. |
-| `.rawb` or `.braw` | SPICE3 Binary Raw (`Binary:`) | **New in Fork (`v2.8`)** | Standard SPICE3 binary rawfile with ASCII preamble followed by interleaved IEEE-754 `float64` records. |
+| `.csv` | Comma-Separated Values (ASCII) | Upstream | Standard comma-separated text table with header row (`time,...`). |
+| `.dat` | Space-Separated Values (ASCII) | Upstream | Standard space-separated text table with header row. |
+| `.raw` or no extension | SPICE3 Raw (ASCII) | Upstream | Standard ASCII SPICE rawfile (`Values:` section). |
+| `.bin` | Native JoSIM Binary (`JOSIMBIN`) | **Fork** | High-speed column-major IEEE-754 `float64` binary format with self-describing trace metadata header. ~37x faster to write and ~38% smaller than `.csv`. |
+| `.npy` | NumPy Structured Array (`.npy`) | **Fork** | Standard NumPy v1.0/v2.0 structured array with named `<f8` columns, directly loadable via `numpy.load()` or `scripts/josim_io.py`. |
+| `.rawb` or `.braw` | SPICE3 Binary Raw (`Binary:`) | **Fork** | Standard SPICE3 binary rawfile with ASCII preamble followed by interleaved IEEE-754 `float64` records. |
 
 I.e. 
 
@@ -827,7 +831,7 @@ The final control command that is of importance in JoSIM is the parameters comma
 
 Additionally, expressions can also contain other variables and parameters will be continuously evaluated until all variables are reduced to values. If variables are not defined the program will halt and produce an error.
 
-In **`v2.8`**, mathematical expressions enclosed in curly braces (`{2*IBIAS + 10u}`) can also be used inline on component cards, source waveforms (`PWL`, `PULSE`, `SIN`, `PAT`, `SFQ`), and subcircuit instance overrides. Supported built-in functions include:
+In this fork, mathematical expressions enclosed in curly braces (`{2*IBIAS + 10u}`) can also be used inline on component cards, source waveforms (`PWL`, `PULSE`, `SIN`, `PAT`, `SFQ`), and subcircuit instance overrides. Supported built-in functions include:
 - **1-argument functions:** `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `ln`/`log`, `log10`, `log2`, `sqrt`, `cbrt`, `abs`/`fabs`, `sgn`/`sign`, `floor`, `ceil`, `round`/`nint`, `trunc`/`int`, `frac`, `step`/`u`, `uramp`, `erf`, `erfc`, `db`.
 - **2-argument & variadic functions:** `min(a, b, ...)`, `max(a, b, ...)`, `pow(x, y)` / `pwr(x, y)` / `pwrs(x, y)`, `atan2(y, x)`, `hypot(x, y)`, `mod(x, y)` / `fmod(x, y)`.
 - **3-argument functions:** `if(cond, tVal, fVal)` / `ternary(cond, tVal, fVal)`, `limit(x, lo, hi)` / `clamp(x, lo, hi)`.

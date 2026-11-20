@@ -40,7 +40,7 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
    - Replaced full-history PTL `results.xVector` forcing with compact circular ring buffers (`hist_`) of length $k+4$ and added in-loop `PRSTART`/`PRSTEP` decimation (**reducing peak RAM by 2x–17.6x**).
    - **In-Memory Rolling Checkpoints for Local Step-Halving Rollback (`.option rollback[=1|2|window|stay]`, `.option norollback`):** Maintains a double-buffered 128-step rolling checkpoint (`ckpt_[2]`, `<2 MB`) in both Standard MNA and CPU Nodal (`-n`). When a junction phase jump exceeds $0.4\pi$ (`needsTR_`), JoSIM rolls back only $32\text{–}256$ base steps to the nearest safe checkpoint, rescales BDF2 two-step history ($h_{\text{old}} \to h_{\text{new}}$) and matrix diagonal entries in place (`klu_l_refactor`), and sub-steps locally ($M = 2, 4, 8, 16$) instead of restarting from $t = 0$ (**2.02x–3.93x faster** across Phase & Voltage modes).
 8. **High-Speed Binary Output (`.npy`, `.bin`, `.rawb`) & New Controls:**
-   - `.npy` (NumPy structured array, **2.4x–2.5x faster end-to-end runtime** on 2.5k–3k trace decks and **23x faster Python load**), `.bin` (`JOSIMBIN` column-major float64, **~37x faster write than CSV**), `.rawb` (SPICE3 binary raw), and Python loader [`scripts/josim_io.py`](../scripts/josim_io.py).
+   - `.npy` (NumPy structured array, **2.4x–2.5x faster end-to-end runtime** on 2.5k–3k trace decks and **23x faster Python load**), `.bin` (`JOSIMBIN` column-major float64, **~37x faster write than CSV**), `.rawb` (SPICE3 binary raw), and Python loader [`scripts/josim_io.py`](https://github.com/mandalsoumyajit/JoSIM/blob/master/scripts/josim_io.py).
    - State checkpointing (`.savestate` / `.loadstate`), local step-halving rollback (`.option rollback[=1|2|window|stay]` / `.option norollback`), fractional PTL delay interpolation (`.option txinterp` / `interp=1`), mutual inductance cutoff (`.option kcutoff=<val>`), implicit JJ predictor-corrector (`-c [N]` / `.option corrector=<N>`), and fixed-step / step-halving diagnostics (`-f` / `.option fixedstep` / `.option warnstep`).
 9. **Automated Critical Operating Margin Finder, OAAT Sensitivity & Digital Verification (`.margins`, `.sens`, `.assert`, `.meas`, `.jitter`):**
    - **Critical Margin Finder (`-M` / `.margins`) & Event Verifier (`--verify-events`):** One-shot batched discovery of operating margins across `@BIAS`, `@JJ`, `@IND`, `@RES`, or every individual cell component (`@DEVICES`, `@DEVICES|X0`) using exact temporal `(polarity, time)` SFQ event-sequence verification within $\pm\tau_{\text{tol}}$ and root-cause failure diagnosis (`EXTRA_PULSE`, `MISSING_PULSE`, `TIMING_VIOLATION`, `POLARITY_FLIP`).
@@ -54,7 +54,7 @@ For low-level GPU kernel and linear-algebra implementation details, see [`docs/g
     - OpenMP-parallelized model/circuit `.iv`, RF Shapiro steps (`RF_AMP=`, `RF_FREQ=`), and 1D/2D SQUID $V(\Phi)$ / $I_c(\Phi)$ flux modulation (`.squid`, `--squid`).
     - Native 2-, 3-, and 4-terminal electrothermal superconducting nanowire / cryotron (`nTron` / `hTron` / `SNSPD`) device element (`N...`, `.model ... ntron/htron/snspd/nanowire`).
 11. **In-Memory Python/C API (`pyjosim` / `libjosim_c`) & Hybrid SPICE Co-Simulation (`ngspice`, `LTspice`, `Cadence Spectre`):**
-    - Zero-copy NumPy views and persistent pre-parsed AST sessions via [`scripts/pyjosim.py`](../scripts/pyjosim.py) (`pyjosim.Session` / `pyjosim.JoSIMSession`) and `libjosim_c`.
+    - Zero-copy NumPy views and persistent pre-parsed AST sessions via [`scripts/pyjosim.py`](https://github.com/mandalsoumyajit/JoSIM/blob/master/scripts/pyjosim.py) (`pyjosim.Session` / `pyjosim.JoSIMSession`) and `libjosim_c`.
     - Lockstep Norton/Thevenin and windowed Branin co-simulation across **`ngspice`** (`josim_cosim.cm` XSPICE code model), **ADI `LTspice`** (`BraninWaveWindowCoordinator` & `run_ltspice_pwl_cosim`), and **Cadence Spectre 25.1** (`libjosim_spectre_dpi.so` + `josim_cosim_port.va` 1-/2-/3-/4-/6-/8-port modules + multiplexed `josim-cosim-server`), delivering **$4.6\times\text{–}37.5\times$ speedup in `ngspice`** ($16\text{–}1000$ JJs, $2.0\times$ on `macro-SPLIT`) and **$2.1\times\text{–}7.1\times$ wall-time speedup on 1000-JJ JTLs and PTL macros in Cadence Spectre 25.1** over monolithic Verilog-A (`seeqc_jj3.va`). See [`docs/cosimulation.md`](cosimulation.md) for the complete guide.
 
 ---
@@ -267,7 +267,7 @@ When junctions do not dynamically switch (`RTYPE=0` or quiescent bias), the GPU-
 
 ### C. Windowed PTL Block-Parallel & Multi-Channel Benchmarks
 
-Reproducible via the benchmark scripts in [`scripts/`](../scripts/):
+Reproducible via the benchmark scripts in [`scripts/`](https://github.com/mandalsoumyajit/JoSIM/tree/master/scripts):
 
 | Circuit | Scale & Topology | Serial (1T) | **OpenMP (`-p`)** | **CUDA GPU (`-g`)** | **OpenMP Speedup** | **GPU Speedup** |
 | :--- | :--- | ---: | ---: | ---: | :---: | :---: |
@@ -524,7 +524,7 @@ JoSIM provides an OpenMP-parallelized DC steady-state I-V, microwave Shapiro-ste
 
 ### M. In-Memory Python / C Binding (`pyjosim` & `josim_c`)
 
-JoSIM builds a shared C library (`libjosim_c.so` / `josim_c.dll`, header [`include/JoSIM/josim_c_api.h`](../include/JoSIM/josim_c_api.h)) and a zero-dependency `ctypes` + NumPy Python binding ([`scripts/pyjosim.py`](../scripts/pyjosim.py), also re-exported by [`scripts/josim_io.py`](../scripts/josim_io.py)) for zero-copy in-memory simulation and rapid parameter optimization loops:
+JoSIM builds a shared C library (`libjosim_c.so` / `josim_c.dll`, header [`include/JoSIM/josim_c_api.h`](https://github.com/mandalsoumyajit/JoSIM/blob/master/include/JoSIM/josim_c_api.h)) and a zero-dependency `ctypes` + NumPy Python binding ([`scripts/pyjosim.py`](https://github.com/mandalsoumyajit/JoSIM/blob/master/scripts/pyjosim.py), also re-exported by [`scripts/josim_io.py`](https://github.com/mandalsoumyajit/JoSIM/blob/master/scripts/josim_io.py)) for zero-copy in-memory simulation and rapid parameter optimization loops:
 
 1. **One-Shot In-Memory Simulation (Zero-Copy NumPy Views):**
    ```python

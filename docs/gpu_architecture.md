@@ -181,7 +181,7 @@ To evaluate performance on circuits that **do not rely solely on PTLs**—includ
 ### 6.1 Architectural Design (`Simulation::trans_sim_mc`, `advance_mc_coalesced_kernel`)
 Superconducting IC design requires extensive Monte Carlo yield and critical-margin analysis (`.spread`), simulating a circuit across $B = 32\text{ to }4,096$ fabrication-variation trials where every inductor (`L`), Josephson junction (`B` area/$I_c$), resistor (`R`), and capacitor (`C`) is perturbed around its nominal value. Running JoSIM $B$ times sequentially from the CLI repeats netlist parsing, subcircuit flattening, CSR assembly, and symbolic factorization $B$ times, and leaves single-component or modest-partition circuits ($P = 1\text{–}66$) unable to saturate a multi-core CPU or GPU.
 
-The Batched Monte Carlo & Parameter Sweep solver (`Simulation::trans_sim_mc` and `Simulation::trans_sim_mc_nodal` in [`src/Simulation.cpp`](../src/Simulation.cpp) and `advance_mc_coalesced_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)) solves all $B$ trials simultaneously in a single invocation:
+The Batched Monte Carlo & Parameter Sweep solver (`Simulation::trans_sim_mc` and `Simulation::trans_sim_mc_nodal` in [`src/Simulation.cpp`](https://github.com/mandalsoumyajit/JoSIM/blob/master/src/Simulation.cpp) and `advance_mc_coalesced_kernel` in [`src/CudaSolver.cu`](https://github.com/mandalsoumyajit/JoSIM/blob/master/src/CudaSolver.cu)) solves all $B$ trials simultaneously in a single invocation:
 
 1. **CLI & Netlist Controls:**
    - `-b <N>` / `--batch=<N>` CLI flag
@@ -190,7 +190,7 @@ The Batched Monte Carlo & Parameter Sweep solver (`Simulation::trans_sim_mc` and
    - `.option mcall` (outputs all individual trial waveforms `<Trace>_MC0 .. <Trace>_MC{B-1}` alongside ensemble statistics)
    - `JOSIM_SEED=<uint64>` environment variable or `.option seed=<uint64>` for deterministic reproducibility.
 2. **Parse-Once, Symbolic-Once Setup:**
-   - Each device stores its unperturbed nominal value (`nominalValue_`, `nominalArea_`, `nominalIc_`, `baseModel_`) and resolved spread fraction (`spread_`). We also fixed an upstream bug in [`src/JJ.cpp`](../src/JJ.cpp) where `AREA=` was parsed before `SPREAD=` and default `area=1.0` junctions ignored `.spread`.
+   - Each device stores its unperturbed nominal value (`nominalValue_`, `nominalArea_`, `nominalIc_`, `baseModel_`) and resolved spread fraction (`spread_`). We also fixed an upstream bug in [`src/JJ.cpp`](https://github.com/mandalsoumyajit/JoSIM/blob/master/src/JJ.cpp) where `AREA=` was parsed before `SPREAD=` and default `area=1.0` junctions ignored `.spread`.
    - The base circuit topology and connected-component partitions ($P_{\text{base}} \ge 1$) are analyzed **once**. Each trial $b \in \{0, \dots, B-1\}$ receives a deterministic 64-bit splitmix seed $\text{seed}_b = \text{baseSeed} \oplus (b \cdot \text{0x9E3779B97F4A7C15})$ via thread-safe `Spread::spread_value_rng`.
 3. **Thread-Per-Trial Coalesced CUDA Kernel (`advance_mc_coalesced_kernel`):**
    - **Why Coalesced Batch-Minor Layout (`[baseIdx * B + b]`) Beats Warp-Per-Partition:**
@@ -205,7 +205,7 @@ The Batched Monte Carlo & Parameter Sweep solver (`Simulation::trans_sim_mc` and
      - `step_window` automatically selects `warpsPerBlock` $\in \{1, 2, 4\}$ (`32, 64, or 128` threads/block) based on the active GPU's SM count, shared-memory capacity per block/SM, and total trial warps (`(B / 32) * P_base`).
      - When `warpsPerBlock > 1`, all warps in the thread block solve trials for the same base partition $p = \text{blockIdx.y}$ and **share a single copy** of the symbolic CSR structure (`s_luRp`, `s_luDiag`, `s_P`, `s_Q`, `s_luCi`, `s_luSrcNz`) in shared memory while each warp indexes its own bank-conflict-free vector slice (`s_warpBase = s_mem_mc + warpInBlock * 32 * 3 * n`).
    - **Multi-Architecture CMake Configuration:**
-     - [`CMakeLists.txt`](../CMakeLists.txt) automatically defaults `CMAKE_CUDA_ARCHITECTURES` to `"native"` on CMake $\ge 3.24$ (auto-detecting the installed V100, T4, A100, RTX A6000, L40S, H100, or B200 GPU) or `"70;75;80;86"` on older CMake when not overridden by the user.
+     - [`CMakeLists.txt`](https://github.com/mandalsoumyajit/JoSIM/blob/master/CMakeLists.txt) automatically defaults `CMAKE_CUDA_ARCHITECTURES` to `"native"` on CMake $\ge 3.24$ (auto-detecting the installed V100, T4, A100, RTX A6000, L40S, H100, or B200 GPU) or `"70;75;80;86"` on older CMake when not overridden by the user.
 5. **Numerically Stable Welford Ensemble Statistics & Robustness Summary (`Output::write_output`):**
    - Uses **Welford's online algorithm** across all $B$ trials at each output timestep to compute `<Trace>` (ensemble mean), `<Trace>_STD` (sample standard deviation), `<Trace>_MIN`, and `<Trace>_MAX` without catastrophic cancellation on constant $2\pi$ superconducting phase plateaus, plus a formatted **Monte Carlo Robustness Summary** table on stdout.
 
@@ -257,11 +257,11 @@ When a circuit contains **zero transmission lines ($P = 1$ single connected comp
 To eliminate both bottlenecks, the **Fully GPU-Resident Monolithic Solver (`-g 3` / `--gpu=3`, `.option gpu=3`, `.option gpumono`, `.option cusolverrf`)** keeps the **entire transient simulation loop 100% resident in GPU VRAM** with **zero per-timestep PCIe transfers**:
 
 1. **Exact $O(\text{nnz}(L+U))$ KLU Factor Extraction (`klu_l_extract`):**
-   - During setup (`Simulation::setup_gpu_monolithic_full` in [`src/Simulation.cpp`](../src/Simulation.cpp)), KLU factors the unscaled monolithic CSR matrix ($A$, interpreted by KLU as CSC of $A^T$) with `Common_.btf = 0; Common_.scale = 0`:
+   - During setup (`Simulation::setup_gpu_monolithic_full` in [`src/Simulation.cpp`](https://github.com/mandalsoumyajit/JoSIM/blob/master/src/Simulation.cpp)), KLU factors the unscaled monolithic CSR matrix ($A$, interpreted by KLU as CSC of $A^T$) with `Common_.btf = 0; Common_.scale = 0`:
      $$P_{\text{klu}} A^T Q_{\text{klu}} = L_{\text{klu}} U_{\text{klu}} \implies Q_{\text{klu}}^T A P_{\text{klu}}^T = U_{\text{klu}}^T L_{\text{klu}}^T = \underbrace{(U_{\text{klu}}^T D^{-1})}_{\tilde{L}} \underbrace{(D L_{\text{klu}}^T)}_{\tilde{U}}$$
    - Using `klu_l_extract`, JoSIM extracts the exact symbolic and numeric CSR factors $\tilde{L}$ (lower-triangular with stored unit diagonal `CUSOLVERRF_UNIT_DIAGONAL_STORED_L`), $\tilde{U}$ (upper-triangular with non-unit diagonal $D = \text{diag}(U_{\text{klu}})$), row permutation $P_{\text{csr}}[r] = Q_{\text{klu}}[r]$, and column permutation $Q_{\text{csr}}[c] = P_{\text{num}}[c]$ in milliseconds.
    - JoSIM passes $(\tilde{L}, \tilde{U}, P_{\text{csr}}, Q_{\text{csr}}, A_{\text{csr}})$ to NVIDIA **`cuSolverRF`** (`cusolverRfSetupHost` $\to$ `cusolverRfAnalyze` $\to$ `cusolverRfResetValues` $\to$ `cusolverRfRefactor`), which constructs the level-scheduled DAG for parallel GPU LU refactorization and sparse triangular solve (`cusolverRfSolve`).
-2. **Fused All-Device GPU RHS Kernel (`monolithic_full_setup_b_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)):**
+2. **Fused All-Device GPU RHS Kernel (`monolithic_full_setup_b_kernel` in [`src/CudaSolver.cu`](https://github.com/mandalsoumyajit/JoSIM/blob/master/src/CudaSolver.cu)):**
    - Evaluates **all** circuit devices in parallel directly in VRAM at each timestep: Josephson junctions (`JJ` RCSJ + sin/cos CPR + temperature-dependent $I_c(T)$ + `RTYPE=1` piecewise-linear conductance state machine), resistors (`R`), capacitors (`C`), inductors (`L` + arbitrary mutual inductance couplings `K` via double-buffered `d_indIn2Old_`/`d_indIn2New_`), voltage sources (`V`), phase sources (`P`), current sources (`I` via `atomicAdd`), controlled sources (`CCVS`/`VCCS`), and transmission line port halves (`T`).
    - Whenever any `RTYPE=1` junction switches conductance state, the kernel updates `d_csrValA[jj.nzIdx]` **in-place in VRAM** and increments `d_numChangedNz_`.
    - If `hasSwitchingJJs_` is true and `h_numChanged > 0`, `step_monolithic_full_window` calls `cusolverRfResetValues` + `cusolverRfRefactor` directly on the GPU in VRAM; when `!hasSwitchingJJs_` (e.g., `RTYPE=0` or passive circuits), zero host-device synchronization occurs across the entire window $W = 1,024$ steps.
@@ -332,7 +332,7 @@ In JoSIM's standard Modified Nodal Analysis (MNA) formulation:
 As a result, a circuit with $14,400$ nodes and $14,400$ JJs (`Mono-2D-Grid-14kJJ`) has **$N = 86,163$ MNA equations** even though only **$N_{\text{red}} = 14,401$ independent nodal equations** exist! Similarly, on real production superconducting IC designs (`spec2si-seeqc`: `xadd4`, `r5cal`, `r10f1n`, `coupler`, `adder`), auxiliary branch rows account for **48%–60% of the entire MNA matrix** and **35%–55% of all LU nonzeros $\text{nnz}(L+U)$**. Crucially, when a circuit has only $P = 1$ or $P = 2$ PTL partitions (`xadd4`, `r5cal`, `r10f1n`), partition-level OpenMP cannot parallelize the global triangular solve (`klu_l_tsolve`), making matrix size reduction the primary lever for both single-core CPU and GPU performance.
 
 ### 8.2 Exact Schur-Complement Nodal Admittance Formulation (`Simulation::build_nodal_system`)
-The Schur-Complement Nodal Admittance Solver (`Simulation::build_nodal_system`, `Simulation::setup_cpu_nodal`, `Simulation::setup_gpu_nodal`, `Simulation::trans_sim_nodal`, and `Simulation::trans_sim_gpu_nodal` in [`src/Simulation.cpp`](../src/Simulation.cpp); `nodal_full_setup_b_kernel` and `nodal_full_post_solve_kernel` in [`src/CudaSolver.cu`](../src/CudaSolver.cu)) analytically eliminates all diagonal internal branch equations prior to factorization:
+The Schur-Complement Nodal Admittance Solver (`Simulation::build_nodal_system`, `Simulation::setup_cpu_nodal`, `Simulation::setup_gpu_nodal`, `Simulation::trans_sim_nodal`, and `Simulation::trans_sim_gpu_nodal` in [`src/Simulation.cpp`](https://github.com/mandalsoumyajit/JoSIM/blob/master/src/Simulation.cpp); `nodal_full_setup_b_kernel` and `nodal_full_post_solve_kernel` in [`src/CudaSolver.cu`](https://github.com/mandalsoumyajit/JoSIM/blob/master/src/CudaSolver.cu)) analytically eliminates all diagonal internal branch equations prior to factorization:
 
 1. **Two-Row Josephson Junction Elimination (`variableIndex_` and `currentIndex_`):**
    - From row $v = \text{variableIndex\_}$:
@@ -412,7 +412,7 @@ Evaluated across all 6 circuits from the `spec2si-seeqc` benchmark suite (`xadd4
 
 ## 9. Series $R+L$ Elimination, Per-Partition Nodal PTL Solver (`-p -n`), Short-PTL Coarsening, Streaming Binary/Event I/O (`-e`, `-E`), Local Rollback (`.option rollback`), & Batched Sweeps (`.sweep`, `-S`)
 
-Building on the core solver modes, JoSIM `v2.8` includes 7 synergistic algorithmic and architectural enhancements documented in [`ENHANCEMENT_PLAN.md`](../ENHANCEMENT_PLAN.md) and [`docs/usage_and_benchmarks.md`](usage_and_benchmarks.md):
+Building on the core solver modes, JoSIM `v2.8` includes 7 synergistic algorithmic and architectural enhancements documented in [`ENHANCEMENT_PLAN.md`](https://github.com/mandalsoumyajit/JoSIM/blob/master/ENHANCEMENT_PLAN.md) and [`docs/usage_and_benchmarks.md`](usage_and_benchmarks.md):
 
 | # | Algorithmic / Architectural Enhancement | Summary & Measured Impact (`2× AMD EPYC 7413, 512 GB RAM, RTX A6000`) |
 | :---: | :--- | :--- |

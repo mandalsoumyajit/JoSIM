@@ -28,6 +28,7 @@ nav:
   - Runtime and Memory: 'performance.md'
   - Development: 'DEVELOPMENT.md'
   - Updating to 3.1: 'compatibility.md'
+  - Merging Upstream 3.1 into the Fork: 'upstream-3.1-merge.md'
   - C++ API: 'API.md'
   - Release Procedure: 'RELEASE_POLICY.md'
   - Development Schedule and Bugs: 'bugs.md'

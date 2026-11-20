@@ -422,6 +422,11 @@ if(BUILD_TESTING)
            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/regression_sweep.py
                    $<TARGET_FILE:josim-cli>)
   set_tests_properties(regression::sweep PROPERTIES TIMEOUT 90)
+  # The fork's solver paths, output formats and analyses against each other (Debug coverage builds are slow).
+  add_test(NAME regression::fork_modes
+           COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/regression_fork_modes.py
+                   $<TARGET_FILE:josim-cli>)
+  set_tests_properties(regression::fork_modes PROPERTIES TIMEOUT 900)
   add_test(NAME regression::installed_package
     COMMAND ${CMAKE_COMMAND}
       "-DTEST_SOURCE_DIR=${PROJECT_SOURCE_DIR}"

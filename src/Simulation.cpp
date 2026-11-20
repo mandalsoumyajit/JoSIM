@@ -10271,9 +10271,13 @@ void Simulation::trans_sim_omp_windowed(Matrix& mObj) {
                             b_[curIdx]   += (-((2.0 * m.second) / h) * x_[mi.indexInfo.currentIndex_.value()]
                                            + (m.second / (2.0 * h)) * mi.In2_);
                         }
-                        temp.In4_ = temp.In3_;
-                        temp.In3_ = temp.In2_;
-                        temp.In2_ = x_[curIdx];
+                    }
+                    // Shift after every branch has read the preceding currents (coupled branches; as the other loops).
+                    for (int64_t lIdx : part.indIndices) {
+                        auto& temp = inductors_[lIdx];
+                        temp.In4_  = temp.In3_;
+                        temp.In3_  = temp.In2_;
+                        temp.In2_  = x_[temp.indexInfo.currentIndex_.value()];
                     }
                 }
 
@@ -10649,6 +10653,13 @@ void Simulation::trans_sim(Matrix& mObj) {
         eventsOnly_ = false;
         trans_sim_mc(mObj);
         return;
+    }
+    // A partitioned deck whose batch the partition loop cannot run (corrector, thermal noise, a state file) runs it on
+    // the whole matrix below; it used to fall through to a single trial.
+    if (mcRuns_ > 1 && usePartitions_) {
+        usePartitions_ = false;
+        nodal_         = false;
+        factorize_lu(mObj);
     }
     if (mcRuns_ > 1 && !usePartitions_) {
         eventsOnly_     = false;

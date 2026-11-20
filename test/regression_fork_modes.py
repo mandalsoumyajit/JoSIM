@@ -273,6 +273,9 @@ class ForkModes(unittest.TestCase):
     # ---- output formats ----
     def test_output_formats_carry_the_same_data(self):
         names, rows = self.waveform([], JTL)
+        # CSV has 7 significant digits; values near zero (residual currents) differ in their last bits between runs
+        # on some platforms (arm64), so the absolute part of the tolerance scales with each column's range.
+        scale = [max(abs(row[c]) for row in rows) or 1.0 for c in range(len(names))]
         for extension, reader in (("dat", None), ("npy", read_npy), ("bin", read_bin)):
             self.run_josim(["-m", "1", "-o", "out." + extension], JTL)
             if reader is None:
@@ -285,16 +288,16 @@ class ForkModes(unittest.TestCase):
             self.assertEqual(other_names, names, extension)
             self.assertEqual(len(other), len(rows), extension)
             for a, b in zip(rows, other):
-                for x, y in zip(a, b):
-                    self.assertLessEqual(abs(x - y), 1e-6 * abs(x) + 1e-18, extension)
+                for c, (x, y) in enumerate(zip(a, b)):
+                    self.assertLessEqual(abs(x - y), 1e-6 * abs(x) + 1e-12 * scale[c], extension)
         for extension in ("raw", "rawb"):
             self.run_josim(["-m", "1", "-o", "out." + extension], JTL)
             variables, other = read_raw(self.dir / ("out." + extension))
             self.assertEqual(variables, len(names), extension)
             self.assertEqual(len(other), len(rows), extension)
             for a, b in zip(rows, other):
-                for x, y in zip(a, b):
-                    self.assertLessEqual(abs(x - y), 5e-6 * abs(x) + 1e-18, extension)
+                for c, (x, y) in enumerate(zip(a, b)):
+                    self.assertLessEqual(abs(x - y), 5e-6 * abs(x) + 1e-12 * scale[c], extension)
 
     def test_voltage_mode_formats(self):
         for extension, reader in (("npy", read_npy), ("bin", read_bin)):
